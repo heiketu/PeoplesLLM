@@ -28,6 +28,10 @@ extern "C" {
 #endif
 
 void ggml_compute_forward_dup(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+// NUMA mirror: fan out rows written by a cpy/dup into a mirrored KV-cache view to all node copies.
+// defined in ggml-cpu.c; no-op for destinations that are not mirrored.
+void ggml_numa_replicate_kv_write(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_numa_replicate_kv_write_set_rows(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_add(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_add_id(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_add1(const struct ggml_compute_params * params, struct ggml_tensor * dst);
@@ -45,6 +49,8 @@ void ggml_compute_forward_silu_back(const struct ggml_compute_params * params, s
 void ggml_compute_forward_norm(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_rms_norm(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_rms_norm_mul_fused(const struct ggml_compute_params * params, struct ggml_tensor * dst_rms_norm, struct ggml_tensor * dst_mul);
+float ggml_cpu_rms_norm_row_scale_f32(const float * x, int64_t n, float eps);
+void ggml_cpu_rms_norm_row_apply_f32(const float * x, const float * w, float * y, float scale, int64_t i0, int64_t i1);
 void ggml_compute_forward_rms_norm_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_group_norm(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_l2_norm(const struct ggml_compute_params * params, struct ggml_tensor * dst);
@@ -109,6 +115,10 @@ void ggml_compute_forward_lightning_indexer(const struct ggml_compute_params * p
 void ggml_compute_forward_dsv4_hc_comb(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_dsv4_hc_pre(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_dsv4_hc_post(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_dsv4_hc_prep(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_dsv4_moe_probs(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_dsv4_moe_topk(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_dsv4_moe_weights(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_map_custom1(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_map_custom2(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_map_custom3(const struct ggml_compute_params * params, struct ggml_tensor * dst);

@@ -41,6 +41,9 @@ public:
     ggml_tensor * get_kv   (ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_score(ggml_context * ctx, int32_t il) const;
 
+    // debug: raw storage access (no ggml_context needed)
+    ggml_tensor * get_kv_storage(int32_t il) const;
+
     ggml_tensor * cpy_kv   (ggml_context * ctx, ggml_tensor * cur, ggml_tensor * idxs, int32_t il) const;
     ggml_tensor * cpy_score(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * idxs, int32_t il) const;
 
@@ -159,6 +162,9 @@ private:
 
     void clear_compressed(llama_seq_id seq_id, bool data);
 };
+
+// debug: print checksums of the DSV4 KV/state buffers (env LLAMA_DSV4_STATE_DEBUG=1)
+void llama_kv_cache_dsv4_debug_state(const llama_kv_cache_dsv4 * kv, const char * tag);
 
 // DSV4 raw attention only uses the SWA half of kv_raw. The base half is kept
 // for generic ISWA bookkeeping, but it has no DSV4 layers to expose here.

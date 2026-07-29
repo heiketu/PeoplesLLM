@@ -664,6 +664,39 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     if (strcmp(name, "ggml_backend_cpu_is_numa") == 0) {
         return (void *)ggml_is_numa;
     }
+    if (strcmp(name, "ggml_backend_cpu_numa_node_count") == 0) {
+        return (void *)ggml_numa_node_count;
+    }
+    if (strcmp(name, "ggml_backend_cpu_numa_mirror_active") == 0) {
+        return (void *)ggml_numa_mirror_active;
+    }
+    if (strcmp(name, "ggml_backend_cpu_numa_set_mirror") == 0) {
+        return (void *)ggml_numa_set_mirror;
+    }
+    if (strcmp(name, "ggml_backend_cpu_numa_get_mirror") == 0) {
+        return (void *)ggml_numa_get_mirror;
+    }
+    if (strcmp(name, "ggml_backend_cpu_numa_alloc") == 0) {
+        return (void *)ggml_numa_alloc;
+    }
+    if (strcmp(name, "ggml_backend_cpu_numa_free") == 0) {
+        return (void *)ggml_numa_free;
+    }
+    if (strcmp(name, "ggml_backend_cpu_numa_bind") == 0) {
+        return (void *)ggml_numa_bind;
+    }
+    if (strcmp(name, "ggml_backend_cpu_numa_bind_policy") == 0) {
+        return (void *)ggml_numa_bind_policy;
+    }
+    if (strcmp(name, "ggml_backend_cpu_numa_tensor_set_mirror") == 0) {
+        return (void *)ggml_numa_tensor_set_mirror;
+    }
+    if (strcmp(name, "ggml_backend_cpu_numa_tensor_clear_mirror") == 0) {
+        return (void *)ggml_numa_tensor_clear_mirror;
+    }
+    if (strcmp(name, "ggml_backend_cpu_numa_tensor_resync") == 0) {
+        return (void *)ggml_numa_tensor_resync;
+    }
     if (strcmp(name, "ggml_backend_cpu_set_use_ref") == 0) {
         return (void *)ggml_backend_cpu_set_use_ref;
     }

@@ -412,6 +412,87 @@ static __global__ void quantize_mmq_q8_1(
     GGML_UNUSED(n_expert_used);
 }
 
+// Fused rms_norm + weight_mul + q8_1 quantization in a single kernel.
+// Eliminates separate rms_norm+mul kernel launch and separate quantize kernel launch.
+// One block per row, 256 threads. Phase 1: block reduction for sum_sq. Phase 2: normalize+quantize.
+template <int block_size>
+__launch_bounds__(block_size, 2)
+static __global__ void rms_norm_mul_quantize_q8_1_kernel(
+        const float * __restrict__ x, const float * __restrict__ weight,
+        void * __restrict__ vy, const int ncols, const float eps) {
+
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    const float * x_row = x + (int64_t)row * ncols;
+    block_q8_1 * y = (block_q8_1 *) vy;
+    const int64_t y_row_offset = (int64_t)row * (ncols / QK8_1);
+
+    // Phase 1: compute sum of squares
+    float sum_sq = 0.0f;
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = x_row[col];
+        sum_sq += xi * xi;
+    }
+
+    // Block reduction
+    __shared__ float s_sum[block_size / 32];
+    sum_sq = warp_reduce_sum<32>(sum_sq);
+    if (tid % 32 == 0) {
+        s_sum[tid / 32] = sum_sq;
+    }
+    __syncthreads();
+
+    if (tid < 32) {
+        float val = tid < (block_size / 32) ? s_sum[tid] : 0.0f;
+        val = warp_reduce_sum<32>(val);
+        if (tid == 0) {
+            s_sum[0] = val;
+        }
+    }
+    __syncthreads();
+
+    const float rms_scale = rsqrtf(s_sum[0] / ncols + eps);
+
+    // Phase 2: normalize, multiply by weight, quantize to q8_1
+    // Each warp handles ncols/(block_size/32) elements = ncols/8 for block_size=256
+    const int warp_id = tid / 32;
+    const int lane = tid % 32;
+    constexpr int nwarps = block_size / 32;
+    const int blocks_per_warp = (ncols / QK8_1) / nwarps;
+
+    for (int b = 0; b < blocks_per_warp; ++b) {
+        const int ib = warp_id * blocks_per_warp + b;
+        const int col = ib * QK8_1 + lane;
+
+        float val = x_row[col] * rms_scale * weight[col];
+        float amax = fabsf(val);
+        float sum = val;
+
+        amax = warp_reduce_max<32>(amax);
+        sum  = warp_reduce_sum<32>(sum);
+
+        const float d = amax / 127.0f;
+        const int8_t q = amax == 0.0f ? 0 : (int8_t)roundf(val / d);
+
+        y[y_row_offset + ib].qs[lane] = q;
+        if (lane == 0) {
+            y[y_row_offset + ib].ds = make_half2(d, sum);
+        }
+    }
+}
+
+void rms_norm_mul_quantize_q8_1_cuda(
+        const float * x, const float * weight, void * vy,
+        const int ncols, const int nrows, const float eps, cudaStream_t stream) {
+    constexpr int block_size = 256;
+    const dim3 grid(nrows);
+    const dim3 block(block_size);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid, block, 0, stream);
+    ggml_cuda_kernel_launch(rms_norm_mul_quantize_q8_1_kernel<block_size>, launch_params,
+        x, weight, vy, ncols, eps);
+}
+
 void quantize_row_q8_1_cuda(
         const float * x, const int32_t * ids, void * vy, const ggml_type type_src0,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,

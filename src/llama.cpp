@@ -9,6 +9,7 @@
 #include "llama-model-loader.h"
 #include "llama-model-saver.h"
 #include "llama-model.h"
+#include "llama-numa.h"
 
 #include "ggml.h"
 #include "ggml-cpp.h"
@@ -23,6 +24,7 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <list>
 #include <stdexcept>
 #include <vector>
 
@@ -279,6 +281,13 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
 static std::pair<int, llama_model *> llama_model_load(struct gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
         const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params) {
     try {
+        // NUMA weight mirroring needs writable, owned (non-mmap) weight buffers: the per-node
+        // copies are made from the buffer contents after load, and mmap-backed buffers alias the
+        // read-only file mapping (which must not be NUMA-bound or duplicated).
+        if (params.use_mmap && llama_numa_mirror_active() && (llama_numa_get_mirror() & GGML_NUMA_MIRROR_WEIGHTS)) {
+            LLAMA_LOG_INFO("%s: NUMA mirror: forcing --no-mmap so weights can be duplicated per node\n", __func__);
+            params.use_mmap = false;
+        }
         llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.use_mmap, params.use_direct_io,
             params.check_tensors, params.no_alloc, params.kv_overrides, params.tensor_buft_overrides);
 
@@ -293,6 +302,50 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         auto * model = dynamic_cast<llama_model_base *>(model_ptr.get());
         if (model == nullptr) {
             GGML_ABORT("fatal error: model does not implement llama_model_base");
+        }
+
+        // resolve deferred -ot META overrides: create the tensor-parallel Meta device over the
+        // model's GPUs and point the sentinel (nullptr buft) overrides at its buffer type. The
+        // Meta device is appended to model->devices only AFTER load_tensors, so the layer-split
+        // logic there keeps distributing layers across the real GPUs only.
+        ggml_backend_dev_t meta_dev = nullptr;
+        if (params.tensor_buft_overrides) {
+            bool need_meta = false;
+            for (const auto * o = params.tensor_buft_overrides; o->pattern != nullptr; ++o) {
+                if (o->buft == nullptr) {
+                    need_meta = true;
+                    break;
+                }
+            }
+            if (need_meta) {
+                std::vector<ggml_backend_dev_t> devs;
+                for (const auto & d : model_ptr->devices) {
+                    if (!d.is_meta && ggml_backend_dev_buffer_type(d.dev) != ggml_backend_cpu_buffer_type()) {
+                        devs.push_back(d.dev);
+                    }
+                }
+                if (devs.size() < 2) {
+                    LLAMA_LOG_ERROR("%s: -ot META overrides need >= 2 GPU devices, got %zu\n", __func__, devs.size());
+                    return {-1, nullptr};
+                }
+                model_ptr->get_split_state_ud.n_devices = devs.size();
+                model_ptr->get_split_state_ud.model     = model_ptr.get();
+                meta_dev = ggml_backend_meta_device(
+                        devs.data(), devs.size(), llama_meta_device_get_split_state, &model_ptr->get_split_state_ud);
+                auto * meta_buft = ggml_backend_dev_buffer_type(meta_dev);
+                LLAMA_LOG_INFO("%s: resolving -ot META overrides to buffer type %s\n", __func__, ggml_backend_buft_name(meta_buft));
+
+                // the patched array must outlive the model load; patterns stay owned by the caller
+                static std::list<std::vector<llama_model_tensor_buft_override>> patched_overrides;
+                patched_overrides.emplace_back();
+                auto & tbo = patched_overrides.back();
+                for (const auto * o = params.tensor_buft_overrides; o->pattern != nullptr; ++o) {
+                    tbo.push_back({o->pattern, o->buft != nullptr ? o->buft : meta_buft});
+                }
+                tbo.push_back({nullptr, nullptr});
+                params.tensor_buft_overrides = tbo.data();
+                ml.tensor_buft_overrides     = tbo.data();
+            }
         }
 
         // loading time will be recalculated after the first eval, so
@@ -329,6 +382,19 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
 
         if (!model->load_tensors(ml)) {
             return {-2, nullptr};
+        }
+
+        // NUMA mirror: duplicate the (now final) host weight buffers per node
+        model->numa_mirror_weights();
+
+        // NUMA expert parallelism: place routed-expert pages per node (after mirroring,
+        // so *_exps tensors excluded from duplication get their single copy bound)
+        model->numa_ep_place_experts(params.use_mmap);
+
+        // deferred -ot META overrides: expose the Meta device to the context/scheduler now that
+        // load_tensors has distributed the layers across the real GPUs
+        if (meta_dev != nullptr) {
+            model_ptr->devices.push_back({true, meta_dev});
         }
 
         return {0, model_ptr.release()};

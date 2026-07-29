@@ -4,6 +4,7 @@
 #include "llama-io.h"
 #include "llama-model.h"
 #include "llama-context.h"
+#include "llama-numa.h"
 
 #include <algorithm>
 #include <cassert>
@@ -361,6 +362,135 @@ llama_kv_cache::llama_kv_cache(
 
     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
+
+    // NUMA mirror: duplicate the KV cache per node (writes are replicated in the graph; reads
+    // are redirected per thread). Runs once the KV buffers exist and have been cleared.
+    init_numa_mirror();
+}
+
+llama_kv_cache::~llama_kv_cache() {
+    // release NUMA mirror per-tensor pointer tables and the extra node-local KV copies
+    for (auto & [ctx, bufs] : ctxs_bufs) {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+            llama_numa_tensor_clear_mirror(t);
+        }
+    }
+    for (auto & mb : numa_mirror_bufs) {
+        for (int n = 1; n < llama_numa_node_count(); ++n) { // node_base[0] aliases the original buffer
+            llama_numa_free(mb.node_base[n], mb.size);
+        }
+    }
+    numa_mirror_bufs.clear();
+}
+
+void llama_kv_cache::init_numa_mirror() {
+    if (!llama_numa_mirror_active() || !(llama_numa_get_mirror() & GGML_NUMA_MIRROR_KV)) {
+        return;
+    }
+    if (!numa_mirror_bufs.empty()) {
+        return; // already mirrored
+    }
+    const int n_nodes = llama_numa_node_count();
+    if (n_nodes < 2) {
+        return;
+    }
+
+    size_t total = 0;
+    for (auto & [ctx, buf] : ctxs_bufs) {
+        GGML_UNUSED(ctx);
+        if (buf && ggml_backend_buffer_is_host(buf.get())) {
+            total += ggml_backend_buffer_get_size(buf.get());
+        }
+    }
+    if (total == 0) {
+        return;
+    }
+
+    const size_t extra = total * (size_t) (n_nodes - 1);
+    const size_t avail = llama_get_available_ram_bytes();
+    LLAMA_LOG_INFO("%s: NUMA mirror: KV cache %.2f GiB; +%.2f GiB for %d-node mirror (%.2f GiB available)\n",
+            __func__, total/1073741824.0, extra/1073741824.0, n_nodes, avail/1073741824.0);
+    if (avail > 0 && extra + (2ull << 30) > avail) {
+        LLAMA_LOG_WARN("%s: NUMA mirror: insufficient RAM to mirror the KV cache; continuing WITHOUT KV mirror\n", __func__);
+        return;
+    }
+
+    for (auto & [ctx, buf] : ctxs_bufs) {
+        GGML_UNUSED(ctx);
+        if (!buf || !ggml_backend_buffer_is_host(buf.get())) {
+            continue;
+        }
+        numa_mirror_buffer mb;
+        mb.buf  = buf.get();
+        mb.size = ggml_backend_buffer_get_size(buf.get());
+        void * base = ggml_backend_buffer_get_base(buf.get());
+        for (int n = 0; n < GGML_NUMA_MAX_NODES; ++n) {
+            mb.node_base[n] = nullptr;
+        }
+        mb.node_base[0] = base;            // node 0 aliases the original buffer ...
+        llama_numa_bind(base, mb.size, 0); // ... migrated onto node 0 (best effort)
+        bool ok = true;
+        for (int n = 1; n < n_nodes; ++n) {
+            void * p = llama_numa_alloc(mb.size, n);
+            if (!p) { ok = false; break; }
+            // the copies start zeroed, matching the just-cleared cache; subsequent writes are
+            // fanned out to every node by ggml_numa_replicate_kv_write (graph CPY hook)
+            mb.node_base[n] = p;
+        }
+        if (!ok) {
+            for (int n = 1; n < n_nodes; ++n) {
+                llama_numa_free(mb.node_base[n], mb.size);
+            }
+            for (auto & done : numa_mirror_bufs) {
+                for (int n = 1; n < n_nodes; ++n) {
+                    llama_numa_free(done.node_base[n], done.size);
+                }
+            }
+            numa_mirror_bufs.clear();
+            LLAMA_LOG_WARN("%s: NUMA mirror: allocation failed; continuing WITHOUT KV mirror\n", __func__);
+            return;
+        }
+        numa_mirror_bufs.push_back(mb);
+    }
+
+    // point every (non-view) cache tensor at its per-node copies
+    int n_mirrored = 0;
+    for (auto & [ctx, buf] : ctxs_bufs) {
+        GGML_UNUSED(buf);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+            if (!t->data || t->view_src || !t->buffer || !ggml_backend_buffer_is_host(t->buffer)) {
+                continue;
+            }
+            const numa_mirror_buffer * mb = nullptr;
+            for (auto & cand : numa_mirror_bufs) {
+                if (cand.buf == t->buffer) { mb = &cand; break; }
+            }
+            if (!mb) {
+                continue;
+            }
+            const size_t offset = (const char *) t->data - (const char *) mb->node_base[0];
+            void * node_data[GGML_NUMA_MAX_NODES];
+            for (int n = 0; n < n_nodes; ++n) {
+                node_data[n] = (char *) mb->node_base[n] + offset;
+            }
+            llama_numa_tensor_set_mirror(t, node_data);
+            ++n_mirrored;
+        }
+    }
+    LLAMA_LOG_INFO("%s: NUMA mirror: duplicated %d KV cache tensors across %d nodes\n",
+            __func__, n_mirrored, n_nodes);
+}
+
+void llama_kv_cache::resync_numa_mirror() {
+    if (numa_mirror_bufs.empty()) {
+        return;
+    }
+    for (auto & [ctx, buf] : ctxs_bufs) {
+        GGML_UNUSED(buf);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+            llama_numa_tensor_resync(t);
+        }
+    }
 }
 
 void llama_kv_cache::clear(bool data) {
@@ -373,6 +503,9 @@ void llama_kv_cache::clear(bool data) {
         for (auto & [_, buf] : ctxs_bufs) {
             ggml_backend_buffer_clear(buf.get(), 0);
         }
+        // ggml_backend_buffer_clear zeroes only node 0; mirror the zeroing to the other node copies
+        // (defensive — cleared cells are normally rewritten before re-read, but keep copies consistent)
+        resync_numa_mirror();
     }
 }
 
@@ -848,6 +981,10 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
                 }
             }
         }
+
+        // stream copies wrote node 0's KV copies directly (ggml_backend_tensor_copy), bypassing
+        // graph-CPY replication — re-sync the other node copies. no-op when not mirroring.
+        resync_numa_mirror();
     }
 
     if (do_shift) {
@@ -877,6 +1014,11 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
                 LLAMA_LOG_ERROR("%s: failed to compute K-shift\n", __func__);
                 return updated;
             }
+
+            // For non-quantized K, the K-shift rotates the cache *in place* (RoPE), bypassing
+            // the graph-CPY mirror replication, so the per-node copies keep the un-rotated K.
+            // Re-sync them. No-op when NUMA mirroring is off. (Cold path: only on context shift.)
+            resync_numa_mirror();
 
             updated = true;
         }
@@ -2065,6 +2207,11 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
             throw std::runtime_error("failed to restore kv cache");
         }
     }
+
+    // state restore wrote node 0's KV copies directly (io.read_tensor into the tensor data),
+    // bypassing graph-CPY replication — re-sync the other node copies so attention on node>0
+    // reads the restored K/V, not stale/zero data. No-op when not mirroring.
+    resync_numa_mirror();
 }
 
 void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t & cr, llama_seq_id seq_id) const {

@@ -88,6 +88,9 @@ struct llama_context {
     float * get_embeddings_nextn();
     float * get_embeddings_nextn_ith(int32_t i);
 
+    float * get_embeddings_pre_norm();
+    float * get_embeddings_pre_norm_ith(int32_t i);
+
     float * get_embeddings_layer_inp(uint32_t lid);
 
     llama_token * get_sampled_tokens() const;
@@ -114,6 +117,7 @@ struct llama_context {
 
     void set_embeddings (bool value);
     void set_embeddings_nextn(bool value, bool masked);
+    void set_embeddings_pre_norm(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
@@ -299,6 +303,11 @@ private:
     // populated only when cparams.embeddings_nextn is enabled and the model graph
     // sets llm_graph_result::t_h_nextn
     buffer_view<float> embd_nextn = {nullptr, 0};
+
+    // MTP chaining state before the final output norm ([n_outputs][n_embd_h])
+    // populated only when cparams.embeddings_pre_norm is enabled and the model graph
+    // sets llm_graph_result::t_h_pre_norm
+    buffer_view<float> embd_pre_norm = {nullptr, 0};
 
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true

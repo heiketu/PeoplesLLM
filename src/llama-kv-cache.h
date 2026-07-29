@@ -5,6 +5,8 @@
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
 
+#include "ggml-cpu.h" // GGML_NUMA_MAX_NODES
+
 #include <unordered_map>
 #include <vector>
 
@@ -114,7 +116,7 @@ public:
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share);
 
-    ~llama_kv_cache() = default;
+    ~llama_kv_cache();
 
     //
     // llama_memory_i
@@ -264,6 +266,23 @@ private:
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
+
+    // NUMA mirror: per-(host KV buffer) node-local copies. node_base[0] aliases the original
+    // buffer; node_base[1..n-1] are extra copies from llama_numa_alloc, freed in the destructor.
+    struct numa_mirror_buffer {
+        ggml_backend_buffer_t buf;
+        size_t size;
+        void * node_base[GGML_NUMA_MAX_NODES];
+    };
+    std::vector<numa_mirror_buffer> numa_mirror_bufs;
+
+    // NUMA mirror: duplicate the KV buffers per node and point each k/v tensor at its copies.
+    // called once at the end of the constructor; no-op unless strategy == MIRROR && KV flag set.
+    void init_numa_mirror();
+
+    // re-sync all node copies with node 0 after writes that bypass graph-CPY replication
+    // (buffer clear, state restore, stream copy, in-place K-shift). cold paths only.
+    void resync_numa_mirror();
 
     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method

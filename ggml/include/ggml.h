@@ -574,6 +574,10 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_DSV4_HC_PREP,
+        GGML_OP_DSV4_MOE_PROBS,
+        GGML_OP_DSV4_MOE_TOPK,
+        GGML_OP_DSV4_MOE_WEIGHTS,
 
         GGML_OP_UNARY,
 
@@ -701,7 +705,12 @@ extern "C" {
 
         void * extra; // extra things e.g. for ggml-cuda.cu
 
-        char padding[8];
+        // NUMA mirror: when non-NULL, points to a struct holding one node-local copy of this
+        // tensor's data per NUMA node (see ggml_numa_tensor_data in ggml-cpu). NULL for the vast
+        // majority of tensors (the "not mirrored" sentinel). Kept as opaque void * here because
+        // the mirror is a CPU-backend concept; takes the place of the old padding so the struct
+        // size is unchanged.
+        void * data_numa;
     };
 
     static const size_t GGML_TENSOR_SIZE = sizeof(struct ggml_tensor);
@@ -2426,6 +2435,23 @@ extern "C" {
             float                 max_bias,
             float                 logit_softcap);
 
+    // flash attention over two consecutive KV segments (k1/v1 rows followed by k2/v2 rows),
+    // avoiding the full-KV concat. mask1 covers k1 rows, mask2 covers k2 rows. Result and
+    // numerics are identical to flash attention over ggml_concat(k1, k2) with a matching
+    // concatenated mask.
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_2kv(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k1,
+            struct ggml_tensor  * v1,
+            struct ggml_tensor  * k2,
+            struct ggml_tensor  * v2,
+            struct ggml_tensor  * mask1,
+            struct ggml_tensor  * mask2,
+            float                 scale,
+            float                 max_bias,
+            float                 logit_softcap);
+
     GGML_API void ggml_flash_attn_ext_set_prec(
             struct ggml_tensor * a,
             enum ggml_prec       prec);
@@ -2640,6 +2666,56 @@ extern "C" {
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
 
+    // hc_prep: fused pre + post + comb. mixes [(2 + hc)*hc, n_tokens], scale [3],
+    //          base [(2 + hc)*hc] -> [(2 + hc)*hc, n_tokens] packed as:
+    //   rows [0, hc)          : pre[r, t]  = sigmoid(mixes[r, t]*scale[0] + base[r]) + eps
+    //   rows [hc, 2*hc)       : post[r, t] = sigmoid(mixes[hc + r, t]*scale[1] + base[hc + r])*2
+    //   rows [2*hc, (2+hc)*hc): comb, same as ggml_dsv4_hc_comb
+    //   (row 2*hc + dst + hc*src == comb[dst, src, t])
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_prep(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * mixes,
+            struct ggml_tensor  * scale,
+            struct ggml_tensor  * base,
+            float                 eps,
+            int32_t               n_iter);
+
+    // dsv4_moe_probs: fused sigmoid + bias for the MoE router.
+    //   logits [n_expert, n_tokens], bias [n_expert] -> [2*n_expert, n_tokens] packed as:
+    //   rows [0, n_expert)        : probs           = sigmoid(logits)
+    //   rows [n_expert, 2*n_exp)  : selection_probs = sigmoid(logits) + bias
+    GGML_API struct ggml_tensor * ggml_dsv4_moe_probs(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * logits,
+            struct ggml_tensor  * bias);
+
+    // dsv4_moe_topk: fused group-mask + top-k expert selection (DeepSeek V3/V4 style).
+    //   selection_probs [n_expert, n_tokens] -> indices [n_expert_used, n_tokens] (I32)
+    //   Experts are organized in n_expert_groups groups; each group is scored by the sum
+    //   of its top-2 selection_probs, only the top n_group_used groups are kept (others
+    //   masked to -inf), then the top n_expert_used experts are selected.
+    //   Selection order matches ggml_argsort_top_k (descending, ties keep lower index).
+    GGML_API struct ggml_tensor * ggml_dsv4_moe_topk(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * selection_probs,
+            int32_t               n_expert_groups,
+            int32_t               n_group_used,
+            int32_t               n_expert_used);
+
+    // dsv4_moe_weights: fused gather + optional normalize + optional scale of expert weights.
+    //   probs [n_expert, n_tokens] (unbiased), selected [n_expert_used, n_tokens] (I32)
+    //   -> weights [n_expert_used, n_tokens]:
+    //   w[i, t] = probs[selected[i, t], t]
+    //   if normalize: w[i, t] /= clamp(sum_i w[i, t], 6.103515625e-5, +inf)
+    //   if scale != 0 && scale != 1: w[i, t] *= scale
+    //   The row sum uses the same reduction order as the CUDA sum_rows kernel.
+    GGML_API struct ggml_tensor * ggml_dsv4_moe_weights(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * probs,
+            struct ggml_tensor  * selected,
+            float                 scale,
+            int32_t               normalize);
+
     // custom operators
 
     typedef void (*ggml_custom1_op_t)(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith, int nth, void * userdata);
@@ -2816,6 +2892,9 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_graph_get_grad_acc(const struct ggml_cgraph * cgraph, const struct ggml_tensor * node);
 
     // print info and performance information for the graph
+    // set the number of tokens in the batch that built this graph (see ggml_cgraph::n_batch)
+    GGML_API void ggml_graph_set_n_batch(struct ggml_cgraph * cgraph, int n_batch);
+
     GGML_API void ggml_graph_print(const struct ggml_cgraph * cgraph);
 
     // dump the graph into a file using the dot format

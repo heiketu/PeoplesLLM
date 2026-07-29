@@ -1083,6 +1083,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
+    "DSV4_HC_PREP",
+    "DSV4_MOE_PROBS",
+    "DSV4_MOE_TOPK",
+    "DSV4_MOE_WEIGHTS",
 
     "UNARY",
 
@@ -1100,7 +1104,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1198,6 +1202,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
+    "dsv4_hc_prep(mixes, scale, base)",
+    "dsv4_moe_probs(logits, bias)",
+    "dsv4_moe_topk(selection_probs)",
+    "dsv4_moe_weights(probs, selected)",
 
     "unary(x)",
 
@@ -1215,7 +1223,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -1819,7 +1827,7 @@ static struct ggml_tensor * ggml_new_tensor_impl(
         /*.data         =*/ obj_alloc_size > 0 ? (void *)(result + 1) : data,
         /*.name         =*/ { 0 },
         /*.extra        =*/ NULL,
-        /*.padding      =*/ { 0 },
+        /*.data_numa    =*/ NULL,
     };
 
     // TODO: this should not be needed as long as we don't rely on aligned SIMD loads
@@ -5443,6 +5451,68 @@ struct ggml_tensor * ggml_flash_attn_ext(
     return result;
 }
 
+// ggml_flash_attn_ext_2kv
+
+struct ggml_tensor * ggml_flash_attn_ext_2kv(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k1,
+        struct ggml_tensor  * v1,
+        struct ggml_tensor  * k2,
+        struct ggml_tensor  * v2,
+        struct ggml_tensor  * mask1,
+        struct ggml_tensor  * mask2,
+        float                 scale,
+        float                 max_bias,
+        float                 logit_softcap) {
+    GGML_ASSERT(ggml_can_mul_mat(k1, q));
+    GGML_ASSERT(q->ne[3] == k1->ne[3]);
+    GGML_ASSERT(q->ne[3] == v1->ne[3]);
+
+    // the second segment must have the same head structure as the first
+    GGML_ASSERT(k2->type == k1->type);
+    GGML_ASSERT(v2->type == v1->type);
+    GGML_ASSERT(k2->ne[0] == k1->ne[0]);
+    GGML_ASSERT(v2->ne[0] == v1->ne[0]);
+    GGML_ASSERT(k2->ne[2] == k1->ne[2] && k2->ne[3] == k1->ne[3]);
+    GGML_ASSERT(v2->ne[2] == v1->ne[2] && v2->ne[3] == v1->ne[3]);
+
+    if (mask1) {
+        GGML_ASSERT(mask1->type == GGML_TYPE_F16);
+        GGML_ASSERT(ggml_is_contiguous(mask1));
+        GGML_ASSERT(q->ne[2] % mask1->ne[2] == 0);
+        GGML_ASSERT(q->ne[3] % mask1->ne[3] == 0);
+    }
+    if (mask2) {
+        GGML_ASSERT(mask2->type == GGML_TYPE_F16);
+        GGML_ASSERT(ggml_is_contiguous(mask2));
+        GGML_ASSERT(q->ne[2] % mask2->ne[2] == 0);
+        GGML_ASSERT(q->ne[3] % mask2->ne[3] == 0);
+    }
+
+    if (max_bias > 0.0f) {
+        GGML_ASSERT(mask1);
+    }
+
+    // permute(0, 2, 1, 3)
+    int64_t ne[4] = { v1->ne[0], q->ne[2], q->ne[1], q->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    float params[] = { scale, max_bias, logit_softcap };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_FLASH_ATTN_EXT;
+    result->src[0] = q;
+    result->src[1] = k1;
+    result->src[2] = v1;
+    result->src[3] = mask1;
+    result->src[5] = k2;
+    result->src[6] = v2;
+    result->src[7] = mask2;
+
+    return result;
+}
+
 
 void ggml_flash_attn_ext_set_prec(
         struct ggml_tensor * a,
@@ -6470,6 +6540,153 @@ struct ggml_tensor * ggml_dsv4_hc_post(
     return result;
 }
 
+// ggml_dsv4_hc_prep
+
+struct ggml_tensor * ggml_dsv4_hc_prep(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * mixes,
+        struct ggml_tensor  * scale,
+        struct ggml_tensor  * base,
+        float                 eps,
+        int32_t               n_iter) {
+    GGML_ASSERT(mixes->type == GGML_TYPE_F32);
+    GGML_ASSERT(scale->type == GGML_TYPE_F32);
+    GGML_ASSERT(base->type == GGML_TYPE_F32);
+    GGML_ASSERT(n_iter > 0);
+
+    const int64_t hc_mix_dim = mixes->ne[0];
+    const int64_t n_tokens   = mixes->ne[1];
+
+    int64_t hc = 0;
+    for (int64_t i = 1; i*i + 2*i <= hc_mix_dim; ++i) {
+        if ((2 + i)*i == hc_mix_dim) {
+            hc = i;
+            break;
+        }
+    }
+
+    GGML_ASSERT(hc > 0);
+    GGML_ASSERT(hc == 4);
+    GGML_ASSERT(mixes->ne[2] == 1);
+    GGML_ASSERT(mixes->ne[3] == 1);
+    GGML_ASSERT(scale->ne[0] >= 3);
+    GGML_ASSERT(scale->ne[1] == 1);
+    GGML_ASSERT(scale->ne[2] == 1);
+    GGML_ASSERT(scale->ne[3] == 1);
+    GGML_ASSERT(base->ne[0] == hc_mix_dim);
+    GGML_ASSERT(base->ne[1] == 1);
+    GGML_ASSERT(base->ne[2] == 1);
+    GGML_ASSERT(base->ne[3] == 1);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc_mix_dim, n_tokens);
+
+    ggml_set_op_params_f32(result, 0, eps);
+    ggml_set_op_params_i32(result, 1, n_iter);
+
+    result->op     = GGML_OP_DSV4_HC_PREP;
+    result->src[0] = mixes;
+    result->src[1] = scale;
+    result->src[2] = base;
+
+    return result;
+}
+
+// ggml_dsv4_moe_probs
+
+struct ggml_tensor * ggml_dsv4_moe_probs(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * logits,
+        struct ggml_tensor  * bias) {
+    GGML_ASSERT(logits->type == GGML_TYPE_F32);
+    GGML_ASSERT(bias->type == GGML_TYPE_F32);
+
+    const int64_t n_expert = logits->ne[0];
+    const int64_t n_tokens = logits->ne[1];
+
+    GGML_ASSERT(logits->ne[2] == 1);
+    GGML_ASSERT(logits->ne[3] == 1);
+    GGML_ASSERT(bias->ne[0] == n_expert);
+    GGML_ASSERT(bias->ne[1] == 1);
+    GGML_ASSERT(bias->ne[2] == 1);
+    GGML_ASSERT(bias->ne[3] == 1);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2*n_expert, n_tokens);
+
+    result->op     = GGML_OP_DSV4_MOE_PROBS;
+    result->src[0] = logits;
+    result->src[1] = bias;
+
+    return result;
+}
+
+// ggml_dsv4_moe_topk
+
+struct ggml_tensor * ggml_dsv4_moe_topk(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * selection_probs,
+        int32_t               n_expert_groups,
+        int32_t               n_group_used,
+        int32_t               n_expert_used) {
+    GGML_ASSERT(selection_probs->type == GGML_TYPE_F32);
+
+    const int64_t n_expert = selection_probs->ne[0];
+    const int64_t n_tokens = selection_probs->ne[1];
+
+    GGML_ASSERT(selection_probs->ne[2] == 1);
+    GGML_ASSERT(selection_probs->ne[3] == 1);
+    GGML_ASSERT(n_expert_groups > 1);
+    GGML_ASSERT(n_expert % n_expert_groups == 0);
+    GGML_ASSERT(n_group_used > 0 && n_group_used <= n_expert_groups);
+    GGML_ASSERT(n_expert_used > 0 && n_expert_used <= n_expert);
+    GGML_ASSERT((int64_t) n_group_used*(n_expert/n_expert_groups) >= n_expert_used);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_expert_used, n_tokens);
+
+    ggml_set_op_params_i32(result, 0, n_expert_groups);
+    ggml_set_op_params_i32(result, 1, n_group_used);
+    ggml_set_op_params_i32(result, 2, n_expert_used);
+
+    result->op     = GGML_OP_DSV4_MOE_TOPK;
+    result->src[0] = selection_probs;
+
+    return result;
+}
+
+// ggml_dsv4_moe_weights
+
+struct ggml_tensor * ggml_dsv4_moe_weights(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * probs,
+        struct ggml_tensor  * selected,
+        float                 scale,
+        int32_t               normalize) {
+    GGML_ASSERT(probs->type == GGML_TYPE_F32);
+    GGML_ASSERT(selected->type == GGML_TYPE_I32);
+
+    const int64_t n_expert      = probs->ne[0];
+    const int64_t n_tokens      = probs->ne[1];
+    const int64_t n_expert_used = selected->ne[0];
+
+    GGML_ASSERT(probs->ne[2] == 1);
+    GGML_ASSERT(probs->ne[3] == 1);
+    GGML_ASSERT(selected->ne[1] == n_tokens);
+    GGML_ASSERT(selected->ne[2] == 1);
+    GGML_ASSERT(selected->ne[3] == 1);
+    GGML_ASSERT(n_expert_used > 0 && n_expert_used <= n_expert);
+    GGML_ASSERT(n_expert_used <= 32); // reduction order matches the CUDA sum_rows kernel
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_expert_used, n_tokens);
+
+    ggml_set_op_params_f32(result, 0, scale);
+    ggml_set_op_params_i32(result, 1, normalize);
+
+    result->op     = GGML_OP_DSV4_MOE_WEIGHTS;
+    result->src[0] = probs;
+    result->src[1] = selected;
+
+    return result;
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 
 struct ggml_hash_set ggml_hash_set_new(size_t size) {
@@ -7365,6 +7582,7 @@ struct ggml_cgraph * ggml_new_graph_custom(struct ggml_context * ctx, size_t siz
         /*.use_counts   =*/ use_counts_ptr,
         /*.hash_table   =*/ { hash_size, hash_used, hash_keys_ptr },
         /*.order        =*/ GGML_CGRAPH_EVAL_ORDER_LEFT_TO_RIGHT,
+        /*.n_batch      =*/ 0,
         /*.uid          =*/ 0,
     };
 
@@ -7393,6 +7611,7 @@ struct ggml_cgraph ggml_graph_view(struct ggml_cgraph * cgraph0, int i0, int i1)
         /*.use_counts       =*/ cgraph0->use_counts,
         /*.visited_hash_set =*/ cgraph0->visited_hash_set,
         /*.order            =*/ cgraph0->order,
+        /*.n_batch          =*/ cgraph0->n_batch,
         /*.uid              =*/ 0
     };
 
@@ -7563,6 +7782,10 @@ struct ggml_tensor * ggml_graph_get_grad(const struct ggml_cgraph * cgraph, cons
 struct ggml_tensor * ggml_graph_get_grad_acc(const struct ggml_cgraph * cgraph, const struct ggml_tensor * node) {
     const size_t igrad = ggml_hash_find(&cgraph->visited_hash_set, node);
     return igrad != GGML_HASHSET_FULL && ggml_bitset_get(cgraph->visited_hash_set.used, igrad) && cgraph->grad_accs ? cgraph->grad_accs[igrad] : NULL;
+}
+
+void ggml_graph_set_n_batch(struct ggml_cgraph * cgraph, int n_batch) {
+    cgraph->n_batch = n_batch;
 }
 
 void ggml_graph_print(const struct ggml_cgraph * cgraph) {

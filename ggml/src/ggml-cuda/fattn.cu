@@ -369,6 +369,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     const ggml_tensor * V     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
 
+    // ggml_flash_attn_ext_2kv: the CUDA kernels do not read the second KV segment
+    // (src[5..7]); running them would silently drop it. Fall back to the CPU path.
+    if (dst->src[5] != nullptr) {
+        return BEST_FATTN_KERNEL_NONE;
+    }
+
     const int gqa_ratio = Q->ne[2] / K->ne[2];
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
 

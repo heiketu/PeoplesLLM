@@ -622,7 +622,7 @@ struct server_slot {
             SLT_INF(*this,
                     "draft acceptance = %0.5f (%5d accepted / %5d generated), mean len = %5.2f\n",
                     draft_ratio, n_draft_accepted, n_draft_total, mean_acc_len);
-            SLT_TRC(*this,
+            SLT_INF(*this,
                     "     acc per pos = (%s)\n", acceptance_rates_per_pos.c_str());
         }
 

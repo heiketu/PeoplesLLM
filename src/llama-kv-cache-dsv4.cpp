@@ -9,11 +9,15 @@
 #include <algorithm>
 #include <cassert>
 #include <climits>
+#include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
 #include <sstream>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 static constexpr uint32_t DSV4_CSA_RATIO = 4;
 static constexpr uint32_t DSV4_HCA_RATIO = 128;
@@ -937,6 +941,10 @@ ggml_tensor * llama_dsv4_comp_state::get_kv(ggml_context * ctx, int32_t il) cons
     return ggml_reshape_2d(ctx, state, state->ne[0], state->ne[1]*state->ne[2]);
 }
 
+ggml_tensor * llama_dsv4_comp_state::get_kv_storage(int32_t il) const {
+    return layers[map_layer_ids.at(il)].kv;
+}
+
 ggml_tensor * llama_dsv4_comp_state::get_score(ggml_context * ctx, int32_t il) const {
     const int32_t ids = map_layer_ids.at(il);
 
@@ -1431,6 +1439,115 @@ void llama_kv_cache_dsv4::clear_compressed(llama_seq_id seq_id, bool data) {
     csa_state->clear(seq_id, data);
     hca_state->clear(seq_id, data);
     lid_state->clear(seq_id, data);
+}
+
+//
+// llama_kv_cache_dsv4_raw_context
+//
+
+static bool dsv4_dbg_sums(const ggml_tensor * t, std::vector<float> & dst) {
+    const size_t nbytes = ggml_nbytes(t);
+    std::vector<uint8_t> buf(nbytes);
+    ggml_backend_tensor_get(t, buf.data(), 0, nbytes);
+
+    const int64_t n = ggml_nelements(t);
+
+    dst.resize(n);
+
+    if (t->type == GGML_TYPE_F32) {
+        const float * d = (const float *) buf.data();
+        for (int64_t i = 0; i < n; ++i) {
+            dst[i] = d[i];
+        }
+    } else if (t->type == GGML_TYPE_F16) {
+        const ggml_fp16_t * d = (const ggml_fp16_t *) buf.data();
+        for (int64_t i = 0; i < n; ++i) {
+            dst[i] = ggml_fp16_to_fp32(d[i]);
+        }
+    } else {
+        return false;
+    }
+
+    return true;
+}
+
+static void dsv4_dbg_cksum(const char * tag, const char * name, const ggml_tensor * t, int n_rows_dump = 0) {
+    if (t == nullptr || t->buffer == nullptr) {
+        fprintf(stderr, "DSV4DBG %s %s: <none>\n", tag, name);
+        return;
+    }
+
+    std::vector<float> vals;
+    if (!dsv4_dbg_sums(t, vals)) {
+        fprintf(stderr, "DSV4DBG %s %s: unsupported type %s\n", tag, name, ggml_type_name(t->type));
+        return;
+    }
+
+    // layout: [ne0, n_rows, n_stream]
+    const int64_t ne0     = t->ne[0];
+    const int64_t n_row   = t->ne[1];
+    const int64_t n_stream = t->ne[2];
+
+    double tot_sum = 0.0;
+    double tot_abs = 0.0;
+
+    int64_t s_best = 0;
+    double  s_best_abs = -1.0;
+
+    std::string per_stream;
+    for (int64_t s = 0; s < n_stream; ++s) {
+        double sum = 0.0;
+        double abs = 0.0;
+        for (int64_t r = 0; r < n_row; ++r) {
+            for (int64_t e = 0; e < ne0; ++e) {
+                const float v = vals[(s*n_row + r)*ne0 + e];
+                sum += v;
+                abs += fabsf(v);
+            }
+        }
+        tot_sum += sum;
+        tot_abs += abs;
+        if (abs > s_best_abs) {
+            s_best_abs = abs;
+            s_best     = s;
+        }
+        char tmp[64];
+        snprintf(tmp, sizeof(tmp), "%s%.6e", s == 0 ? "" : ",", abs);
+        per_stream += tmp;
+    }
+
+    fprintf(stderr, "DSV4DBG %s %s: sum=%.9e sumabs=%.9e streams=[%s]\n", tag, name, tot_sum, tot_abs, per_stream.c_str());
+
+    if (n_rows_dump > 0) {
+        std::string rows;
+        for (int64_t r = 0; r < std::min<int64_t>(n_row, n_rows_dump); ++r) {
+            double sum = 0.0;
+            for (int64_t e = 0; e < ne0; ++e) {
+                sum += vals[(s_best*n_row + r)*ne0 + e];
+            }
+            char tmp[64];
+            snprintf(tmp, sizeof(tmp), "%s%.4e", r == 0 ? "" : ",", sum);
+            rows += tmp;
+        }
+        fprintf(stderr, "DSV4DBG %s %s rows(s=%d)=[%s]\n", tag, name, (int) s_best, rows.c_str());
+    }
+}
+
+void llama_kv_cache_dsv4_debug_state(const llama_kv_cache_dsv4 * kv, const char * tag) {
+    const int32_t il_csa  = kv->get_csa()->get_layer_ids()[0];
+    const int32_t il_hca  = kv->get_hca()->get_layer_ids()[0];
+    const auto    ids_raw = kv->get_raw()->get_swa()->get_layer_ids();
+    const int32_t il_raw0 = ids_raw.front();
+    const int32_t il_raw1 = ids_raw.back();
+
+    dsv4_dbg_cksum(tag, "raw_k0",  kv->get_raw()->get_swa()->get_k_storage(il_raw0));
+    dsv4_dbg_cksum(tag, "raw_k1",  kv->get_raw()->get_swa()->get_k_storage(il_raw1));
+    dsv4_dbg_cksum(tag, "csa_k",  kv->get_csa()->get_k_storage(il_csa), 40);
+    dsv4_dbg_cksum(tag, "lid_k",  kv->get_lid()->get_k_storage(il_csa), 40);
+    dsv4_dbg_cksum(tag, "hca_k",  kv->get_hca()->get_k_storage(il_hca));
+    dsv4_dbg_cksum(tag, "csa_st", kv->get_csa_state()->get_kv_storage(il_csa), 8);
+    dsv4_dbg_cksum(tag, "lid_st", kv->get_lid_state()->get_kv_storage(il_csa));
+    dsv4_dbg_cksum(tag, "hca_st", kv->get_hca_state()->get_kv_storage(il_hca));
 }
 
 //

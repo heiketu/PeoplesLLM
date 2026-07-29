@@ -2329,6 +2329,18 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_DSV4_HC_POST:
             ggml_cuda_op_dsv4_hc_post(ctx, dst);
             break;
+        case GGML_OP_DSV4_HC_PREP:
+            ggml_cuda_op_dsv4_hc_prep(ctx, dst);
+            break;
+        case GGML_OP_DSV4_MOE_PROBS:
+            ggml_cuda_op_dsv4_moe_probs(ctx, dst);
+            break;
+        case GGML_OP_DSV4_MOE_TOPK:
+            ggml_cuda_op_dsv4_moe_topk(ctx, dst);
+            break;
+        case GGML_OP_DSV4_MOE_WEIGHTS:
+            ggml_cuda_op_dsv4_moe_weights(ctx, dst);
+            break;
         case GGML_OP_RWKV_WKV7:
             ggml_cuda_op_rwkv_wkv7(ctx, dst);
             break;
@@ -3812,6 +3824,65 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return fused_node_count - 1;
     }
 
+    // NOTE: RMS_NORM+MUL+MUL_MAT fusion disabled for TG: single-row fused kernel (1 block)
+    // is slower than separate kernels (17 blocks) due to poor SM utilization.
+    // Only beneficial for batch PP where many rows amortize the overhead.
+#if 0
+    if (ggml_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_MUL_MAT }) &&
+        ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
+        ggml_tensor * mul_mat_node = cgraph->nodes[i + 2];
+        if (mul_mat_node->src[0]->type != GGML_TYPE_F32 && mul_mat_node->src[0]->type != GGML_TYPE_F16 &&
+            mul_mat_node->src[0]->type != GGML_TYPE_BF16 &&
+            mul_mat_node->ne[1] == 1 && node->ne[1] == 1 &&
+            ggml_is_contiguous(node->src[0])) {
+
+            // rms_norm input and params
+            const ggml_tensor * rms_src = node->src[0];
+            float eps = 0.0f;
+            memcpy(&eps, node->op_params, sizeof(float));
+
+            // mul weight (the norm weight broadcast)
+            const ggml_tensor * mul_weight = (cgraph->nodes[i+1]->src[0] == node) ?
+                cgraph->nodes[i+1]->src[1] : cgraph->nodes[i+1]->src[0];
+
+            // matmul src0 (quantized weight matrix)
+            const ggml_tensor * mm_src0 = mul_mat_node->src[0];
+            const size_t ts_src0 = ggml_type_size(mm_src0->type);
+
+            const int64_t ne10 = node->ne[0]; // ncols = n_embd
+            const int64_t ne11 = 1;           // single token
+
+            // Allocate q8_1 buffer
+            const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+            ggml_cuda_pool_alloc<char> src1_q8_1(cuda_ctx->pool(),
+                ne10_padded * sizeof(block_q8_1) / QK8_1);
+
+            cudaStream_t stream = cuda_ctx->stream();
+
+            // Fused rms_norm + mul + quantize
+            rms_norm_mul_quantize_q8_1_cuda(
+                (const float *) rms_src->data, (const float *) mul_weight->data,
+                src1_q8_1.get(), ne10, 1, eps, stream);
+
+            // Call vec_dot with pre-quantized buffer
+            const int64_t s01 = mm_src0->nb[1] / ts_src0;
+            const int64_t s11 = ne10_padded / QK8_1;
+            float * dst_d = (float *) mul_mat_node->data;
+            const int64_t s1 = mul_mat_node->nb[1] / ggml_type_size(mul_mat_node->type);
+
+            ggml_cuda_mm_fusion_args_device no_fusion{};
+            mul_mat_vec_q_switch_type(
+                mm_src0->data, mm_src0->type, src1_q8_1.get(), nullptr, no_fusion, dst_d,
+                mm_src0->ne[0], mm_src0->ne[1], 1, s01, s11, s1,
+                mm_src0->ne[2], 1, 1, mm_src0->nb[2]/ts_src0, s11, mul_mat_node->nb[2]/ggml_type_size(mul_mat_node->type),
+                mm_src0->ne[3], 1, mm_src0->nb[3]/ts_src0, s11, mul_mat_node->nb[3]/ggml_type_size(mul_mat_node->type),
+                0, stream);
+
+            return 2; // skip RMS_NORM+MUL+MUL_MAT (3 nodes total, return extra 2)
+        }
+    }
+#endif
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
         ggml_cuda_op_rms_norm_fused_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
         return 2;
@@ -5107,6 +5178,17 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_DSV4_HC_POST:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
+                op->type == GGML_TYPE_F32;
+        case GGML_OP_DSV4_HC_PREP:
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
+        case GGML_OP_DSV4_MOE_PROBS:
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                op->type == GGML_TYPE_F32;
+        case GGML_OP_DSV4_MOE_TOPK:
+            return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_I32;
+        case GGML_OP_DSV4_MOE_WEIGHTS:
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_I32 &&
                 op->type == GGML_TYPE_F32;
         case GGML_OP_FLASH_ATTN_EXT:
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);

@@ -139,6 +139,7 @@ enum llm_type {
     LLM_TYPE_310B_A15B, // /MiMo-V2-Flash
     LLM_TYPE_355B_A32B, // GLM-4.5
     LLM_TYPE_397B_A17B, // Qwen3.5
+    LLM_TYPE_428B_A23B, // MiniMax M3
     LLM_TYPE_685B_A37B, // DeepSeek V3.2
     LLM_TYPE_744B_A40B, // GLM-5
     LLM_TYPE_E2B,
@@ -212,6 +213,12 @@ struct llama_layer_nextn {
     struct ggml_tensor * eh_proj               = nullptr;
     struct ggml_tensor * eh_proj_s             = nullptr;
     struct ggml_tensor * eh_proj_in_s          = nullptr;
+    // DSV4 MTP: separate embedding/hidden projections and hyper-connection head
+    struct ggml_tensor * e_proj                = nullptr;
+    struct ggml_tensor * h_proj                = nullptr;
+    struct ggml_tensor * hc_head_fn            = nullptr;
+    struct ggml_tensor * hc_head_base          = nullptr;
+    struct ggml_tensor * hc_head_scale         = nullptr;
     struct ggml_tensor * embed_tokens          = nullptr;
     struct ggml_tensor * enorm                 = nullptr;
     struct ggml_tensor * hnorm                 = nullptr;
@@ -653,6 +660,13 @@ struct llama_model {
     uint64_t n_elements() const;
 
     void print_info() const;
+
+    // NUMA mirror: duplicate the model's host weight buffers once per NUMA node and point each
+    // weight tensor at its per-node copies. Must run after all weights are final (post load).
+    // No-op unless the NUMA strategy is MIRROR and weight mirroring is enabled. Idempotent.
+    void numa_mirror_weights();
+    void numa_mirror_weights_partial();
+    void numa_ep_place_experts(bool used_mmap);
 
     ggml_backend_dev_t dev_layer(int il) const;
     ggml_backend_dev_t dev_output() const;

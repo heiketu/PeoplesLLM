@@ -1196,6 +1196,13 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
         }
 
+        // MLA wo_a (attn_output_a) is consumed via a 3D reshape + mul_mat in the graph.
+        // The repack forward cannot handle 3D weight views, and the generic path would
+        // read interleaved repacked data as plain rows -> keep it out of the repack buffer.
+        if (tn.tensor == LLM_TENSOR_ATTN_OUT_A && strcmp(ggml_backend_buft_name(buft), "CPU_REPACK") == 0) {
+            buft = ggml_backend_cpu_buffer_type();
+        }
+
         // avoid using a host buffer when using mmap
         auto * buft_dev = ggml_backend_buft_get_device(buft);
         if (use_mmap && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev)) {
@@ -1573,7 +1580,10 @@ bool llama_model_loader::load_all_data(
         } else {
             const auto & file = files.at(weight->idx);
 
-            if (ggml_backend_buffer_is_host(cur->buffer)) {
+            // plain CPU buffers can be filled with a raw read; buffers with a custom
+            // set_tensor iface (e.g. repack) must go through ggml_backend_tensor_set
+            if (ggml_backend_buffer_is_host(cur->buffer) &&
+                ggml_backend_buffer_get_type(cur->buffer) == ggml_backend_cpu_buffer_type()) {
                 file->seek(weight->offs, SEEK_SET);
                 file->read_raw(cur->data, n_size);
                 if (check_tensors) {

@@ -6,6 +6,7 @@
 
 #include "ggml-opt.h"
 #include "ggml.h"
+#include "ggml-cpu.h" // ggml_numa_mirror_flags
 
 #include <set>
 #include <sstream>
@@ -490,6 +491,7 @@ struct common_params {
     void * cb_eval_user_data                 = nullptr;
 
     ggml_numa_strategy numa = GGML_NUMA_STRATEGY_DISABLED;
+    uint32_t numa_mirror = GGML_NUMA_MIRROR_ALL; // which data to duplicate per node when numa == mirror
 
     enum llama_rope_scaling_type rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED;
     enum llama_pooling_type      pooling_type      = LLAMA_POOLING_TYPE_UNSPECIFIED; // pooling type for embeddings

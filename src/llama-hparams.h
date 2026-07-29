@@ -325,6 +325,9 @@ struct llama_hparams {
 
     // dimension of output embeddings
     uint32_t n_embd_out() const;
+    // width of the per-token hidden state carried between the trunk model and an
+    // MTP draft head (DSV4: the hyper-connection state, n_embd * dsv4_hc_mult)
+    uint32_t n_embd_h() const;
 
     // dimension of key/value embeddings for each head (per layer)
     uint32_t n_embd_head_k(uint32_t il = 0) const;

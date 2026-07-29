@@ -37,6 +37,42 @@ extern "C" {
     GGML_BACKEND_API void    ggml_numa_init(enum ggml_numa_strategy numa); // call once for better performance on NUMA systems
     GGML_BACKEND_API bool    ggml_is_numa(void); // true if init detected that system has >1 NUMA node
 
+    // maximum number of NUMA nodes ggml will track / mirror across
+    #define GGML_NUMA_MAX_NODES 8
+
+    // which read-mostly data to duplicate per NUMA node when GGML_NUMA_STRATEGY_MIRROR is active.
+    // these are bit flags so they can be OR-ed together (see ggml_numa_set_mirror).
+    enum ggml_numa_mirror_flags {
+        GGML_NUMA_MIRROR_WEIGHTS     = 1 << 0, // model weight tensors
+        GGML_NUMA_MIRROR_KV          = 1 << 1, // K/V cache
+        GGML_NUMA_MIRROR_ACTIVATIONS = 1 << 2, // reserved: per-node matmul scratch (not implemented)
+        GGML_NUMA_MIRROR_ALL = GGML_NUMA_MIRROR_WEIGHTS | GGML_NUMA_MIRROR_KV,
+    };
+
+    // NUMA mirroring (GGML_NUMA_STRATEGY_MIRROR): duplicate read-mostly data per NUMA node
+    GGML_BACKEND_API int      ggml_numa_node_count(void);                  // number of NUMA nodes detected (>=1)
+    GGML_BACKEND_API bool     ggml_numa_mirror_active(void);               // true if strategy == MIRROR and >1 node
+    GGML_BACKEND_API void     ggml_numa_set_mirror(uint32_t flags);        // which ggml_numa_mirror_flags to mirror
+    GGML_BACKEND_API uint32_t ggml_numa_get_mirror(void);                  // current mirror flags
+    GGML_BACKEND_API int      ggml_numa_node_for_thread(int ith, int nth); // block split of threads across nodes
+    // allocate/free memory bound to a specific NUMA node (mmap + mbind + THP)
+    GGML_BACKEND_API void *   ggml_numa_alloc(size_t size, int node);
+    GGML_BACKEND_API void     ggml_numa_free(void * ptr, size_t size);
+    // best-effort migrate an already-populated range onto a node (mbind + MPOL_MF_MOVE)
+    GGML_BACKEND_API void     ggml_numa_bind(void * ptr, size_t size, int node);
+    // policy-only variant (mbind flags=0, no MPOL_MF_MOVE): safe for file-backed
+    // (mmap) ranges - sets the VMA policy so future faults/refaults land on `node`.
+    GGML_BACKEND_API void     ggml_numa_bind_policy(void * ptr, size_t size, int node);
+    // attach/detach per-node copies to a tensor. node_data must have ggml_numa_node_count() entries.
+    GGML_BACKEND_API void     ggml_numa_tensor_set_mirror(struct ggml_tensor * tensor, void * const * node_data);
+    GGML_BACKEND_API void     ggml_numa_tensor_clear_mirror(struct ggml_tensor * tensor);
+    // re-sync node copies after a write that bypassed graph-CPY replication (state restore, K-shift, clear)
+    GGML_BACKEND_API void     ggml_numa_tensor_resync(struct ggml_tensor * tensor);
+    // hot path: return the node-local copy of a (possibly view) tensor's data, or its plain
+    // ->data when the tensor is not mirrored. Walks the view_src chain so views-of-views still
+    // resolve to node-local memory.
+    GGML_BACKEND_API void *   ggml_numa_tensor_data(const struct ggml_tensor * tensor, int node);
+
     GGML_BACKEND_API struct ggml_tensor * ggml_new_i32(struct ggml_context * ctx, int32_t value);
     GGML_BACKEND_API struct ggml_tensor * ggml_new_f32(struct ggml_context * ctx, float value);
 

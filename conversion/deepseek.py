@@ -566,6 +566,18 @@ class DeepseekV4Model(TextModel):
         self.gguf_writer.add_hyper_connection_epsilon(hparams["hc_eps"])
         self.gguf_writer.add_hash_layer_count(hparams["num_hash_layers"])
 
+        # DSpark config uses the legacy {"type": "yarn", ...} rope_scaling format, which the
+        # base class does not recognize (it expects "rope_type"); write the yarn fields directly
+        rope_scaling = hparams.get("rope_scaling") or {}
+        if rope_scaling.get("type") == "yarn" and "rope_type" not in rope_scaling:
+            self.gguf_writer.add_rope_scaling_type(gguf.RopeScalingType.YARN)
+            self.gguf_writer.add_rope_scaling_factor(rope_scaling["factor"])
+            self.gguf_writer.add_rope_scaling_orig_ctx_len(rope_scaling["original_max_position_embeddings"])
+            if (beta_fast := rope_scaling.get("beta_fast")) is not None:
+                self.gguf_writer.add_rope_scaling_yarn_beta_fast(beta_fast)
+            if (beta_slow := rope_scaling.get("beta_slow")) is not None:
+                self.gguf_writer.add_rope_scaling_yarn_beta_slow(beta_slow)
+
     def dequant_model(self):
         fp8_dtypes = self._float8_dtypes()
         tensors_to_remove: list[str] = []

@@ -1090,8 +1090,9 @@ struct llama_model_deepseek4 : public llama_model_base {
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
-    struct graph : public llm_graph_context {
-        graph(const llama_model & model, const llm_graph_params & params);
+    // hyper-connection helpers shared by the trunk graph and the MTP draft graph
+    struct graph_base : public llm_graph_context {
+        graph_base(const llm_graph_params & params) : llm_graph_context(params) {}
 
         ggml_tensor * build_hc_pre(
                 ggml_tensor * x,
@@ -1114,6 +1115,19 @@ struct llama_model_deepseek4 : public llama_model_base {
                 ggml_tensor * hc_fn,
                 ggml_tensor * hc_scale,
                 ggml_tensor * hc_base) const;
+
+        ggml_tensor * build_hc_pre(
+                ggml_tensor * x,
+                ggml_tensor * weights,
+                int il) const;
+
+        ggml_tensor * build_hc_sinkhorn(
+                ggml_tensor * comb,
+                int il) const;
+    };
+
+    struct graph : public graph_base {
+        graph(const llama_model & model, const llm_graph_params & params);
 
         ggml_tensor * build_attention(
                 const llama_model & model,
@@ -1170,6 +1184,18 @@ struct llama_model_deepseek4 : public llama_model_base {
                 float kq_scale,
                 int il) const;
 
+        // flash attention over two consecutive KV segments (raw window KV + compressed
+        // state KV), avoiding the per-token full-KV concat
+        ggml_tensor * build_attn_mha_2kv(
+                ggml_tensor * q,
+                ggml_tensor * k1,
+                ggml_tensor * k2,
+                ggml_tensor * mask1,
+                ggml_tensor * mask2,
+                ggml_tensor * sinks,
+                float kq_scale,
+                int il) const;
+
         ggml_tensor * build_hca_attention(
                 llm_graph_input_dsv4 * inp_dsv4,
                 llm_graph_input_dsv4_raw * inp_attn,
@@ -1186,15 +1212,10 @@ struct llama_model_deepseek4 : public llama_model_base {
                 ggml_tensor * sinks,
                 float kq_scale,
                 int il) const;
+    };
 
-        ggml_tensor * build_hc_pre(
-                ggml_tensor * x,
-                ggml_tensor * weights,
-                int il) const;
-
-        ggml_tensor * build_hc_sinkhorn(
-                ggml_tensor * comb,
-                int il) const;
+    struct graph_mtp : public graph_base {
+        graph_mtp(const llama_model & model, const llm_graph_params & params);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
@@ -1877,6 +1898,18 @@ struct llama_model_apertus : public llama_model_base {
 
 struct llama_model_minimax_m2 : public llama_model_base {
     llama_model_minimax_m2(const struct llama_model_params & params) : llama_model_base(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    struct graph : public llm_graph_context {
+        graph(const llama_model & model, const llm_graph_params & params);
+    };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
+struct llama_model_minimax_m3 : public llama_model_base {
+    llama_model_minimax_m3(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 

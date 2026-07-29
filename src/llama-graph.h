@@ -46,6 +46,7 @@ enum llm_fused_op {
     LLM_FUSED_OP_DSV4_HC_PRE,
     LLM_FUSED_OP_DSV4_HC_COMB,
     LLM_FUSED_OP_DSV4_HC_POST,
+    LLM_FUSED_OP_DSV4_MOE_ROUTER,
 };
 
 enum llm_ffn_op_type : int {
@@ -57,6 +58,7 @@ enum llm_ffn_op_type : int {
     LLM_FFN_SWIGLU,
     LLM_FFN_GEGLU,
     LLM_FFN_REGLU,
+    LLM_FFN_SWIGLU_OAI,
     LLM_FFN_SWIGLU_OAI_MOE,
 };
 
@@ -802,6 +804,7 @@ public:
     ggml_tensor * get_embd()        const { return t_embd; }
     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
     ggml_tensor * get_h_nextn()     const { return t_h_nextn; }
+    ggml_tensor * get_h_pre_norm()  const { return t_h_pre_norm; }
 
     ggml_tensor * get_layer_inp(int il) const { return t_layer_inp[il]; }
 
@@ -837,6 +840,7 @@ public:
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
+    ggml_tensor * t_h_pre_norm  = nullptr; // [n_embd_h, n_outputs] MTP chaining state (DSV4: flat hyper-connection state)
 
     std::vector<ggml_tensor *> t_layer_inp;
 

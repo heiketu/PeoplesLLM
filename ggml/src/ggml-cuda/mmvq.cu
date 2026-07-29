@@ -698,6 +698,81 @@ static __global__ void mul_mat_vec_q(
     }
 }
 
+// Small-k kernel: each warp processes multiple rows sequentially.
+// All 32 threads per warp stay active by iterating over (super-block, qi) pairs.
+// For Q3_K k=1024: 4 super-blocks × 16 qi = 64 items per row, 2 iters of 32 threads.
+// vs original kernel where only 4 out of 32 threads per warp are active.
+template <ggml_type type, int rows_per_warp>
+__launch_bounds__(256, 2)
+static __global__ void mul_mat_vec_q_small_k(
+        const void * __restrict__ vx_ptr, const void * __restrict__ vy_ptr,
+        float * __restrict__ dst_ptr,
+        const uint32_t ncols_x, const uint32_t nrows_x,
+        const uint32_t stride_row_x) {
+
+    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr = get_vdr_mmvq(type);
+    constexpr int warp_size = 32;
+    constexpr int nwarps = 8;
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+
+    const int blocks_per_row_x = ncols_x / qk;
+    const int items_per_row = blocks_per_row_x * (qi / vdr);
+    const int iters_per_row = (items_per_row + warp_size - 1) / warp_size;
+
+    const int warp_id = threadIdx.x / warp_size;
+    const int lane = threadIdx.x % warp_size;
+    const int row_base = (blockIdx.x * nwarps + warp_id) * rows_per_warp;
+
+    const block_q8_1 * y = (const block_q8_1 *) vy_ptr;
+
+#pragma unroll
+    for (int r = 0; r < rows_per_warp; ++r) {
+        const int row = row_base + r;
+        if (row >= (int) nrows_x) {
+            return;
+        }
+
+        const int row_offset = row * stride_row_x;
+        float sumf = 0.0f;
+
+        for (int iter = 0; iter < iters_per_row; ++iter) {
+            const int item = iter * warp_size + lane;
+            if (item < items_per_row) {
+                const int kbx = item / (qi / vdr);
+                const int iqs = vdr * (item % (qi / vdr));
+                const int kby = kbx * (qk / QK8_1);
+                sumf += vec_dot_q_cuda(vx_ptr, &y[kby], row_offset + kbx, iqs);
+            }
+        }
+
+        sumf = warp_reduce_sum<warp_size>(sumf);
+        if (lane == 0) {
+            dst_ptr[row] = sumf;
+        }
+    }
+}
+
+template <ggml_type type>
+static void mul_mat_vec_q_small_k_launch(
+        const void * vx, const void * vy, float * dst,
+        const int ncols_x, const int nrows_x,
+        const int stride_row_x,
+        cudaStream_t stream) {
+
+    constexpr int nwarps = 8;
+    constexpr int rows_per_warp = 4;
+    constexpr int rows_per_block = nwarps * rows_per_warp;
+    const int nblocks = (nrows_x + rows_per_block - 1) / rows_per_block;
+
+    const dim3 grid(nblocks);
+    const dim3 block(nwarps * 32);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid, block, 0, stream);
+    ggml_cuda_kernel_launch(mul_mat_vec_q_small_k<type, rows_per_warp>, launch_params,
+        vx, vy, dst, (uint32_t) ncols_x, (uint32_t) nrows_x, (uint32_t) stride_row_x);
+}
+
 // Dedicated MoE multi-token kernel.
 // Grid: (ceil(nrows_x / c_rows_per_block), nchannels_dst)
 // Block: (warp_size, ncols_dst) - each warp handles one token independently.
@@ -914,6 +989,17 @@ static void mul_mat_vec_q_switch_ncols_dst(
         case 1: {
             constexpr int c_ncols_dst = 1;
 
+            // Fast path for small k: one thread per row, no warp reduction needed.
+            // Beneficial when blocks_per_row is small and the standard kernel wastes threads.
+            constexpr int qk_chk = ggml_cuda_type_traits<type>::qk;
+            const int blocks_per_row_chk = ncols_x / qk_chk;
+            const bool has_fusion_chk = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
+                                        fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
+            if (!has_ids && !has_fusion_chk && nchannels_dst == 1 && nsamples_dst == 1 && blocks_per_row_chk <= 8) {
+                mul_mat_vec_q_small_k_launch<type>(vx, vy, dst, ncols_x, nrows_x, stride_row_x, stream);
+                return;
+            }
+
             bool use_small_k = should_use_small_k(c_ncols_dst);
 
             if (use_small_k) {
@@ -995,7 +1081,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
             break;
     }
 }
-static void mul_mat_vec_q_switch_type(
+void mul_mat_vec_q_switch_type(
         const void * vx, const ggml_type type_x, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
         const int ncols_x, const int nrows_x, const int ncols_dst,
         const int stride_row_x, const int stride_col_y, const int stride_col_dst,

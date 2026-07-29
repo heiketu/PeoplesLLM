@@ -15,6 +15,7 @@
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
+#include "llama-numa.h"
 
 #include "models/models.h"
 
@@ -34,6 +35,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
@@ -282,6 +284,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_apertus(params);
         case LLM_ARCH_MINIMAX_M2:
             return new llama_model_minimax_m2(params);
+        case LLM_ARCH_MINIMAX_M3:
+            return new llama_model_minimax_m3(params);
         case LLM_ARCH_COGVLM:
             return new llama_model_cogvlm(params);
         case LLM_ARCH_PANGU_EMBED:
@@ -349,6 +353,11 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_attn_out_weight ("blk\\.\\d*\\.attn_output.weight");
     static const std::regex pattern_attn_out_bias   ("blk\\.\\d*\\.attn_output.bias");
     static const std::regex pattern_attn_gate_weight("blk\\.\\d*\\.attn_gate.weight");
+
+    // DeepSeek-V4 MLA: low-rank Q up-projection and grouped o_proj LoRA
+    static const std::regex pattern_ds4_attn_q_b_weight  ("blk\\.\\d*\\.attn_q_b.weight");
+    static const std::regex pattern_ds4_attn_out_a_weight("blk\\.\\d*\\.attn_output_a.weight");
+    static const std::regex pattern_ds4_attn_out_b_weight("blk\\.\\d*\\.attn_output_b.weight");
 
     static const std::regex pattern_ssm_dt          ("blk\\.\\d*\\.ssm_dt.bias");
     static const std::regex pattern_ssm_a           ("blk\\.\\d*\\.ssm_a");
@@ -424,6 +433,32 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     };
 
     auto get_tensor_config = [&]() -> tensor_config {
+        // DeepSeek-V4: MLA with a single latent KV head shared by all Q heads, plus a grouped
+        // o_proj LoRA (attn_output_a: {n_head*n_embd_head/o_groups, o_lora_rank*o_groups} applied as a
+        // batched per-group matmul, then attn_output_b: {o_lora_rank*o_groups, n_embd}).
+        // Split the Q heads (axis 1 of attn_q_b) and the matching o_proj group blocks (axis 1 of
+        // attn_output_a) across devices; attn_output_b is split along its input dim (axis 0) so the
+        // partial sums are combined with an allreduce. The latent KV (attn_kv) and the KV cache are
+        // mirrored because every Q head attends to the full latent KV, as are the DSA
+        // compressor/indexer, hyper-connection, and routing tensors (default below).
+        if (ud->model->arch == LLM_ARCH_DEEPSEEK4) {
+            if (std::regex_match(tensor_name, pattern_ds4_attn_q_b_weight)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output_a.weight");
+            }
+            if (std::regex_match(tensor_name, pattern_ds4_attn_out_a_weight)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output_b.weight");
+            }
+            if (std::regex_match(tensor_name, pattern_ds4_attn_out_b_weight)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output_a.weight");
+            }
+            if (std::regex_match(tensor_name, pattern_attn_sinks)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
+            }
+            if (std::regex_match(tensor_name, pattern_kv_cache)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
+        }
+
         // standard attention
         if (std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_kv_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight", "ssm_out.weight");
@@ -575,6 +610,25 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     };
 
     auto get_split_granularity = [&](int64_t blck_size, uint32_t il, const std::vector<std::pair<int64_t, uint32_t>> & segments) -> std::vector<int64_t> {
+        if (ud->model->arch == LLM_ARCH_DEEPSEEK4) {
+            // keep the Q head split aligned with the o_proj groups: each device must own whole groups
+            const int64_t n_heads_group = hparams.n_head(il)/hparams.dsv4_o_group_count;
+            const int64_t o_group_dim   = n_heads_group*hparams.n_embd_head_k(il);
+            if (std::regex_match(tensor_name, pattern_ds4_attn_q_b_weight)) {
+                GGML_ASSERT(segments.size() == 1);
+                return {std::lcm(blck_size, o_group_dim)};
+            }
+            if (std::regex_match(tensor_name, pattern_ds4_attn_out_a_weight) ||
+                    std::regex_match(tensor_name, pattern_ds4_attn_out_b_weight)) {
+                GGML_ASSERT(segments.size() == 1);
+                return {std::lcm(blck_size, int64_t(hparams.dsv4_o_lora_rank))};
+            }
+            if (std::regex_match(tensor_name, pattern_attn_sinks)) {
+                GGML_ASSERT(segments.size() == 1);
+                return {n_heads_group};
+            }
+        }
+
         // for better performance it may make sense to round up blck_size to a higher power of 2 so that more efficient kernels can be used
         if (hparams.is_recr(il)) {
             // linear attention
@@ -820,6 +874,7 @@ const char * llm_type_name(llm_type type) {
         case LLM_TYPE_310B_A15B:     return "310B.A15B";
         case LLM_TYPE_355B_A32B:     return "355B.A32B";
         case LLM_TYPE_397B_A17B:     return "397B.A17B";
+        case LLM_TYPE_428B_A23B:     return "428B.A23B";
         case LLM_TYPE_685B_A37B:     return "685B.A37B";
         case LLM_TYPE_744B_A40B:     return "744B.A40B";
         case LLM_TYPE_E2B:           return "E2B";
@@ -993,7 +1048,7 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
 
 struct llama_model::impl {
     impl() = default;
-    ~impl() = default;
+    ~impl();
 
     uint64_t n_elements = 0;
 
@@ -1012,6 +1067,15 @@ struct llama_model::impl {
 
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
+
+    // NUMA mirror: per-(host weight buffer) node-local copies. node_base[0] aliases the original
+    // buffer; node_base[1..n-1] are extra copies allocated with llama_numa_alloc and freed here.
+    struct numa_mirror_buffer {
+        ggml_backend_buffer_t buf;
+        size_t size;
+        void * node_base[GGML_NUMA_MAX_NODES];
+    };
+    std::vector<numa_mirror_buffer> numa_mirror_bufs;
 
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
@@ -1044,6 +1108,610 @@ llama_model::~llama_model() {
     for (auto * lora : loras) {
         delete lora;
     }
+}
+
+llama_model::impl::~impl() {
+    // free NUMA mirror per-tensor pointer tables and the extra node-local weight copies
+    for (auto & [ctx, bufs] : ctxs_bufs) {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+            llama_numa_tensor_clear_mirror(t);
+        }
+    }
+    for (auto & mb : numa_mirror_bufs) {
+        for (int n = 1; n < llama_numa_node_count(); ++n) { // node_base[0] aliases the original buffer
+            if (mb.node_base[n]) {
+                llama_numa_free(mb.node_base[n], mb.size);
+            }
+        }
+    }
+    numa_mirror_bufs.clear();
+}
+
+// Partial mirror for models too big to duplicate in full (e.g. 215 GiB on a 256 GiB box):
+// duplicate only *hot* tensors — everything except routed-expert stacks (read for only
+// 8/256 experts per token) and the token embedding table (gather, not mul_mat) — as many as
+// fit in the per-node free RAM, largest first (every hot byte is read once per token, so the
+// value per byte is equal). The original pages of each mirrored tensor are migrated onto
+// node 0 (they were interleaved by first-touch); per-node arena copies serve the other nodes.
+// Routed experts stay interleaved, which is the best placement for them anyway since every
+// node reads a random subset each token.
+
+#if defined(__linux__)
+#include <sys/syscall.h>
+#include <unistd.h>
+#ifndef MPOL_MF_MOVE
+#define MPOL_MF_MOVE (1 << 1)
+#endif
+// migrate up to max_bytes of resident pages that currently sit on from_node within
+// [base, base+size) to to_node; returns bytes actually migrated. Own-process
+// move_pages(MPOL_MF_MOVE) needs no privilege.
+static size_t llama_numa_migrate_node_pages(void * base, size_t size, int from_node, int to_node, size_t max_bytes) {
+    const long ps = sysconf(_SC_PAGESIZE);
+    if (ps <= 0) return 0;
+    uintptr_t beg = (uintptr_t) base & ~(uintptr_t) (ps - 1);
+    uintptr_t end = ((uintptr_t) base + size + ps - 1) & ~(uintptr_t) (ps - 1);
+    const size_t chunk = 1024;
+    std::vector<void *> addrs(chunk);
+    std::vector<int>    status(chunk);
+    std::vector<int>    nodes(chunk);
+    size_t moved = 0;
+    for (uintptr_t p = beg; p < end && moved < max_bytes; ) {
+        size_t n = 0;
+        for (; n < chunk && p < end; ++n, p += ps) {
+            addrs[n] = (void *) p;
+        }
+        if (syscall(SYS_move_pages, 0, n, addrs.data(), nullptr, status.data(), 0) != 0) {
+            break;
+        }
+        size_t m = 0;
+        for (size_t i = 0; i < n; ++i) {
+            if (status[i] == from_node) {
+                addrs[m] = addrs[i];
+                nodes[m] = to_node;
+                ++m;
+            }
+        }
+        if (m > 0 && syscall(SYS_move_pages, 0, m, addrs.data(), nodes.data(), status.data(), MPOL_MF_MOVE) == 0) {
+            for (size_t i = 0; i < m; ++i) {
+                if (status[i] == to_node) {
+                    moved += (size_t) ps;
+                }
+            }
+        }
+    }
+    return moved;
+}
+#else
+static size_t llama_numa_migrate_node_pages(void * base, size_t size, int from_node, int to_node, size_t max_bytes) {
+    GGML_UNUSED(base); GGML_UNUSED(size); GGML_UNUSED(from_node); GGML_UNUSED(to_node); GGML_UNUSED(max_bytes);
+    return 0;
+}
+#endif
+
+// per-node reclaimable RAM ("Node N MemFree" + inactive file cache) in bytes; 0 when unknown
+static size_t llama_node_free_ram_bytes(int node) {
+#if defined(__linux__)
+    char path[128];
+    snprintf(path, sizeof(path), "/sys/devices/system/node/node%d/meminfo", node);
+    FILE * f = fopen(path, "r");
+    if (!f) return 0;
+    char line[256];
+    size_t free_kb = 0, inact_file_kb = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (sscanf(line, "Node %*d MemFree: %zu kB", &free_kb) == 1) continue;
+        if (sscanf(line, "Node %*d Inactive(file): %zu kB", &inact_file_kb) == 1) continue;
+    }
+    fclose(f);
+    // anonymous weight pages can only grow by reclaiming clean file cache on the same node
+    return (free_kb + inact_file_kb) * 1024;
+#else
+    GGML_UNUSED(node);
+    return 0;
+#endif
+}
+
+// Parallel memcpy used by the NUMA weight-mirroring paths below. A single-threaded memcpy of
+// a multi-GiB MPOL_BIND destination spends most of its time in the kernel (first-touch page
+// faults, THP allocation, direct reclaim when RAM is tight), so splitting the range across
+// worker threads speeds the mirror up roughly until memory bandwidth saturates. Chunk
+// boundaries are aligned to 2 MiB so each thread faults disjoint huge pages. The destination
+// VMA carries MPOL_BIND from llama_numa_alloc, so pages land on the target node no matter
+// which thread faults them; the source has already been bound to node 0 by llama_numa_bind.
+static void llama_numa_mirror_memcpy(void * dst, const void * src, size_t size) {
+    const size_t align = 2ull << 20;
+    unsigned n_threads = std::thread::hardware_concurrency();
+    if (const char * env = getenv("GGML_NUMA_MIRROR_THREADS")) {
+        const int v = atoi(env);
+        if (v > 0) {
+            n_threads = (unsigned) v;
+        }
+    }
+    n_threads = std::min(n_threads, 32u);
+    if (n_threads < 2 || size < (256ull << 20)) {
+        memcpy(dst, src, size);
+        return;
+    }
+    size_t chunk = ((size / n_threads) + align - 1) & ~(align - 1);
+    if (chunk == 0) {
+        chunk = align;
+    }
+    std::vector<std::thread> workers;
+    workers.reserve(n_threads - 1);
+    size_t pos = 0;
+    for (unsigned i = 0; i < n_threads && pos < size; ++i) {
+        const size_t end = std::min(pos + chunk, size);
+        char       * d = (char *)       dst + pos;
+        const char * s = (const char *) src + pos;
+        const size_t n = end - pos;
+        if (i + 1 == n_threads || end == size) {
+            memcpy(d, s, n); // tail on the calling thread
+            break;
+        }
+        workers.emplace_back([d, s, n]() { memcpy(d, s, n); });
+        pos = end;
+    }
+    for (auto & w : workers) {
+        w.join();
+    }
+}
+
+void llama_model::numa_mirror_weights_partial() {
+    const int n_nodes = llama_numa_node_count();
+
+    // budget: tightest node's free RAM minus a reserve for KV cache, compute buffers and the OS
+    const size_t reserve = 6ull << 30;
+    // hard cap: keep well clear of the node capacity (strict MPOL_BIND/mbind migration can
+    // OOM-kill before reclaim keeps up); env override for experimentation
+    const char * cap_env = getenv("GGML_NUMA_MIRROR_BUDGET_GB");
+    const size_t cap = cap_env ? ((size_t) atoi(cap_env) << 30) : (12ull << 30);
+
+    std::vector<size_t> node_free(n_nodes, 0);
+    for (int n = 0; n < n_nodes; ++n) {
+        node_free[n] = llama_node_free_ram_bytes(n);
+    }
+    const auto compute_budget = [&]() {
+        size_t b = SIZE_MAX;
+        for (int n = 0; n < n_nodes; ++n) {
+            if (node_free[n] > 0) {
+                b = std::min(b, node_free[n] > reserve ? node_free[n] - reserve : (size_t) 0);
+            }
+        }
+        if (b == SIZE_MAX) {
+            b = cap; // per-node free unknown: conservative default
+        }
+        return std::min(b, cap);
+    };
+    size_t budget = compute_budget();
+
+    // Rebalance: one over-full node (e.g. numa_balancing drift during the long no-mmap
+    // load) caps the budget for every node. Migrate pages of routed-expert tensors (they
+    // stay effectively interleaved either way, since every node reads a random subset of
+    // experts per token) from the tightest node to the roomiest one to even the budget out.
+    // Skipped when NUMA EP is enabled: expert pages are placed per node by
+    // numa_ep_place_experts instead.
+    const char * ep_env = getenv("GGML_NUMA_EP");
+    const bool ep = ep_env && atoi(ep_env) != 0;
+    if (budget < cap && n_nodes >= 2) {
+        int tight = 0, roomy = 0;
+        for (int n = 0; n < n_nodes; ++n) {
+            if (node_free[n] < node_free[tight]) tight = n;
+            if (node_free[n] > node_free[roomy]) roomy = n;
+        }
+        const size_t want = std::min(cap, node_free[roomy] > reserve ? node_free[roomy] - reserve : (size_t) 0);
+        if (tight != roomy && want > budget) {
+            const size_t deficit = want - budget + reserve; // slack so the reserve survives
+            std::vector<ggml_tensor *> exps;
+            for (auto & [ctx, bufs] : pimpl->ctxs_bufs) {
+                for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+                    if (!t->data || t->view_src || !t->buffer || !ggml_backend_buffer_is_host(t->buffer)) {
+                        continue;
+                    }
+                    const bool is_exps = strstr(t->name, "_exps") != nullptr;
+                    // with NUMA EP, expert pages are placed per node by numa_ep_place_experts;
+                    // migrating them would break that locality, so only non-expert pages
+                    // participate in balancing (EP=0 keeps the historical experts-only set)
+                    if (ep ? is_exps : !is_exps) {
+                        continue;
+                    }
+                    exps.push_back(t);
+                }
+            }
+            std::sort(exps.begin(), exps.end(), [](const ggml_tensor * a, const ggml_tensor * b) {
+                return ggml_nbytes(a) > ggml_nbytes(b);
+            });
+            size_t moved = 0;
+            for (ggml_tensor * t : exps) {
+                if (moved >= deficit) {
+                    break;
+                }
+                moved += llama_numa_migrate_node_pages(t->data, ggml_nbytes(t), tight, roomy, deficit - moved);
+            }
+            for (int n = 0; n < n_nodes; ++n) {
+                node_free[n] = llama_node_free_ram_bytes(n);
+            }
+            const size_t new_budget = compute_budget();
+            LLAMA_LOG_INFO("%s: NUMA partial mirror: rebalanced %.2f GiB node%d->node%d, budget %.2f -> %.2f GiB/node\n",
+                    __func__, moved/1073741824.0, tight, roomy, budget/1073741824.0, new_budget/1073741824.0);
+            budget = new_budget;
+        }
+    }
+
+    std::vector<ggml_tensor *> hot;
+    size_t hot_bytes = 0;
+    std::vector<ggml_tensor *> cand;
+    for (auto & [ctx, bufs] : pimpl->ctxs_bufs) {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+            if (!t->data || t->view_src || !t->buffer || !ggml_backend_buffer_is_host(t->buffer)) {
+                continue;
+            }
+            const char * name = t->name;
+            if (strstr(name, "_exps") || strstr(name, "token_embd")) {
+                continue;
+            }
+            cand.push_back(t);
+        }
+    }
+    // largest first: fewer mbind/memcpy calls per mirrored GiB
+    std::sort(cand.begin(), cand.end(), [](const ggml_tensor * a, const ggml_tensor * b) {
+        return ggml_nbytes(a) > ggml_nbytes(b);
+    });
+    for (ggml_tensor * t : cand) {
+        const size_t padded = (ggml_nbytes(t) + 63) & ~(size_t) 63;
+        if (hot_bytes + padded > budget) {
+            continue; // keep going: smaller tensors may still fit
+        }
+        hot.push_back(t);
+        hot_bytes += padded;
+    }
+    if (hot.empty()) {
+        LLAMA_LOG_WARN("%s: NUMA partial mirror: no room for any hot tensor (budget %.2f GiB/node); "
+                "continuing WITHOUT weight mirroring\n", __func__, budget/1073741824.0);
+        return;
+    }
+
+    const size_t extra_needed = hot_bytes * (size_t) (n_nodes - 1);
+    const size_t avail = llama_get_available_ram_bytes();
+    LLAMA_LOG_INFO("%s: NUMA partial mirror: %zu hot tensors %.2f GiB; need +%.2f GiB (%.2f GiB available)\n",
+            __func__, hot.size(), hot_bytes/1073741824.0, extra_needed/1073741824.0, avail/1073741824.0);
+    if (avail > 0 && extra_needed + (4ull << 30) > avail) {
+        LLAMA_LOG_WARN("%s: NUMA partial mirror: insufficient free RAM; continuing WITHOUT weight mirroring\n", __func__);
+        return;
+    }
+
+    // one arena per extra node; packed 64-byte aligned tensor copies
+    for (int n = 1; n < n_nodes; ++n) {
+        void * arena = llama_numa_alloc(hot_bytes, n);
+        if (!arena) {
+            for (auto & mb : pimpl->numa_mirror_bufs) {
+                for (int j = 1; j < n_nodes; ++j) {
+                    if (mb.node_base[j]) {
+                        llama_numa_free(mb.node_base[j], mb.size);
+                    }
+                }
+            }
+            pimpl->numa_mirror_bufs.clear();
+            LLAMA_LOG_WARN("%s: NUMA partial mirror: allocation failed; continuing WITHOUT weight mirroring\n", __func__);
+            return;
+        }
+        impl::numa_mirror_buffer mb;
+        mb.buf  = nullptr;
+        mb.size = hot_bytes;
+        for (int j = 0; j < GGML_NUMA_MAX_NODES; ++j) {
+            mb.node_base[j] = nullptr;
+        }
+        mb.node_base[n] = arena;
+        pimpl->numa_mirror_bufs.push_back(mb);
+    }
+
+    int n_mirrored = 0;
+    size_t off = 0;
+    for (ggml_tensor * t : hot) {
+        const size_t nbytes = ggml_nbytes(t);
+        const size_t padded = (nbytes + 63) & ~(size_t) 63;
+        // node 0 reuses the original data, migrated node-0-local (best effort)
+        llama_numa_bind(t->data, nbytes, 0);
+        for (int n = 1; n < n_nodes; ++n) {
+            char * arena = (char *) pimpl->numa_mirror_bufs[n - 1].node_base[n];
+            llama_numa_mirror_memcpy(arena + off, t->data, nbytes); // MPOL_BIND places these faulted pages on node n
+        }
+        void * node_data[GGML_NUMA_MAX_NODES];
+        node_data[0] = t->data;
+        for (int n = 1; n < n_nodes; ++n) {
+            node_data[n] = (char *) pimpl->numa_mirror_bufs[n - 1].node_base[n] + off;
+        }
+        llama_numa_tensor_set_mirror(t, node_data);
+        ++n_mirrored;
+        off += padded;
+    }
+    LLAMA_LOG_INFO("%s: NUMA partial mirror: duplicated %d hot tensors across %d nodes\n",
+            __func__, n_mirrored, n_nodes);
+}
+
+// NUMA expert parallelism (GGML_NUMA_EP=1): bind the pages of each routed-expert tensor
+// (*_exps, [ff, embd, n_expert], experts contiguous along ne[2]) so that the first half of
+// the experts lives on node 0 and the second half on node 1 (generalized to n_nodes with
+// the same e * n_nodes / n_expert mapping as the compute-side filter). Boundary pages go
+// to the earlier node. Skipped when the model was loaded with mmap (pages alias the file
+// mapping and must not be rebound).
+void llama_model::numa_ep_place_experts(bool used_mmap) {
+    const char * env = getenv("GGML_NUMA_EP");
+    if (!env || atoi(env) == 0) {
+        return;
+    }
+    const int n_nodes = llama_numa_node_count();
+    if (n_nodes < 2) {
+        return;
+    }
+    if (used_mmap) {
+        const char * env_mmap = getenv("GGML_NUMA_EP_MMAP");
+        if (!env_mmap || atoi(env_mmap) == 0) {
+            LLAMA_LOG_INFO("%s: GGML_NUMA_EP set but the model was loaded with mmap; skipping expert placement (set GGML_NUMA_EP_MMAP=1 for policy-only placement)\n", __func__);
+            return;
+        }
+        LLAMA_LOG_INFO("%s: GGML_NUMA_EP_MMAP=1: policy-only expert placement on the file mapping (no page migration)\n", __func__);
+    }
+
+    long pg = sysconf(_SC_PAGESIZE);
+    if (pg <= 0) {
+        pg = 4096;
+    }
+
+    int n_placed = 0;
+    size_t placed_bytes = 0;
+    for (auto & [ctx, bufs] : pimpl->ctxs_bufs) {
+        GGML_UNUSED(bufs);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+            if (!t->data || t->view_src || !t->buffer || !ggml_backend_buffer_is_host(t->buffer)) {
+                continue;
+            }
+            if (t->ne[2] <= 1 || strstr(t->name, "_exps") == nullptr) {
+                continue;
+            }
+            const int64_t n_expert = t->ne[2];
+            const size_t eb = t->nb[2]; // bytes per expert plane (contiguous along ne[2])
+            char * base = (char *) t->data;
+            for (int n = 0; n < n_nodes; ++n) {
+                const int64_t e0 = (int64_t) n * n_expert / n_nodes;
+                const int64_t e1 = (int64_t) (n + 1) * n_expert / n_nodes;
+                if (e1 <= e0) {
+                    continue;
+                }
+                char * p = base + e0 * eb;
+                size_t sz = (size_t) (e1 - e0) * eb;
+                if (n > 0) {
+                    // keep the boundary page on the earlier node: only bind whole pages
+                    const uintptr_t up = ((uintptr_t) p + pg - 1) & ~((uintptr_t) pg - 1);
+                    if ((size_t) (up - (uintptr_t) p) >= sz) {
+                        continue;
+                    }
+                    sz -= up - (uintptr_t) p;
+                    p = (char *) up;
+                }
+                if (used_mmap) {
+                    llama_numa_bind_policy(p, sz, n);
+                } else {
+                    llama_numa_bind(p, sz, n);
+                }
+            }
+            ++n_placed;
+            placed_bytes += ggml_nbytes(t);
+        }
+    }
+    LLAMA_LOG_INFO("%s: NUMA EP: placed %d expert tensors (%.2f GiB) across %d nodes\n",
+            __func__, n_placed, placed_bytes/1073741824.0, n_nodes);
+}
+
+void llama_model::numa_mirror_weights() {
+    if (!llama_numa_mirror_active() || !(llama_numa_get_mirror() & GGML_NUMA_MIRROR_WEIGHTS)) {
+        return;
+    }
+    if (!pimpl->numa_mirror_bufs.empty()) {
+        return; // already mirrored (e.g. a second context created on the same model)
+    }
+    const int n_nodes = llama_numa_node_count();
+    if (n_nodes < 2) {
+        return;
+    }
+
+    // NUMA expert parallelism: routed experts stay single-copy and are placed per node by
+    // numa_ep_place_experts instead of being duplicated
+    const char * ep_env = getenv("GGML_NUMA_EP");
+    const bool ep = ep_env && atoi(ep_env) != 0;
+
+    size_t total_host = 0;
+    size_t total_ep = 0;
+    for (auto & [ctx, bufs] : pimpl->ctxs_bufs) {
+        for (auto & buf : bufs) {
+            if (buf && ggml_backend_buffer_is_host(buf.get())) {
+                total_host += ggml_backend_buffer_get_size(buf.get());
+            }
+        }
+        if (ep) {
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+                if (t->data && !t->view_src && t->buffer && ggml_backend_buffer_is_host(t->buffer) &&
+                    t->ne[2] > 1 && strstr(t->name, "_exps")) {
+                    total_ep += ggml_nbytes(t);
+                }
+            }
+        }
+    }
+    if (total_host == 0) {
+        return;
+    }
+
+    const size_t extra_needed = (total_host - total_ep) * (size_t) (n_nodes - 1); // node 0 reuses the original
+    const size_t avail = llama_get_available_ram_bytes();
+    LLAMA_LOG_INFO("%s: NUMA mirror: %d nodes, host weights %.2f GiB; need +%.2f GiB for mirrors (%.2f GiB available)\n",
+            __func__, n_nodes, total_host/1073741824.0, extra_needed/1073741824.0, avail/1073741824.0);
+    if (avail > 0 && extra_needed + (2ull << 30) > avail) {
+        LLAMA_LOG_WARN("%s: NUMA mirror: insufficient free RAM to duplicate weights across %d nodes; "
+                "falling back to PARTIAL mirror (hot tensors only)\n", __func__, n_nodes);
+        numa_mirror_weights_partial();
+        return;
+    }
+    if (getenv("GGML_NUMA_MIRROR_PARTIAL")) {
+        LLAMA_LOG_INFO("%s: NUMA mirror: GGML_NUMA_MIRROR_PARTIAL set, mirroring hot tensors only\n", __func__);
+        numa_mirror_weights_partial();
+        return;
+    }
+
+    // MOE-only mirror: only duplicate buffers containing routed expert weights (_exps tensors).
+    // Useful in hybrid CPU+GPU mode where attention is on GPU and only MoE experts are on CPU.
+    const bool mirror_moe_only = getenv("GGML_NUMA_MIRROR_MOE") != nullptr;
+    if (mirror_moe_only) {
+        size_t mirrored_bytes = 0;
+        for (auto & [ctx, bufs] : pimpl->ctxs_bufs) {
+            for (auto & buf : bufs) {
+                if (!buf || !ggml_backend_buffer_is_host(buf.get())) {
+                    continue;
+                }
+                // Check if this buffer contains any _exps tensors
+                bool has_exps = false;
+                for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+                    if (t->data && !t->view_src && t->buffer == buf.get() && strstr(t->name, "_exps")) {
+                        has_exps = true;
+                        break;
+                    }
+                }
+                if (!has_exps) {
+                    continue; // skip non-expert buffers
+                }
+
+                impl::numa_mirror_buffer mb;
+                mb.buf  = buf.get();
+                mb.size = ggml_backend_buffer_get_size(buf.get());
+                void * base = ggml_backend_buffer_get_base(buf.get());
+                for (int n = 0; n < GGML_NUMA_MAX_NODES; ++n) {
+                    mb.node_base[n] = nullptr;
+                }
+                mb.node_base[0] = base;
+
+                llama_numa_bind(base, mb.size, 0);
+                for (int n = 1; n < n_nodes; ++n) {
+                    void * copy = llama_numa_alloc(mb.size, n);
+                    if (!copy) {
+                        LLAMA_LOG_WARN("%s: NUMA mirror-moe: alloc failed on node %d\n", __func__, n);
+                        for (int k = 1; k < n; ++k) { llama_numa_free(mb.node_base[k], mb.size); mb.node_base[k] = nullptr; }
+                        goto skip_buf_moe;
+                    }
+                    llama_numa_mirror_memcpy(copy, base, mb.size);
+                    mb.node_base[n] = copy;
+                }
+                mirrored_bytes += mb.size * (n_nodes - 1);
+                pimpl->numa_mirror_bufs.push_back(mb);
+                skip_buf_moe:;
+            }
+        }
+        LLAMA_LOG_INFO("%s: NUMA mirror-moe: mirrored %.2f GiB of expert weights across %d nodes\n",
+                __func__, mirrored_bytes / 1073741824.0, n_nodes);
+        return;
+    }
+
+    // allocate per-node copies of each host weight buffer
+    for (auto & [ctx, bufs] : pimpl->ctxs_bufs) {
+        for (auto & buf : bufs) {
+            if (!buf || !ggml_backend_buffer_is_host(buf.get())) {
+                continue;
+            }
+            impl::numa_mirror_buffer mb;
+            mb.buf  = buf.get();
+            mb.size = ggml_backend_buffer_get_size(buf.get());
+            void * base = ggml_backend_buffer_get_base(buf.get());
+            for (int n = 0; n < GGML_NUMA_MAX_NODES; ++n) {
+                mb.node_base[n] = nullptr;
+            }
+            mb.node_base[0] = base;                 // node 0 aliases the original buffer ...
+
+            // with NUMA EP the *_exps tensors stay single-copy: their byte ranges are
+            // neither bound to node 0 nor duplicated to the other nodes
+            std::vector<std::pair<size_t, size_t>> excl;
+            if (ep) {
+                for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+                    if (t->data && !t->view_src && t->buffer == buf.get() &&
+                        t->ne[2] > 1 && strstr(t->name, "_exps")) {
+                        const size_t off = (size_t) ((const char *) t->data - (const char *) base);
+                        excl.emplace_back(off, off + ggml_nbytes(t));
+                    }
+                }
+                std::sort(excl.begin(), excl.end());
+            }
+            {
+                size_t pos = 0;
+                const auto bind_gaps = [&](int node) {
+                    for (const auto & [s, e] : excl) {
+                        if (s > pos) { llama_numa_bind((char *) base + pos, s - pos, node); }
+                        pos = e;
+                    }
+                    if (mb.size > pos) { llama_numa_bind((char *) base + pos, mb.size - pos, node); }
+                };
+                if (excl.empty()) {
+                    llama_numa_bind(base, mb.size, 0);  // ... migrated onto node 0 (best effort)
+                } else {
+                    bind_gaps(0);
+                }
+            }
+            bool ok = true;
+            for (int n = 1; n < n_nodes; ++n) {
+                void * p = llama_numa_alloc(mb.size, n);
+                if (!p) { ok = false; break; }
+                if (excl.empty()) {
+                    llama_numa_mirror_memcpy(p, base, mb.size); // MPOL_BIND places these faulted pages on node n
+                } else {
+                    // duplicate only the non-expert segments
+                    size_t pos = 0;
+                    for (const auto & [s, e] : excl) {
+                        if (s > pos) { llama_numa_mirror_memcpy((char *) p + pos, (const char *) base + pos, s - pos); }
+                        pos = e;
+                    }
+                    if (mb.size > pos) { llama_numa_mirror_memcpy((char *) p + pos, (const char *) base + pos, mb.size - pos); }
+                }
+                mb.node_base[n] = p;
+            }
+            if (!ok) {
+                for (int n = 1; n < n_nodes; ++n) {
+                    llama_numa_free(mb.node_base[n], mb.size);
+                }
+                for (auto & done : pimpl->numa_mirror_bufs) {
+                    for (int n = 1; n < n_nodes; ++n) {
+                        llama_numa_free(done.node_base[n], done.size);
+                    }
+                }
+                pimpl->numa_mirror_bufs.clear();
+                LLAMA_LOG_WARN("%s: NUMA mirror: allocation failed; continuing WITHOUT weight mirroring\n", __func__);
+                return;
+            }
+            pimpl->numa_mirror_bufs.push_back(mb);
+        }
+    }
+
+    // point every (non-view) host weight tensor at its per-node copies
+    int n_mirrored = 0;
+    for (auto & [ctx, bufs] : pimpl->ctxs_bufs) {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+            if (!t->data || t->view_src || !t->buffer || !ggml_backend_buffer_is_host(t->buffer)) {
+                continue;
+            }
+            if (ep && t->ne[2] > 1 && strstr(t->name, "_exps")) {
+                continue; // routed experts stay single-copy (NUMA EP placement)
+            }
+            const impl::numa_mirror_buffer * mb = nullptr;
+            for (auto & cand : pimpl->numa_mirror_bufs) {
+                if (cand.buf == t->buffer) { mb = &cand; break; }
+            }
+            if (!mb) {
+                continue;
+            }
+            const size_t offset = (const char *) t->data - (const char *) mb->node_base[0];
+            void * node_data[GGML_NUMA_MAX_NODES];
+            for (int n = 0; n < n_nodes; ++n) {
+                node_data[n] = (char *) mb->node_base[n] + offset;
+            }
+            llama_numa_tensor_set_mirror(t, node_data);
+            ++n_mirrored;
+        }
+    }
+    LLAMA_LOG_INFO("%s: NUMA mirror: duplicated %d weight tensors across %d nodes\n",
+            __func__, n_mirrored, n_nodes);
 }
 
 void llama_model_base::load_stats(llama_model_loader & ml) {
@@ -2182,7 +2850,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         filter = [&](uint32_t il) { return il >= hparams.n_layer(); };
                     }
 
-                    if ((arch == LLM_ARCH_STEP35 || arch == LLM_ARCH_HY_V3) && hparams.n_layer_nextn > 0) {
+                    if ((arch == LLM_ARCH_STEP35 || arch == LLM_ARCH_HY_V3 || arch == LLM_ARCH_DEEPSEEK4) && hparams.n_layer_nextn > 0) {
                         if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
                             filter = [&](uint32_t il) { return il >= hparams.n_layer(); };
                         } else {
@@ -2193,6 +2861,27 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     if (arch == LLM_ARCH_DEEPSEEK4) {
                         GGML_ASSERT(hparams.swa_type != LLAMA_SWA_TYPE_NONE);
 
+                        if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && hparams.n_layer_nextn > 0) {
+                            // The DSV4 MTP draft head runs the single NextN block as a
+                            // plain SWA layer — use a standard iSWA KV cache (with the
+                            // il >= n_layer filter above) instead of the DSV4 memory.
+                            res = new llama_kv_cache_iswa(
+                                    *this,
+                                    params.type_k,
+                                    params.type_v,
+                                    !cparams.flash_attn,
+                                    cparams.offload_kqv,
+                                    params.swa_full,
+                                    cparams.kv_unified,
+                                    cparams.n_ctx_seq,
+                                    cparams.n_seq_max,
+                                    cparams.n_ubatch,
+                                    1,
+                                    nullptr,
+                                    filter,
+                                    reuse,
+                                    nullptr);
+                        } else {
                         res = new llama_kv_cache_dsv4(
                                 *this,
                                 params.type_k,
@@ -2207,6 +2896,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 1,
                                 filter,
                                 reuse);
+                        }
                     } else if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
                         GGML_ASSERT(hparams.is_swa_any());
 
@@ -2360,6 +3050,10 @@ int32_t llama_model_n_embd_inp(const llama_model * model) {
 
 int32_t llama_model_n_embd_out(const llama_model * model) {
     return model->hparams.n_embd_out();
+}
+
+int32_t llama_model_n_embd_h(const llama_model * model) {
+    return model->hparams.n_embd_h();
 }
 
 int32_t llama_model_n_layer(const llama_model * model) {
@@ -2546,6 +3240,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_GROVEMOE:
         case LLM_ARCH_APERTUS:
         case LLM_ARCH_MINIMAX_M2:
+        case LLM_ARCH_MINIMAX_M3:
         case LLM_ARCH_COGVLM:
         case LLM_ARCH_PANGU_EMBED:
         case LLM_ARCH_AFMOE:

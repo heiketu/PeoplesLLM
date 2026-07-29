@@ -267,6 +267,16 @@ static void parse_tensor_buffer_overrides(const std::string & value, std::vector
         std::string buffer_type = override.substr(pos + 1);
 
         if (buft_list.find(buffer_type) == buft_list.end()) {
+            // META/META0: deferred alias for the tensor-parallel Meta device. Meta devices are
+            // created per model at load time (they need the model's split-state callback), so the
+            // buffer type cannot be resolved here; the nullptr buft sentinel is resolved to the
+            // model's Meta(CUDA0,CUDA1,...) buffer type in llama_model_load.
+            if (buffer_type == "META" || buffer_type == "META0") {
+                static std::list<std::string> buft_overrides_meta;
+                buft_overrides_meta.push_back(tensor_name);
+                overrides.push_back({buft_overrides_meta.back().c_str(), nullptr});
+                continue;
+            }
             printf("Available buffer types:\n");
             for (const auto & it : buft_list) {
                 printf("  %s\n", ggml_backend_buft_name(it.second));
@@ -2432,15 +2442,37 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "- distribute: spread execution evenly over all nodes\n"
         "- isolate: only spawn threads on CPUs on the node that execution started on\n"
         "- numactl: use the CPU map provided by numactl\n"
+        "- mirror: duplicate model weights/KV per NUMA node so each node reads only local memory.\n"
+        "          pins threads per node and uses N x RAM (N = number of NUMA nodes). implies --no-mmap.\n"
         "if run without this previously, it is recommended to drop the system page cache before using this\n"
         "see https://github.com/ggml-org/llama.cpp/issues/1437",
         [](common_params & params, const std::string & value) {
             /**/ if (value == "distribute" || value == "") { params.numa = GGML_NUMA_STRATEGY_DISTRIBUTE; }
             else if (value == "isolate") { params.numa = GGML_NUMA_STRATEGY_ISOLATE; }
             else if (value == "numactl") { params.numa = GGML_NUMA_STRATEGY_NUMACTL; }
+            else if (value == "mirror") { params.numa = GGML_NUMA_STRATEGY_MIRROR; }
             else { throw std::invalid_argument("invalid value"); }
         }
     ).set_env("LLAMA_ARG_NUMA"));
+    add_opt(common_arg(
+        {"--numa-mirror"}, "LIST",
+        "comma list selecting what to mirror with --numa mirror:\n"
+        "- weights, kv, all, none (default: all). implies --numa mirror",
+        [](common_params & params, const std::string & value) {
+            params.numa = GGML_NUMA_STRATEGY_MIRROR; // selecting components implies mirror mode
+            uint32_t mask = 0;
+            std::stringstream ss(value);
+            std::string item;
+            while (std::getline(ss, item, ',')) {
+                /**/ if (item == "all")     { mask |= GGML_NUMA_MIRROR_ALL; }
+                else if (item == "none")    { mask  = 0; }
+                else if (item == "weights") { mask |= GGML_NUMA_MIRROR_WEIGHTS; }
+                else if (item == "kv")      { mask |= GGML_NUMA_MIRROR_KV; }
+                else { throw std::invalid_argument("invalid value"); }
+            }
+            params.numa_mirror = mask;
+        }
+    ).set_env("LLAMA_ARG_NUMA_MIRROR"));
     add_opt(common_arg(
         {"-dev", "--device"}, "<dev1,dev2,..>",
         "comma-separated list of devices to use for offloading (none = don't offload)\n"

@@ -550,9 +550,12 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
     // base tensors may not be allocated if there are no non-SWA attention layers
     if (self_k_idxs && self_k_idxs->buffer) {
         mctx->get_base()->set_input_k_idxs(self_k_idxs, ubatch);
-        if (self_v_idxs) {
-            mctx->get_base()->set_input_v_idxs(self_v_idxs, ubatch);
-        }
+    }
+
+    // note: each tensor guards on its own buffer — tensors not consumed by any
+    // graph op (e.g. v_idxs in K-only attention) are not allocated
+    if (self_v_idxs && self_v_idxs->buffer) {
+        mctx->get_base()->set_input_v_idxs(self_v_idxs, ubatch);
     }
 
     // the kq mask guards on its own buffer: shared cells leave idxs unbacked while the mask stays live
@@ -563,9 +566,10 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
     // swa tensors may not be allocated if there are no SWA attention layers
     if (self_k_idxs_swa && self_k_idxs_swa->buffer) {
         mctx->get_swa()->set_input_k_idxs(self_k_idxs_swa, ubatch);
-        if (self_v_idxs_swa) {
-            mctx->get_swa()->set_input_v_idxs(self_v_idxs_swa, ubatch);
-        }
+    }
+
+    if (self_v_idxs_swa && self_v_idxs_swa->buffer) {
+        mctx->get_swa()->set_input_v_idxs(self_v_idxs_swa, ubatch);
     }
 
     if (self_kq_mask_swa && self_kq_mask_swa->buffer) {
@@ -1363,6 +1367,9 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
         res->set_params(params);
+
+        // let ggml-cpu tell prompt-processing from token-generation graphs (NUMA mirror barrier)
+        ggml_graph_set_n_batch(gf, ubatch.n_tokens);
     }
 
 void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
@@ -1719,6 +1726,16 @@ ggml_tensor * llm_graph_context::build_ffn(
                 cur = ggml_reglu(ctx0, cur);
                 cb(cur, "ffn_reglu", il);
             } break;
+        case LLM_FFN_SWIGLU_OAI:
+            {
+                // clamped SwiGLU: parallel gate path (cur=gate, tmp=up)
+                GGML_ASSERT(gate && type_gate == LLM_FFN_PAR);
+                constexpr float alpha = 1.702f;
+                constexpr float limit = 7.0f;
+                cur = ggml_swiglu_oai(ctx0, cur, tmp, alpha, limit);
+                cb(cur, "ffn_swiglu_oai", il);
+                type_gate = LLM_FFN_SEQ; // gate*up already fused; skip the par multiply
+            } break;
         default:
             GGML_ABORT("fatal error");
     }
@@ -1843,34 +1860,49 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     ggml_tensor * probs = nullptr;
-    switch (gating_op) {
-        case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX:
-            {
-                probs = ggml_soft_max(ctx0, logits); // [n_expert, n_tokens]
-            } break;
-        case LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID:
-            {
-                probs = ggml_sigmoid(ctx0, logits); // [n_expert, n_tokens]
-            } break;
-        case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT:
-            {
-                probs = logits; // [n_expert, n_tokens]
-            } break;
-        case LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS:
-            {
-                probs = ggml_sqrt(ctx0, ggml_softplus(ctx0, logits)); // [n_expert, n_tokens]
-            } break;
-        default:
-            GGML_ABORT("fatal error");
-    }
-    cb(probs, "ffn_moe_probs", il);
+    ggml_tensor * selection_probs = nullptr;
 
-    // add experts selection bias - introduced in DeepSeek V3
-    // leave probs unbiased as it's later used to get expert weights
-    ggml_tensor * selection_probs = probs;
-    if (exp_probs_b != nullptr) {
-        selection_probs = ggml_add(ctx0, probs, exp_probs_b);
+    const bool fused_router = cparams.fused_dsv4_moe_router && arch == LLM_ARCH_DEEPSEEK4;
+
+    if (fused_router && gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID && exp_probs_b != nullptr) {
+        // fused: one op produces sigmoid(logits) and sigmoid(logits) + bias packed as [2*n_expert, n_tokens]
+        ggml_tensor * packed = ggml_dsv4_moe_probs(ctx0, logits, exp_probs_b);
+        res->add_fused_node({LLM_FUSED_OP_DSV4_MOE_ROUTER, packed, il});
+
+        probs           = ggml_view_2d(ctx0, packed, n_expert, n_tokens, packed->nb[1], 0);
+        selection_probs = ggml_view_2d(ctx0, packed, n_expert, n_tokens, packed->nb[1], n_expert*packed->nb[0]);
+        cb(probs, "ffn_moe_probs", il);
         cb(selection_probs, "ffn_moe_probs_biased", il);
+    } else {
+        switch (gating_op) {
+            case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX:
+                {
+                    probs = ggml_soft_max(ctx0, logits); // [n_expert, n_tokens]
+                } break;
+            case LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID:
+                {
+                    probs = ggml_sigmoid(ctx0, logits); // [n_expert, n_tokens]
+                } break;
+            case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT:
+                {
+                    probs = logits; // [n_expert, n_tokens]
+                } break;
+            case LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS:
+                {
+                    probs = ggml_sqrt(ctx0, ggml_softplus(ctx0, logits)); // [n_expert, n_tokens]
+                } break;
+            default:
+                GGML_ABORT("fatal error");
+        }
+        cb(probs, "ffn_moe_probs", il);
+
+        // add experts selection bias - introduced in DeepSeek V3
+        // leave probs unbiased as it's later used to get expert weights
+        selection_probs = probs;
+        if (exp_probs_b != nullptr) {
+            selection_probs = ggml_add(ctx0, probs, exp_probs_b);
+            cb(selection_probs, "ffn_moe_probs_biased", il);
+        }
     }
 
     // llama4 doesn't have exp_probs_b, and sigmoid is only used after top_k
@@ -1884,77 +1916,93 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(selection_probs, "ffn_moe_probs_biased", il);
     }
 
-    // select top n_group_used expert groups
-    // https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/e815299b0bcbac849fa540c768ef21845365c9eb/modeling_deepseek.py#L440-L457
-    if (hparams.n_expert_groups > 1 && n_tokens > 0) {
-        const int64_t n_exp_per_group = n_expert / hparams.n_expert_groups;
-
-        // organize experts into n_expert_groups
-        ggml_tensor * selection_groups = ggml_reshape_3d(ctx0, selection_probs, n_exp_per_group, hparams.n_expert_groups, n_tokens); // [n_exp_per_group, n_expert_groups, n_tokens]
-
-        ggml_tensor * group_scores = ggml_argsort_top_k(ctx0, selection_groups, 2); // [2, n_expert_groups, n_tokens]
-        group_scores = ggml_get_rows(ctx0, ggml_reshape_4d(ctx0, selection_groups, 1, selection_groups->ne[0], selection_groups->ne[1], selection_groups->ne[2]), group_scores); // [1, 2, n_expert_groups, n_tokens]
-
-        // get top n_group_used expert groups
-        group_scores = ggml_sum_rows(ctx0, ggml_reshape_3d(ctx0, group_scores, group_scores->ne[1], group_scores->ne[2], group_scores->ne[3])); // [1, n_expert_groups, n_tokens]
-        group_scores = ggml_reshape_2d(ctx0, group_scores, group_scores->ne[1], group_scores->ne[2]); // [n_expert_groups, n_tokens]
-
-        ggml_tensor * expert_groups = ggml_argsort_top_k(ctx0, group_scores, hparams.n_group_used); // [n_group_used, n_tokens]
-        cb(expert_groups, "ffn_moe_group_topk", il);
-
-        // mask out the other groups
-        selection_probs = ggml_get_rows(ctx0, selection_groups, expert_groups); // [n_exp_per_group, n_group_used, n_tokens]
-        selection_probs = ggml_set_rows(ctx0, ggml_fill(ctx0, selection_groups, -INFINITY), selection_probs, expert_groups); // [n_exp_per_group, n_expert_groups, n_tokens]
-        selection_probs = ggml_reshape_2d(ctx0, selection_probs, n_expert, n_tokens); // [n_expert, n_tokens]
-        cb(selection_probs, "ffn_moe_probs_masked", il);
-    }
-
     // select experts
     ggml_tensor * selected_experts = selected_experts_in;
-    if (selected_experts == nullptr) {
+    if (selected_experts == nullptr && fused_router && hparams.n_expert_groups > 1) {
+        // fused: one op does the group scoring + group top-k + masking + expert top-k
+        selected_experts = ggml_dsv4_moe_topk(ctx0, selection_probs,
+                (int32_t) hparams.n_expert_groups, (int32_t) hparams.n_group_used, (int32_t) n_expert_used);
+        res->add_fused_node({LLM_FUSED_OP_DSV4_MOE_ROUTER, selected_experts, il});
+    } else if (selected_experts == nullptr) {
+        // select top n_group_used expert groups
+        // https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/e815299b0bcbac849fa540c768ef21845365c9eb/modeling_deepseek.py#L440-L457
+        if (hparams.n_expert_groups > 1 && n_tokens > 0) {
+            const int64_t n_exp_per_group = n_expert / hparams.n_expert_groups;
+
+            // organize experts into n_expert_groups
+            ggml_tensor * selection_groups = ggml_reshape_3d(ctx0, selection_probs, n_exp_per_group, hparams.n_expert_groups, n_tokens); // [n_exp_per_group, n_expert_groups, n_tokens]
+
+            ggml_tensor * group_scores = ggml_argsort_top_k(ctx0, selection_groups, 2); // [2, n_expert_groups, n_tokens]
+            group_scores = ggml_get_rows(ctx0, ggml_reshape_4d(ctx0, selection_groups, 1, selection_groups->ne[0], selection_groups->ne[1], selection_groups->ne[2]), group_scores); // [1, 2, n_expert_groups, n_tokens]
+
+            // get top n_group_used expert groups
+            group_scores = ggml_sum_rows(ctx0, ggml_reshape_3d(ctx0, group_scores, group_scores->ne[1], group_scores->ne[2], group_scores->ne[3])); // [1, n_expert_groups, n_tokens]
+            group_scores = ggml_reshape_2d(ctx0, group_scores, group_scores->ne[1], group_scores->ne[2]); // [n_expert_groups, n_tokens]
+
+            ggml_tensor * expert_groups = ggml_argsort_top_k(ctx0, group_scores, hparams.n_group_used); // [n_group_used, n_tokens]
+            cb(expert_groups, "ffn_moe_group_topk", il);
+
+            // mask out the other groups
+            selection_probs = ggml_get_rows(ctx0, selection_groups, expert_groups); // [n_exp_per_group, n_group_used, n_tokens]
+            selection_probs = ggml_set_rows(ctx0, ggml_fill(ctx0, selection_groups, -INFINITY), selection_probs, expert_groups); // [n_exp_per_group, n_expert_groups, n_tokens]
+            selection_probs = ggml_reshape_2d(ctx0, selection_probs, n_expert, n_tokens); // [n_expert, n_tokens]
+            cb(selection_probs, "ffn_moe_probs_masked", il);
+        }
+
         selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
         cb(selected_experts->src[0], "ffn_moe_argsort", il);
     }
     cb(selected_experts, "ffn_moe_topk", il);
 
-    if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
-        // TODO: Use scalar div instead when/if implemented
-        ggml_tensor * f_sel = ggml_cast(ctx0, selected_experts, GGML_TYPE_F32);
-        selected_experts = ggml_cast(ctx0, ggml_scale(ctx0, f_sel, 1.0f / float(hparams.n_group_experts)), GGML_TYPE_I32);
-        probs = ggml_reshape_3d(ctx0, probs, 1, hparams.n_expert, n_tokens);
+    ggml_tensor * weights = nullptr;
+
+    if (fused_router && gating_op != LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT &&
+            (norm_w || (w_scale != 0.0f && w_scale != 1.0f))) {
+        // fused: one op does gather + normalize + scale; probs is still [n_expert, n_tokens] here
+        weights = ggml_dsv4_moe_weights(ctx0, probs, selected_experts, w_scale, norm_w ? 1 : 0);
+        res->add_fused_node({LLM_FUSED_OP_DSV4_MOE_ROUTER, weights, il});
+        weights = ggml_reshape_3d(ctx0, weights, 1, n_expert_used, n_tokens);
+        cb(weights, "ffn_moe_weights", il);
     } else {
-        probs = ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tokens);
-    }
+        if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
+            // TODO: Use scalar div instead when/if implemented
+            ggml_tensor * f_sel = ggml_cast(ctx0, selected_experts, GGML_TYPE_F32);
+            selected_experts = ggml_cast(ctx0, ggml_scale(ctx0, f_sel, 1.0f / float(hparams.n_group_experts)), GGML_TYPE_I32);
+            probs = ggml_reshape_3d(ctx0, probs, 1, hparams.n_expert, n_tokens);
+        } else {
+            probs = ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tokens);
+        }
 
-    ggml_tensor * weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_expert_used, n_tokens]
-    cb(weights, "ffn_moe_weights", il);
+        weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_expert_used, n_tokens]
+        cb(weights, "ffn_moe_weights", il);
 
 
-    if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT) {
-        weights = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
-        weights = ggml_soft_max(ctx0, weights); // [n_expert_used, n_tokens]
-        weights = ggml_reshape_3d(ctx0, weights, 1, n_expert_used, n_tokens);
-        cb(weights, "ffn_moe_weights_softmax", il);
-    }
+        if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT) {
+            weights = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
+            weights = ggml_soft_max(ctx0, weights); // [n_expert_used, n_tokens]
+            weights = ggml_reshape_3d(ctx0, weights, 1, n_expert_used, n_tokens);
+            cb(weights, "ffn_moe_weights_softmax", il);
+        }
 
-    if (norm_w) {
-        weights = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
+        if (norm_w) {
+            weights = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
 
-        ggml_tensor * weights_sum = ggml_sum_rows(ctx0, weights); // [1, n_tokens]
-        cb(weights_sum, "ffn_moe_weights_sum", il);
+            ggml_tensor * weights_sum = ggml_sum_rows(ctx0, weights); // [1, n_tokens]
+            cb(weights_sum, "ffn_moe_weights_sum", il);
 
-        // Avoid division by zero, clamp to smallest number representable by F16
-        weights_sum = ggml_clamp(ctx0, weights_sum, 6.103515625e-5, INFINITY);
-        cb(weights_sum, "ffn_moe_weights_sum_clamped", il);
+            // Avoid division by zero, clamp to smallest number representable by F16
+            weights_sum = ggml_clamp(ctx0, weights_sum, 6.103515625e-5, INFINITY);
+            cb(weights_sum, "ffn_moe_weights_sum_clamped", il);
 
-        weights = ggml_div(ctx0, weights, weights_sum); // [n_expert_used, n_tokens]
-        cb(weights, "ffn_moe_weights_norm", il);
+            weights = ggml_div(ctx0, weights, weights_sum); // [n_expert_used, n_tokens]
+            cb(weights, "ffn_moe_weights_norm", il);
 
-        weights = ggml_reshape_3d(ctx0, weights, 1, n_expert_used, n_tokens);
-    }
-    if (w_scale != 0.0f && w_scale != 1.0f) {
-        weights = ggml_scale(ctx0, weights, w_scale);
-        cb(weights, "ffn_moe_weights_scaled", il);
+            weights = ggml_reshape_3d(ctx0, weights, 1, n_expert_used, n_tokens);
+        }
+        if (w_scale != 0.0f && w_scale != 1.0f) {
+            weights = ggml_scale(ctx0, weights, w_scale);
+            cb(weights, "ffn_moe_weights_scaled", il);
+        }
     }
 
     //call early so that topk-moe can be used

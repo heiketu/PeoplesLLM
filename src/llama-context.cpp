@@ -6,6 +6,7 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-kv-cache-dsv4.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
@@ -18,6 +19,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 //
 // llama_context
@@ -79,6 +81,12 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+static const llm_fused_op_probe llm_fused_op_dsv4_moe_router_probe = {
+    /*.op               =*/ LLM_FUSED_OP_DSV4_MOE_ROUTER,
+    /*.name             =*/ "fused DeepSeek V4 MoE router",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -116,6 +124,8 @@ llama_context::llama_context(
     cparams.embeddings              = params.embeddings;
     cparams.embeddings_nextn        = false;
     cparams.embeddings_nextn_masked = false;
+    cparams.embeddings_pre_norm        = false;
+    cparams.embeddings_pre_norm_masked = false;
     cparams.offload_kqv             = params.offload_kqv;
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
@@ -246,16 +256,23 @@ llama_context::llama_context(
     cparams.flash_attn = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
     cparams.auto_fa    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
 
-    cparams.fused_gdn_ar = true;
-    cparams.fused_gdn_ch = true;
+    // debug: allow disabling individual fused ops via env (default: all enabled)
+    const auto env_fused = [](const char * name) {
+        const char * v = getenv(name);
+        return v == nullptr || atoi(v) > 0;
+    };
+
+    cparams.fused_gdn_ar = env_fused("LLAMA_FUSED_GDN_AR");
+    cparams.fused_gdn_ch = env_fused("LLAMA_FUSED_GDN_CH");
     cparams.auto_fgdn    = true;
 
-    cparams.fused_lid    = true;
+    cparams.fused_lid    = env_fused("LLAMA_FUSED_LID");
     cparams.auto_flid    = true;
 
-    cparams.fused_dsv4_hc_pre  = true;
-    cparams.fused_dsv4_hc_comb = true;
-    cparams.fused_dsv4_hc_post = true;
+    cparams.fused_dsv4_hc_pre  = env_fused("LLAMA_FUSED_DSV4_HC_PRE");
+    cparams.fused_dsv4_hc_comb = env_fused("LLAMA_FUSED_DSV4_HC_COMB");
+    cparams.fused_dsv4_hc_post = env_fused("LLAMA_FUSED_DSV4_HC_POST");
+    cparams.fused_dsv4_moe_router = env_fused("LLAMA_FUSED_DSV4_MOE_ROUTER");
     cparams.auto_fhc           = true;
 
     // with causal attention, the batch size is limited by the context size
@@ -566,6 +583,7 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
         resolve(llm_fused_op_dsv4_hc_pre_probe,  cparams.fused_dsv4_hc_pre);
         resolve(llm_fused_op_dsv4_hc_comb_probe, cparams.fused_dsv4_hc_comb);
         resolve(llm_fused_op_dsv4_hc_post_probe, cparams.fused_dsv4_hc_post);
+        resolve(llm_fused_op_dsv4_moe_router_probe, cparams.fused_dsv4_moe_router);
         cparams.auto_fhc = false;
     }
 }
@@ -963,6 +981,43 @@ float * llama_context::get_embeddings_nextn_ith(int32_t i) {
     }
 }
 
+float * llama_context::get_embeddings_pre_norm() {
+    output_reorder();
+
+    return embd_pre_norm.data;
+}
+
+float * llama_context::get_embeddings_pre_norm_ith(int32_t i) {
+    output_reorder();
+
+    try {
+        if (embd_pre_norm.data == nullptr) {
+            throw std::runtime_error("no pre-norm embeddings");
+        }
+
+        // the pre-norm channel carries the full MTP chaining state (DSV4: hc_dim)
+        const uint32_t n_embd = model.hparams.n_embd_h();
+
+        if (!cparams.embeddings_pre_norm_masked) {
+            // unmasked: rows are stored densely, indexed by raw token position.
+            if (i < 0 || (size_t)(i + 1) * n_embd > embd_pre_norm.size) {
+                throw std::runtime_error(format("out of range [0, %zu)", embd_pre_norm.size / n_embd));
+            }
+            return embd_pre_norm.data + (size_t) i * n_embd;
+        }
+
+        const int64_t j = output_resolve_row(i);
+        return embd_pre_norm.data + j*n_embd;
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: invalid pre-norm embeddings id %d, reason: %s\n", __func__, i, err.what());
+#ifndef NDEBUG
+        GGML_ABORT("fatal error");
+#else
+        return nullptr;
+#endif
+    }
+}
+
 float * llama_context::get_embeddings_layer_inp(uint32_t lid) {
     output_reorder();
 
@@ -1158,6 +1213,13 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
     cparams.embeddings_nextn_masked = masked;
 }
 
+void llama_context::set_embeddings_pre_norm(bool value, bool masked) {
+    LLAMA_LOG_DEBUG("%s: value = %d, masked = %d\n", __func__, value, masked);
+
+    cparams.embeddings_pre_norm        = value;
+    cparams.embeddings_pre_norm_masked = masked;
+}
+
 void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
     LLAMA_LOG_DEBUG("%s: lid = %d, enable = %d\n", __func__, lid, enable);
 
@@ -1314,6 +1376,45 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+struct nan_dbg_ctx { int n_tokens; int pos0; int n_nan_nodes; };
+
+static bool llama_nan_dbg_eval_cb(ggml_tensor * t, bool ask, void * user_data) {
+    if (ask) {
+        return true;
+    }
+    auto * ctx = (nan_dbg_ctx *) user_data;
+    if (ctx->n_nan_nodes >= 8 || !t->data || t->view_src || t->type != GGML_TYPE_F32) {
+        return true;
+    }
+    const size_t nbytes = ggml_nbytes(t);
+    if (nbytes == 0 || nbytes > (size_t) 64*1024*1024) {
+        return true;
+    }
+    const bool full = ctx->n_tokens == 1;
+    const size_t chunk = std::min(nbytes, (size_t) 96*1024);
+    const size_t nscan = full ? nbytes : chunk;
+    static std::vector<float> buf;
+    for (int part = 0; part < (full ? 1 : 2); ++part) {
+        const size_t off = part == 0 ? 0 : nbytes - nscan;
+        buf.resize(nscan/sizeof(float));
+        ggml_backend_tensor_get(t, buf.data(), off, nscan);
+        size_t n_nan = 0, first = SIZE_MAX;
+        for (size_t j = 0; j < buf.size(); ++j) {
+            if (!std::isfinite(buf[j])) { n_nan++; if (first == SIZE_MAX) first = j; }
+        }
+        if (n_nan) {
+            fprintf(stderr, "[nan-dbg] nt=%d pos0=%d node=%s op=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] off=%zu nan=%zu/%zu first=%zu\n",
+                ctx->n_tokens, ctx->pos0, t->name[0] ? t->name : "?", ggml_op_name(t->op),
+                t->ne[0], t->ne[1], t->ne[2], t->ne[3], off, n_nan, buf.size(), first);
+            if (++ctx->n_nan_nodes >= 8) {
+                fprintf(stderr, "[nan-dbg] ... (more nodes with nan)\n");
+                return true;
+            }
+        }
+    }
+    return true;
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
@@ -1374,11 +1475,32 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    static const bool nan_dbg = []() {
+        const char * env = getenv("LLAMA_NAN_DEBUG");
+        return env && atoi(env) > 0;
+    }();
+    nan_dbg_ctx nan_ctx { (int) ubatch.n_tokens, ubatch.pos ? (int) ubatch.pos[0] : -1, 0 };
+    if (nan_dbg) {
+        ggml_backend_sched_set_eval_callback(sched.get(), llama_nan_dbg_eval_cb, &nan_ctx);
+    }
+
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+
+    static const bool dsv4_state_dbg = []() {
+        const char * env = getenv("LLAMA_DSV4_STATE_DEBUG");
+        return env && atoi(env) > 0;
+    }();
+    if (dsv4_state_dbg && model.arch == LLM_ARCH_DEEPSEEK4) {
+        ggml_backend_sched_synchronize(sched.get());
+
+        char tag[96];
+        snprintf(tag, sizeof(tag), "nt=%u p0=%d", ubatch.n_tokens, ubatch.pos ? (int) ubatch.pos[0] : -1);
+        llama_kv_cache_dsv4_debug_state(static_cast<const llama_kv_cache_dsv4 *>(memory.get()), tag);
     }
 
     ret = GGML_STATUS_SUCCESS;
@@ -1464,6 +1586,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
     auto * t_logits  = res->get_logits();
     auto * t_embd    = res->get_embd_pooled() ? res->get_embd_pooled() : res->get_embd();
     auto * t_h_nextn = cparams.embeddings_nextn ? res->get_h_nextn() : nullptr;
+    auto * t_h_pre_norm = cparams.embeddings_pre_norm ? res->get_h_pre_norm() : nullptr;
 
     // extract logits
     if (logits.data && t_logits) {
@@ -1537,6 +1660,16 @@ int llama_context::encode(const llama_batch & batch_inp) {
         const uint32_t n_embd = hparams.n_embd_out();
         GGML_ASSERT(n_tokens*n_embd <= (int64_t) embd_nextn.size);
         ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn.data, 0, n_tokens*n_embd*sizeof(float));
+    }
+
+    // extract pre-norm embeddings (MTP chaining state)
+    if (embd_pre_norm.data && t_h_pre_norm && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
+        ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_pre_norm);
+        GGML_ASSERT(backend_h != nullptr);
+
+        const uint32_t n_embd = hparams.n_embd_h();
+        GGML_ASSERT(n_tokens*n_embd <= (int64_t) embd_pre_norm.size);
+        ggml_backend_tensor_get_async(backend_h, t_h_pre_norm, embd_pre_norm.data, 0, n_tokens*n_embd*sizeof(float));
     }
 
     // TODO: hacky solution
@@ -1694,6 +1827,20 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
+
+    // debug instrumentation: LLAMA_DECODE_TIMING=1 logs per-decode wall time (abs timestamp, ctx type, n_tokens)
+    struct decode_prof_guard {
+        bool               active;
+        int64_t            t0;
+        llama_context_type type;
+        int32_t            n_tokens;
+        ~decode_prof_guard() {
+            if (active) {
+                fprintf(stderr, "[decode-prof] t=%.3f ctx_type=%d n_tokens=%d wall=%.2f ms\n",
+                        ggml_time_us() / 1.0e6, (int) type, (int) n_tokens, (ggml_time_us() - t0) / 1000.0);
+            }
+        }
+    } decode_prof_guard{ getenv("LLAMA_DECODE_TIMING") != nullptr, ggml_time_us(), cparams.ctx_type, batch_inp.n_tokens };
 
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
@@ -1894,6 +2041,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         auto * t_logits  = res->get_logits();
         auto * t_embd    = cparams.embeddings       ? res->get_embd()     : nullptr;
         auto * t_h_nextn = cparams.embeddings_nextn ? res->get_h_nextn()  : nullptr;
+        auto * t_h_pre_norm = cparams.embeddings_pre_norm ? res->get_h_pre_norm() : nullptr;
 
         if (t_embd && res->get_embd_pooled()) {
             t_embd = res->get_embd_pooled();
@@ -1995,6 +2143,24 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
+        // extract pre-norm embeddings (MTP chaining state); same masking rules as nextn
+        {
+            const bool masked    = cparams.embeddings_pre_norm_masked;
+            const int64_t n_rows = masked ? n_outputs       : (int64_t) ubatch.n_tokens;
+            const int64_t offset = masked ? n_outputs_prev  : n_tokens_prev;
+
+            if (embd_pre_norm.data && t_h_pre_norm && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
+                ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_pre_norm);
+                GGML_ASSERT(backend_h != nullptr);
+
+                const uint32_t n_embd  = hparams.n_embd_h();
+                float * embd_pre_norm_out = embd_pre_norm.data + offset*n_embd;
+
+                GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_pre_norm.size);
+                ggml_backend_tensor_get_async(backend_h, t_h_pre_norm, embd_pre_norm_out, 0, n_rows*n_embd*sizeof(float));
+            }
+        }
+
         // Copy backend sampling output if this ubatch produced any sampling tensors.
         if (has_samplers && (!res->t_sampled.empty() || !res->t_sampled_probs.empty() || !res->t_sampled_logits.empty())) {
             const auto seq_to_output_row = build_seq_to_output_row(ubatch, n_outputs_prev);
@@ -2086,6 +2252,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     bool has_logits     = true;
     bool has_embd       = cparams.embeddings;
     bool has_embd_nextn = cparams.embeddings_nextn;
+    bool has_embd_pre_norm = cparams.embeddings_pre_norm;
 
     // TODO: hacky enc-dec support
     if (model.arch == LLM_ARCH_T5) {
@@ -2100,11 +2267,17 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     logits.size     = has_logits     ? n_vocab*n_outputs_max     : 0;
     embd.size       = has_embd       ? n_embd_out*n_outputs_max  : 0;
     embd_nextn.size = has_embd_nextn ? n_embd_out*n_outputs_max  : 0;
+    embd_pre_norm.size = has_embd_pre_norm ? (size_t) hparams.n_embd_h()*n_outputs_max : 0;
 
     if (has_embd_nextn && !cparams.embeddings_nextn_masked) {
         // unmasked: nextn row exists for every token in the batch, not just
         // those flagged via batch.logits[i] -> size by token count instead.
         embd_nextn.size = (size_t) n_embd_out * n_batch;
+    }
+
+    if (has_embd_pre_norm && !cparams.embeddings_pre_norm_masked) {
+        // unmasked: one chaining-state row per batch token (same rule as nextn)
+        embd_pre_norm.size = (size_t) hparams.n_embd_h() * n_batch;
     }
 
     for (bool enabled : cparams.embeddings_layer_inp) {
@@ -2127,7 +2300,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     const size_t prev_size = buf_output ? ggml_backend_buffer_get_size(buf_output.get()) : 0;
     const size_t new_size  =
-        (logits.size + embd.size + embd_nextn.size + embd_layer_inp_float_count + backend_float_count) * sizeof(float) +
+        (logits.size + embd.size + embd_nextn.size + embd_pre_norm.size + embd_layer_inp_float_count + backend_float_count) * sizeof(float) +
         (                                                                         backend_token_count) * sizeof(llama_token);
 
     // alloc only when more than the current capacity is required
@@ -2145,6 +2318,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
             logits.data = nullptr;
             embd.data = nullptr;
             embd_nextn.data = nullptr;
+            embd_pre_norm.data = nullptr;
             for (auto & layer_inp : embd_layer_inp) {
                 layer_inp = {nullptr, 0};
             }
@@ -2178,6 +2352,9 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     embd_nextn = has_embd_nextn ? buffer_view<float>{(float *) (base + offset), embd_nextn.size} : buffer_view<float>{nullptr, 0};
     offset += embd_nextn.size * sizeof(float);
+
+    embd_pre_norm = has_embd_pre_norm ? buffer_view<float>{(float *) (base + offset), embd_pre_norm.size} : buffer_view<float>{nullptr, 0};
+    offset += embd_pre_norm.size * sizeof(float);
 
     for (uint32_t il = 0; il < embd_layer_inp.size(); ++il) {
         if (cparams.embeddings_layer_inp[il]) {
@@ -2285,6 +2462,13 @@ void llama_context::output_reorder() {
         if (embd_nextn.size > 0) {
             for (uint64_t k = 0; k < n_embd; k++) {
                 std::swap(embd_nextn.data[i0*n_embd + k], embd_nextn.data[i1*n_embd + k]);
+            }
+        }
+
+        if (embd_pre_norm.size > 0) {
+            const uint64_t n_embd_h = model.hparams.n_embd_h();
+            for (uint64_t k = 0; k < n_embd_h; k++) {
+                std::swap(embd_pre_norm.data[i0*n_embd_h + k], embd_pre_norm.data[i1*n_embd_h + k]);
             }
         }
 
@@ -3742,6 +3926,22 @@ float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
 
     return ctx->get_embeddings_nextn_ith(i);
+}
+
+void llama_set_embeddings_pre_norm(llama_context * ctx, bool value, bool masked) {
+    ctx->set_embeddings_pre_norm(value, masked);
+}
+
+float * llama_get_embeddings_pre_norm(llama_context * ctx) {
+    ctx->synchronize();
+
+    return ctx->get_embeddings_pre_norm();
+}
+
+float * llama_get_embeddings_pre_norm_ith(llama_context * ctx, int32_t i) {
+    ctx->synchronize();
+
+    return ctx->get_embeddings_pre_norm_ith(i);
 }
 
 float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {

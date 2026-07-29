@@ -34,6 +34,8 @@ struct llama_cparams {
     bool embeddings;
     bool embeddings_nextn;        // also extract the hidden state before the final output norm
     bool embeddings_nextn_masked; // extract for only rows where batch.logits != 0
+    bool embeddings_pre_norm;        // also extract the MTP chaining state (t_h_pre_norm)
+    bool embeddings_pre_norm_masked; // extract for only rows where batch.logits != 0
     bool causal_attn;
     bool offload_kqv;
     bool flash_attn;
@@ -46,6 +48,7 @@ struct llama_cparams {
     bool fused_dsv4_hc_pre;
     bool fused_dsv4_hc_comb;
     bool fused_dsv4_hc_post;
+    bool fused_dsv4_moe_router;
     bool auto_fhc;
     bool no_perf;
     bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]

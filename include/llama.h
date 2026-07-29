@@ -463,6 +463,11 @@ extern "C" {
     //optional:
     LLAMA_API void llama_numa_init(enum ggml_numa_strategy numa);
 
+    // Select which data to duplicate per NUMA node when numa == GGML_NUMA_STRATEGY_MIRROR.
+    // mirror_flags is a bitmask of enum ggml_numa_mirror_flags (default: GGML_NUMA_MIRROR_ALL).
+    // Call after llama_numa_init(), before loading the model.
+    LLAMA_API void llama_numa_set_mirror(uint32_t mirror_flags);
+
     // Optional: an auto threadpool gets created in ggml if not passed explicitly
     LLAMA_API void llama_attach_threadpool(
             struct llama_context * ctx,

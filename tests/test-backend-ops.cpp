@@ -3911,6 +3911,150 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
 };
 
 
+
+struct test_dsv4_hc_prep : public test_dsv4_hc {
+    const int64_t n_tokens;
+    const int32_t n_iter;
+    const float eps;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_HC_PREP";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_tokens, n_iter, eps);
+    }
+
+    test_dsv4_hc_prep(int64_t n_tokens = 17, int32_t n_iter = 4, float eps = 1e-6f)
+        : n_tokens(n_tokens), n_iter(n_iter), eps(eps) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * mixes = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (2 + hc)*hc, n_tokens);
+        ggml_set_name(mixes, "mixes");
+
+        ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 3);
+        ggml_set_name(scale, "scale");
+
+        ggml_tensor * base = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (2 + hc)*hc);
+        ggml_set_name(base, "base");
+
+        out = ggml_dsv4_hc_prep(ctx, mixes, scale, base, eps, n_iter);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+struct test_dsv4_moe_probs : public test_dsv4_hc {
+    const int64_t n_expert;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_MOE_PROBS";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR2(n_expert, n_tokens);
+    }
+
+    test_dsv4_moe_probs(int64_t n_expert = 256, int64_t n_tokens = 17)
+        : n_expert(n_expert), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * logits = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_expert, n_tokens);
+        ggml_set_name(logits, "x");
+
+        ggml_tensor * bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_expert);
+        ggml_set_name(bias, "base");
+
+        out = ggml_dsv4_moe_probs(ctx, logits, bias);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+struct test_dsv4_moe_topk : public test_dsv4_hc {
+    const int64_t n_expert;
+    const int32_t n_groups;
+    const int32_t n_group_used;
+    const int32_t k;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_MOE_TOPK";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR5(n_expert, n_groups, n_group_used, k, n_tokens);
+    }
+
+    test_dsv4_moe_topk(int64_t n_expert = 256, int32_t n_groups = 8, int32_t n_group_used = 4, int32_t k = 6, int64_t n_tokens = 17)
+        : n_expert(n_expert), n_groups(n_groups), n_group_used(n_group_used), k(k), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * probs = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_expert, n_tokens);
+        ggml_set_name(probs, "weights");
+
+        out = ggml_dsv4_moe_topk(ctx, probs, n_groups, n_group_used, k);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+struct test_dsv4_moe_weights : public test_dsv4_hc {
+    const int64_t n_expert;
+    const int64_t k;
+    const float   scale;
+    const int32_t normalize;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_MOE_WEIGHTS";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR5(n_expert, k, scale, normalize, n_tokens);
+    }
+
+    test_dsv4_moe_weights(int64_t n_expert = 256, int64_t k = 6, float scale = 2.5f, int32_t normalize = 1, int64_t n_tokens = 17)
+        : n_expert(n_expert), k(k), scale(scale), normalize(normalize), n_tokens(n_tokens) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_dsv4_hc::initialize_tensors(ctx);
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            const std::string name = ggml_get_name(t);
+            if (name != "selected") {
+                continue;
+            }
+
+            GGML_ASSERT(t->type == GGML_TYPE_I32);
+            std::mt19937 rng(tensor_seed(t));
+            std::uniform_int_distribution<int32_t> dist(0, (int32_t) n_expert - 1);
+            std::vector<int32_t> data(ggml_nelements(t));
+            for (int32_t & v : data) {
+                v = dist(rng);
+            }
+            ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+        }
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * probs = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_expert, n_tokens);
+        ggml_set_name(probs, "weights");
+
+        ggml_tensor * selected = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, k, n_tokens);
+        ggml_set_name(selected, "selected");
+
+        out = ggml_dsv4_moe_weights(ctx, probs, selected, scale, normalize);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
     const ggml_type type;
@@ -8055,6 +8199,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17));
     test_cases.emplace_back(new test_dsv4_hc_post(128, 257));
 
+    test_cases.emplace_back(new test_dsv4_hc_prep(1, 1));
+    test_cases.emplace_back(new test_dsv4_hc_prep(17, 4));
+    test_cases.emplace_back(new test_dsv4_hc_prep(257, 8));
+
+    test_cases.emplace_back(new test_dsv4_moe_probs(64, 1));
+    test_cases.emplace_back(new test_dsv4_moe_probs(256, 17));
+
+    test_cases.emplace_back(new test_dsv4_moe_topk(64, 8, 2, 4, 1));
+    test_cases.emplace_back(new test_dsv4_moe_topk(256, 8, 4, 6, 17));
+
+    test_cases.emplace_back(new test_dsv4_moe_weights(64, 6, 2.5f, 1, 1));
+    test_cases.emplace_back(new test_dsv4_moe_weights(256, 6, 2.5f, 1, 17));
+    test_cases.emplace_back(new test_dsv4_moe_weights(256, 6, 1.0f, 0, 17));
+
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
         for (int v : {0, 1}) {
@@ -8807,6 +8965,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
+
+    // large GEMV cases for mmvq bandwidth tuning (TG shapes: n = 1..8 tokens)
+    for (ggml_type type_a : {GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0}) {
+        for (int n : {1, 2, 4, 8}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4096, n, 4096, {1, 1}, {1, 1}));
+        }
+    }
+    // DSV4 per-layer attention/shared shapes (q3_K): q_a, q_b, kv, out_a, out_b, shexp
+    for (int64_t m : {1024, 32768, 512, 8192, 2048}) {
+        for (int64_t k : {4096, 1024, 8192, 2048}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q3_K, GGML_TYPE_F32, m, 1, k, {1, 1}, {1, 1}));
+        }
+    }
 
 
 #if 0
@@ -9814,6 +9985,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             for (ggml_type type_b : {GGML_TYPE_F32}) {
                 test_cases.emplace_back(new test_mul_mat(type_a, type_b, 4096, bs, 14336, {1,  1}, {1, 1}));
             }
+        }
+    }
+
+    // DSV4 per-layer attention/shared GEMV shapes (q3_K): q_a, q_b, kv, out_a, out_b, shexp
+    for (int64_t m : {1024, 32768, 512, 8192, 2048}) {
+        for (int64_t k : {4096, 1024, 8192, 2048}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q3_K, GGML_TYPE_F32, m, 1, k, {1, 1}, {1, 1}));
         }
     }
 

@@ -341,6 +341,12 @@ struct ggml_cgraph {
 
     enum ggml_cgraph_eval_order order;
 
+    // number of tokens in the batch that built this graph (0 = unknown).
+    // used by the ggml-cpu NUMA mirror to pick the barrier flavor: large (prompt processing)
+    // graphs are compute-bound and keep the flat barrier, small (token generation) graphs use
+    // the NUMA-aware hierarchical barrier.
+    int n_batch;
+
     // an optional identifier that can be utilized to recognize same graphs if two non-zero values match
     // a value of 0 means it is not set and should be ignored
     uint64_t uid;

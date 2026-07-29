@@ -481,6 +481,17 @@ void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor
         return;
     }
 
+    // temporary instrumentation: trace large cross-backend copies (GGML_COPY_TRACE=1)
+    {
+        static const bool trace = getenv("GGML_COPY_TRACE") != nullptr;
+        if (trace) {
+            const size_t nb = ggml_nbytes(src);
+            if (nb >= 256*1024) {
+                fprintf(stderr, "[copy-trace] %zu bytes: %s -> %s\n", nb, src->name, dst->name);
+            }
+        }
+    }
+
     if (ggml_backend_buffer_is_host(src->buffer)) {
         ggml_backend_tensor_set(dst, src->data, 0, ggml_nbytes(src));
     } else if (ggml_backend_buffer_is_host(dst->buffer)) {

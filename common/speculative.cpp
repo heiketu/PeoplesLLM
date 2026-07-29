@@ -1213,6 +1213,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     int32_t n_embd = 0;
 
+    // DSV4 chains the pre-norm hyper-connection hidden state (n_embd_h wide)
+    // through the MTP heads instead of the nextn embedding (n_embd wide)
+    bool use_pre_norm = false;   // deepseek4
+
     // One MTP draft driver, three modes (set once in the ctor):
     //   is_mem_shared (gemma4): shares the target KV, runs all heads in one graph.
     //   chain_heads (step35): n_mtp_layers trained heads, one per draft step.
@@ -1245,13 +1249,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         auto * ctx_dft = this->params.ctx_dft;
         GGML_ASSERT(ctx_tgt && ctx_dft && "MTP requires ctx_tgt and ctx_dft to be set");
 
-        n_embd = llama_model_n_embd_out(llama_get_model(ctx_dft));
-        GGML_ASSERT(n_embd == llama_model_n_embd(llama_get_model(ctx_tgt)) &&
-                "MTP input row width must match the target h_nextn width");
-        n_mtp_layers = std::max(1, (int) llama_model_n_layer_nextn(llama_get_model(ctx_dft)));
+        const auto * model_tgt = llama_get_model(ctx_tgt);
+        const auto * model_dft = llama_get_model(ctx_dft);
+
+        // DSV4 widens the chaining state to n_embd_h (hyper-connections); every other arch keeps n_embd
+        use_pre_norm = llama_model_n_embd_h(model_dft) != llama_model_n_embd(model_dft);
+
+        n_embd = use_pre_norm ? llama_model_n_embd_h(model_dft) : llama_model_n_embd_out(model_dft);
+        GGML_ASSERT(n_embd == (use_pre_norm ? llama_model_n_embd_h(model_tgt) : llama_model_n_embd(model_tgt)) &&
+                "MTP input row width must match the target chaining state width");
+        n_mtp_layers = std::max(1, (int) llama_model_n_layer_nextn(model_dft));
 
         SPC_TRC("%s", "adding speculative implementation 'draft-mtp'\n");
-        SPC_TRC("- n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d\n", this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) this->params.backend_sampling);
+        SPC_TRC("- n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, pre_norm=%d, backend_sampling=%d\n", this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) use_pre_norm, (int) this->params.backend_sampling);
         SPC_TRC("- gpu_layers=%d, cache_k=%s, cache_v=%s, ctx_tgt=%s, ctx_dft=%s, devices=[%s]\n",
                 this->params.n_gpu_layers,
                 ggml_type_name(this->params.cache_type_k),
@@ -1291,8 +1301,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
-        llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
-        llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
+        if (use_pre_norm) {
+            llama_set_embeddings_pre_norm(ctx_tgt, true, /*masked*/ false);
+            llama_set_embeddings_pre_norm(ctx_dft, true, /*masked*/ true);
+        } else {
+            llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
+            llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
+        }
 
         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
@@ -1402,7 +1417,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             //                                                       ^--- this is a problem
             // TODO:this is generally true, but would be nice to assert it
             {
-                const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+                const float * h_tgt = use_pre_norm ? llama_get_embeddings_pre_norm(ctx_tgt)
+                                                   : llama_get_embeddings_nextn(ctx_tgt);
                 std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
             }
 
@@ -1461,7 +1477,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             verify_h[seq_id].resize((size_t) n_rows * n_embd);
 
             for (int32_t i = 0; i < n_rows; ++i) {
-                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
+                const float * h = use_pre_norm ? llama_get_embeddings_pre_norm_ith(ctx_tgt, i_batch_beg[seq_id] + i)
+                                               : llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
                 std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
             }
 
@@ -1542,7 +1559,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 auto * smpl = smpls[seq_id].get();
 
                 common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
-                const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
+                const float * h_row = use_pre_norm ? llama_get_embeddings_pre_norm_ith(ctx_dft, i_last[seq_id])
+                                                   : llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
 

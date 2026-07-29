@@ -107,6 +107,19 @@ LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
 // LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
 LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
 
+// Set whether the context outputs the pre-norm (pre hc-head) chaining hidden
+// states used by DSV4-style MTP draft models. Same masking semantics as nextn.
+// Rows are n_embd_h() floats wide (n_embd * dsv4_hc_mult for DSV4).
+LLAMA_API void llama_set_embeddings_pre_norm(struct llama_context * ctx, bool value, bool masked);
+
+LLAMA_API float * llama_get_embeddings_pre_norm(struct llama_context * ctx);
+
+LLAMA_API float * llama_get_embeddings_pre_norm_ith(struct llama_context * ctx, int32_t i);
+
+// hidden-state width of the pre-norm chaining output (== n_embd unless the
+// arch widens it, e.g. DSV4 hyper-connections)
+LLAMA_API int32_t llama_model_n_embd_h(const struct llama_model * model);
+
 // Set whether the context outputs the input embeddings of a specific layer
 LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
 
