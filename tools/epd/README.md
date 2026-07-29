@@ -55,5 +55,26 @@ MoE 层）；对比生成 token 序列。master 参数为生产镜像基线
 正确性：同 prompt（temp 0 / seed 42）双机与单机输出逐 token 一致（英文 48 tok +
 中文 64 tok，/completion 原始完成模式）。
 
-已知限制：单一 worker 端点；阻塞式收发（无流水线）；GLM-5.2（glm-dsa，7 分卷）还需要
-epd 多分卷支持 + glm-dsa.cpp 的 loader 跳过三行改动。
+已知限制：单一 worker 端点；阻塞式收发（无流水线）。
+
+## GLM-5.2 双机实测（commit cbcccef7e，glm-dsa，79层/160专家/top-8，UD-Q2_K_MXFP4 7 分卷 ≈236G）
+
+多分卷 GGUF：epd 对每卷独立 gguf_init + mmap，张量注册进统一 name→tensor 表
+（多分卷惯例：各卷元数据只列本卷张量）；glm-dsa.cpp 的 MoE 分支对
+`GGML_REMOTE_EP_LAYERS` 范围内层做 TENSOR_SKIP（前 3 个密集层不动）。
+
+配置：master 本地层 18-78 + GPU 专家卸载（29-32→CUDA0，58-62→CUDA1），
+slave（server2）认领层 3-17（15 层 ≈43.5G 权重）。模型在 exfat USB 盘上，
+4K 随机读仅 ~82MB/s，需先 `dd bs=16M` 顺序预热全部 7 卷，否则 TG 只有 0.14-0.17 t/s。
+
+| 配置 | master RSS | master GPU | slave RSS | TG(96 tok) | PP(5 tok) |
+| --- | --- | --- | --- | --- | --- |
+| 单机 mirror 基线（build-epdev） | 166.8G | 21.7+21.9G | — | 10.5 t/s | 17.4 t/s |
+| 双机 EP（3-17 远端） | 70.7G（生成中快照） | 21.7+21.9G | 37.6G（上限 ~43.5G） | 9.8-9.9 t/s | 9.7 t/s（1 tok） |
+
+正确性：同 prompt（temp 0 / seed 42，cache_prompt false）双机与单机 mirror 输出逐字一致
+（英文 48 tok + 中文 64 tok，长度均相同）。中文 prompt 开头出现的怪字"淏"在单机基线
+同样出现，是模型/权重补丁本身行为，非 EP 引入。
+
+注：生产单机基线（build-cuda 二进制）TG ~12.0 t/s；build-epdev 基线 10.5 t/s 的差距
+来自构建差异而非 EP 改动（EP 关闭时同一二进制）。双机 TG 约为同二进制单机 mirror 的 93%。
