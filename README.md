@@ -2,7 +2,7 @@
 
 > **[English README →](README.en.md)**
 
-**让超大 MoE 模型在本地廉价硬件上跑起来。** llama.cpp 特化分支，专注：双路 CPU + 消费级 GPU 上的 200G ~ 3T 级 MoE 推理。
+**让超大 MoE 模型在本地廉价硬件上跑起来。** llama.cpp 特化分支，专注：双路乃至多路 CPU + 消费级 GPU 上的 200G ~ 3T 级 MoE 推理。
 
 ## 实测数据
 
