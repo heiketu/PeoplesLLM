@@ -7,8 +7,14 @@
 // output. No attention, no router: the master sends expert ids + weights.
 //
 // Modes:
-//   llama-epd -m model.gguf --port 29200 --layers 3-42 [--experts 0-255] [--threads N]
+//   llama-epd -m model.gguf --port 29200 --layers 3-42 [--experts 0-255] [--threads N] [--no-autotune]
 //   llama-epd -m model.gguf --selftest [--selftest-layer N]   # local vs loopback diff
+//
+// Without -t the worker autotunes the compute thread count at startup (after the
+// model is mapped and layers claimed, before listen): it times the expert FFN on
+// representative owned layers over a {16,24,32,48,physical cores} ladder and picks
+// the knee point (smallest count with < 3% marginal gain). Disable with
+// --no-autotune or GGML_EPD_AUTOTUNE=0.
 
 #include "llama-ep-transport.h"
 
@@ -19,6 +25,7 @@
 #include "ggml-cpu.h"
 #include "gguf.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <cmath>
@@ -26,10 +33,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <fcntl.h>
@@ -476,7 +486,14 @@ static bool ep_moe_ffn(
 }
 
 // ---------------------------------------------------------------------------
-// server
+// startup thread autotune (only when -t was not given explicitly)
+//
+// The expert FFN is memory-bandwidth bound: beyond the saturation point extra
+// threads only add barrier overhead (measured: 32 threads already saturate the
+// slave's ~174 GB/s; going past the physical core count wrecks compute via
+// ggml barrier contention). The optimum shifts with machine / layer count, so
+// probe a small candidate ladder at startup on real owned layers and pick the
+// knee point: the smallest thread count whose next step gains < 3%.
 // ---------------------------------------------------------------------------
 
 struct ep_config {
@@ -486,6 +503,151 @@ struct ep_config {
     int expert_last  = 1 << 30;
     int n_threads    = 8;
 };
+
+// env-gated autotune (GGML_EPD_AUTOTUNE=0 to disable), default on
+static bool ep_autotune_enabled() {
+    static const bool v = []() {
+        const char * e = getenv("GGML_EPD_AUTOTUNE");
+        return !(e && e[0] != '\0' && strcmp(e, "0") == 0);
+    }();
+    return v;
+}
+
+// count unique (physical_package_id, core_id) pairs from sysfs topology so
+// hyper-thread siblings are not counted twice; fall back to online cpu count
+static int ep_physical_cores() {
+    std::set<std::pair<int, int>> cores;
+    for (int cpu = 0; cpu < 4096; ++cpu) {
+        char path[128];
+        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/topology/core_id", cpu);
+        FILE * f = fopen(path, "r");
+        if (!f) {
+            if (cpu > 0) {
+                break; // cpu numbering is contiguous
+            }
+            continue;
+        }
+        int core_id = -1;
+        if (fscanf(f, "%d", &core_id) != 1) {
+            fclose(f);
+            continue;
+        }
+        fclose(f);
+        int pkg_id = 0;
+        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/topology/physical_package_id", cpu);
+        f = fopen(path, "r");
+        if (f) {
+            if (fscanf(f, "%d", &pkg_id) != 1) {
+                pkg_id = 0;
+            }
+            fclose(f);
+        }
+        cores.emplace(pkg_id, core_id);
+    }
+    if (!cores.empty()) {
+        return (int) cores.size();
+    }
+    const long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return n > 0 ? (int) n : 8;
+}
+
+static double ep_median_ms(std::vector<double> & v) {
+    std::sort(v.begin(), v.end());
+    return v[v.size() / 2];
+}
+
+// returns the tuned thread count, or -1 on failure (caller keeps its default)
+static int ep_autotune_threads(ggml_backend_t backend, const ep_model & m, const ep_config & cfg) {
+    const int n_phys = ep_physical_cores();
+
+    // candidate ladder + physical core count, clamped to [1, n_phys]
+    std::set<int> uniq;
+    for (int c : {16, 24, 32, 48, n_phys}) {
+        uniq.insert(std::max(1, std::min(c, n_phys)));
+    }
+    std::vector<int> cands(uniq.begin(), uniq.end());
+    if (cands.size() == 1) {
+        return cands[0];
+    }
+
+    // representative layers: first + middle owned
+    std::vector<const ep_layer *> layers;
+    layers.push_back(&m.layers.begin()->second);
+    {
+        auto mid = m.layers.begin();
+        std::advance(mid, m.layers.size() / 2);
+        if (mid->second.il != layers[0]->il) {
+            layers.push_back(&mid->second);
+        }
+    }
+
+    // router top-k from gguf metadata (decode shape: n_tokens = 1)
+    int n_ids = 6;
+    {
+        const std::string key = m.arch + ".expert_used_count";
+        const int64_t id = gguf_find_key(m.shards[0]->gguf, key.c_str());
+        if (id >= 0) {
+            n_ids = (int) gguf_get_val_u32(m.shards[0]->gguf, id);
+        }
+    }
+
+    const int warmup = 2;
+    const int iters  = 5;
+
+    LOG("llama-epd: autotune: %d physical cores, %zu probe layers, n_ids=%d, candidates:",
+        n_phys, layers.size(), n_ids);
+    for (int c : cands) {
+        LOG(" %d", c);
+    }
+    LOG("\n");
+
+    std::vector<double> med(cands.size());
+    const int64_t t_all = ggml_time_us();
+    for (size_t ci = 0; ci < cands.size(); ++ci) {
+        ggml_backend_cpu_set_n_threads(backend, cands[ci]); // same path as serving
+        std::vector<double> times;
+        for (int it = 0; it < warmup + iters; ++it) {
+            const int64_t t0 = ggml_time_us();
+            for (const ep_layer * L : layers) {
+                // dummy decode-shaped inputs: 1 token, n_ids distinct owned experts
+                const int e_first = cfg.expert_first;
+                const int e_last  = (int) std::min<int64_t>(cfg.expert_last, L->n_expert);
+                const int k = std::max(1, std::min(n_ids, e_last - e_first));
+                std::vector<int32_t> ids((size_t) k);
+                for (int j = 0; j < k; ++j) {
+                    ids[(size_t) j] = e_first + (int) (((int64_t) j * (e_last - e_first)) / k);
+                }
+                std::vector<float> weights((size_t) k, 1.0f / k);
+                std::vector<float> hidden((size_t) L->n_embd, 1e-3f);
+                std::vector<float> out((size_t) L->n_embd);
+                std::string err;
+                if (!ep_moe_ffn(backend, *L, 1, k, ids.data(), weights.data(), hidden.data(), out.data(), err)) {
+                    LOG("llama-epd: autotune: compute failed: %s\n", err.c_str());
+                    return -1;
+                }
+            }
+            if (it >= warmup) {
+                times.push_back((ggml_time_us() - t0) / 1000.0);
+            }
+        }
+        med[ci] = ep_median_ms(times);
+        LOG("llama-epd: autotune: threads=%3d  %.3f ms/iter (%zu layers)\n",
+            cands[ci], med[ci], layers.size());
+    }
+
+    // knee point: smallest thread count whose next candidate gains < 3%
+    size_t best = 0;
+    while (best + 1 < cands.size() && (med[best] - med[best + 1]) / med[best] >= 0.03) {
+        ++best;
+    }
+    LOG("llama-epd: autotune: selected threads=%d (%.3f ms/iter, probed in %.1f s)\n",
+        cands[best], med[best], (ggml_time_us() - t_all) / 1e6);
+    return cands[best];
+}
+
+// ---------------------------------------------------------------------------
+// server
+// ---------------------------------------------------------------------------
 
 static bool ep_send_err(llama_ep_transport * t, int32_t code, const std::string & msg) {
     std::vector<uint8_t> payload(sizeof(int32_t) + msg.size());
@@ -799,7 +961,8 @@ static void ep_usage(const char * argv0) {
         "  --port N               listen port (default 29200)\n"
         "  --layers A-B           owned layer range (default: all)\n"
         "  --experts A-B          owned expert range, half-open [A,B) (default: all)\n"
-        "  -t, --threads N        compute threads (default 8)\n"
+        "  -t, --threads N        compute threads (default: startup autotune; 8 if disabled)\n"
+        "  --no-autotune          disable startup thread autotune (also GGML_EPD_AUTOTUNE=0)\n"
         "  --selftest             local vs loopback numerical check, then exit\n"
         "  --selftest-layer N     layer for selftest (default: first owned MoE layer)\n"
         "  --selftest-tokens N    tokens for selftest (default 4)\n"
@@ -829,6 +992,8 @@ int main(int argc, char ** argv) {
     int selftest_tokens = 4;
     int layer_first = 0, layer_last = 1 << 30;
     bool have_layers = false;
+    bool threads_set = false;
+    bool autotune = ep_autotune_enabled();
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -859,6 +1024,9 @@ int main(int argc, char ** argv) {
             cfg.expert_last = e1 + 1; // CLI is inclusive, config is half-open
         } else if (a == "-t" || a == "--threads") {
             cfg.n_threads = atoi(next(a.c_str()));
+            threads_set = true;
+        } else if (a == "--no-autotune") {
+            autotune = false;
         } else if (a == "--selftest") {
             selftest = true;
         } else if (a == "--selftest-layer") {
@@ -906,6 +1074,14 @@ int main(int argc, char ** argv) {
     if (!backend) {
         LOG("llama-epd: failed to init CPU backend\n");
         return 1;
+    }
+    if (!threads_set && autotune) {
+        const int tuned = ep_autotune_threads(backend, m, cfg);
+        if (tuned > 0) {
+            cfg.n_threads = tuned;
+        }
+    } else if (!threads_set) {
+        LOG("llama-epd: autotune disabled, using %d threads\n", cfg.n_threads);
     }
     ggml_backend_cpu_set_n_threads(backend, cfg.n_threads);
 

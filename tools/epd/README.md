@@ -26,6 +26,19 @@ worker 侧另有：
 | --- | --- | --- |
 | `GGML_EP_PREFAULT` | 关 | 置 1 启动时预触认领层专家权重的全部 mmap 页（多线程），消除冷专家首次命中时页入造成的多 ms compute 尖峰 |
 | `GGML_EP_PREFAULT_THREADS` | 16 | 预触线程数 |
+| `GGML_EPD_AUTOTUNE` | 开 | 置 0 关闭启动线程自动标定（同 `--no-autotune`） |
+
+## 启动线程自动标定（autotune）
+
+**仅当未显式传 `-t` 时生效**（显式 `-t` 行为完全不变）。模型映射 + 层认领 + prefault 之后、
+listen 之前，worker 在认领层中取首层 + 中间层共 2 个代表层，以 decode 形态（n_tokens=1、
+top-k 从 `<arch>.expert_used_count` 读）构造 dummy 输入，对候选线程阶梯
+`{16, 24, 32, 48, 物理核数}`（物理核数按 sysfs topology 去重 (package, core)，不计 HT）
+各跑 2 warmup + 5 轮取中位，选 knee point：**边际收益 < 3% 的最小线程数**（专家 FFN 是带宽
+敏感型，过饱和点后加线程只增 barrier 开销）。标定切换线程走与服务完全相同的
+`ggml_backend_cpu_set_n_threads` 路径，总耗时 <1s。每个候选的 ms/iter 与最终选择均打日志。
+
+实测（slave 2×36 核/144 HT，DSV4 8 层 35-42）：见下文标定实测节。
 
 仅当层为 SILU+gate MoE、无 expert bias/scale、非 warmup 图时走远端；
 不满足时自动回退本地路径。连接懒建立、跨 decode 复用，传输错误自动重连重试一次。
@@ -33,7 +46,7 @@ worker 侧另有：
 ## worker
 
 ```
-llama-epd -m model.gguf --port 29200 --layers 3-42 [--experts 0-255] [-t 72]
+llama-epd -m model.gguf --port 29200 --layers 3-42 [--experts 0-255] [-t N] [--no-autotune]
 llama-epd -m model.gguf --selftest [--selftest-layer N]   # 本地直算 vs 回环 TCP 数值校验
 ```
 
