@@ -31,13 +31,17 @@ echo "[ep-topo] no llama processes on master/slave"
 # --- 构建（幂等）---
 mkdir -p "$ROOT/build-epdev-topo"
 gcc -O2 -Wall -o "$BIN" "$ROOT/tools/epd/ep-topo-probe.c" -lnuma -lpthread
+NVCC="$(command -v nvcc || echo /usr/local/cuda/bin/nvcc)"
+if [ -x "$NVCC" ]; then
+    "$NVCC" -O2 -o "$GPU_BIN" "$ROOT/tools/epd/ep-topo-gpu.cu" -lnuma
+fi
 $SSH 'mkdir -p /home/heiketu/x-llama.cpp/llama-src/build-cpu-topo && \
       gcc -O2 -Wall -o /home/heiketu/x-llama.cpp/llama-src/build-cpu-topo/ep-topo-probe \
           /home/heiketu/x-llama.cpp/llama-src/tools/epd/ep-topo-probe.c -lnuma -lpthread'
 echo "[ep-topo] binaries built (master + slave)"
 
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"; $SSH "pkill -f ep-topo-probe.*tcpecho" 2>/dev/null || true' EXIT
+trap 'rm -rf "$TMP"; $SSH "pkill -f '"'"'build-cpu-topo/ep-topo-probe [t]cpecho'"'"'" 2>/dev/null || true' EXIT
 
 # --- master 本地 ---
 "$BIN" membw 0 512 10 2>/dev/null > "$TMP/m_membw0.json"
@@ -64,16 +68,18 @@ $SSH "$SLAVE_BIN pingpong 0 1 5 2000 2>/dev/null" > "$TMP/s_pp01.json"
 echo "[ep-topo] slave local probes done"
 
 # --- 跨机 TCP ping：4 组合（master node × slave node） ---
+# 注：pkill 与 tcpecho 启动必须分开两条 ssh，否则远端 shell 自己的命令行里含
+# "ep-topo-probe tcpecho" 字样，pkill -f 会把本 shell 一起杀掉（ssh exit 255）。
 for sn in 0 1; do
-    $SSH "pkill -f 'ep-topo-probe.*tcpecho' 2>/dev/null; \
-          nohup $SLAVE_BIN tcpecho $PORT $sn >/dev/null 2>&1 & \
+    $SSH "pkill -f 'build-cpu-topo/ep-topo-probe [t]cpecho' 2>/dev/null" || true
+    $SSH "nohup $SLAVE_BIN tcpecho $PORT $sn >/dev/null 2>&1 & \
           for i in \$(seq 50); do $SLAVE_BIN tcping 127.0.0.1 $PORT -1 >/dev/null 2>&1 && break; sleep 0.1; done"
     for mn in 0 1; do
         "$BIN" tcping 10.0.0.2 $PORT $mn 2>/dev/null > "$TMP/tcp_m${mn}_s${sn}.json"
         echo "[ep-topo] tcping master node$mn -> slave node$sn done"
     done
 done
-$SSH "pkill -f 'ep-topo-probe.*tcpecho' 2>/dev/null" || true
+$SSH "pkill -f 'build-cpu-topo/ep-topo-probe [t]cpecho' 2>/dev/null" || true
 
 # --- 汇总 ---
 python3 - "$TMP" "$OUT" <<'EOF'

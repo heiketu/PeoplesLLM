@@ -62,7 +62,7 @@ int main() {
     const size_t act_sizes[] = { 8192, 32768, 131072, 524288 };
     const char  *act_names[] = { "act8K", "act32K", "act128K", "act512K" };
 
-    printf("{\"kind\":\"gpu\",\"devices\":%d,\"transfer\":[\n", ndev);
+    printf("{\"kind\":\"gpu\",\"devices\":%d,\"transfer\":[", ndev);
     int first = 1;
     for (int d = 0; d < ndev; d++) {
         CK(cudaSetDevice(d));
@@ -80,7 +80,7 @@ int main() {
             float d2h_gbps = BIG / (ms * 1e-3f) / 1e9f;
 
             printf("%s{\"dev\":%d,\"host_node\":%d,\"h2d_gbps\":%.2f,\"d2h_gbps\":%.2f,"
-                   "\"act_us\":[", first ? "" : ",\n", d, n, h2d_gbps, d2h_gbps);
+                   "\"act_us\":[", first ? "" : ",", d, n, h2d_gbps, d2h_gbps);
             first = 0;
             for (int s = 0; s < 4; s++) {
                 bench_copy(dbuf, hbuf, act_sizes[s], cudaMemcpyHostToDevice, 100, &ms);
@@ -96,7 +96,7 @@ int main() {
         }
         CK(cudaFree(dbuf));
     }
-    printf("\n]}\n");
+    printf("]}\n");
 
     // P2P 单独一行 JSON
     if (ndev == 2) {

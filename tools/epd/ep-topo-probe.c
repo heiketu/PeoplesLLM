@@ -317,10 +317,10 @@ static int cmd_tcping(const char *host, int port, int node) {
         }
         double med, p90;
         med_p90(us, samples, &med, &p90);
-        // 有效单向带宽：载荷字节 / (RTT/2)
-        double gbps = len / (med * 1e-6) / 2.0 / 1e9;
+        // 双向吞吐：往返共传输 2×len（发送+回显），串行无流水线
+        double gbps = 2.0 * len / (med * 1e-6) / 1e9;
         printf("%s{\"name\":\"%s\",\"bytes\":%zu,\"samples\":%d,"
-               "\"rtt_us_median\":%.1f,\"rtt_us_p90\":%.1f,\"oneway_gbps\":%.2f}",
+               "\"rtt_us_median\":%.1f,\"rtt_us_p90\":%.1f,\"bidir_gbps\":%.2f}",
                s ? "," : "", names[s], len, samples, med, p90, gbps);
         fprintf(stderr, "  %-8s %7zu B  x%d  rtt median %.1f us  p90 %.1f us\n",
                 names[s], len, samples, med, p90);

@@ -1,0 +1,440 @@
+{
+  "kind": "ep-topo-profile",
+  "version": 1,
+  "timestamp": "2026-07-30T05:28:27.845614+08:00",
+  "nodes": [
+    "gpu0",
+    "gpu1",
+    "mnode0",
+    "mnode1",
+    "snode0",
+    "snode1"
+  ],
+  "master": {
+    "membw": [
+      {
+        "kind": "membw",
+        "node": 0,
+        "threads": 76,
+        "mib": 512,
+        "read_gbps": 249.1,
+        "best_s": 0.0022,
+        "checksum": 0
+      },
+      {
+        "kind": "membw",
+        "node": 1,
+        "threads": 76,
+        "mib": 512,
+        "read_gbps": 254.4,
+        "best_s": 0.0021,
+        "checksum": 0
+      }
+    ],
+    "pingpong": {
+      "0-0": {
+        "kind": "pingpong",
+        "node_a": 0,
+        "node_b": 0,
+        "rounds": 5,
+        "samples": 2000,
+        "rtt_ns_median": 248.2,
+        "rtt_ns_p90": 285.8,
+        "oneway_ns_median": 124.1
+      },
+      "1-1": {
+        "kind": "pingpong",
+        "node_a": 1,
+        "node_b": 1,
+        "rounds": 5,
+        "samples": 2000,
+        "rtt_ns_median": 272.0,
+        "rtt_ns_p90": 279.4,
+        "oneway_ns_median": 136.0
+      },
+      "0-1": {
+        "kind": "pingpong",
+        "node_a": 0,
+        "node_b": 1,
+        "rounds": 5,
+        "samples": 2000,
+        "rtt_ns_median": 541.4,
+        "rtt_ns_p90": 622.8,
+        "oneway_ns_median": 270.7
+      }
+    }
+  },
+  "slave": {
+    "membw": [
+      {
+        "kind": "membw",
+        "node": 0,
+        "threads": 72,
+        "mib": 512,
+        "read_gbps": 131.9,
+        "best_s": 0.0041,
+        "checksum": 0
+      },
+      {
+        "kind": "membw",
+        "node": 1,
+        "threads": 72,
+        "mib": 512,
+        "read_gbps": 113.4,
+        "best_s": 0.0047,
+        "checksum": 0
+      }
+    ],
+    "pingpong": {
+      "0-0": {
+        "kind": "pingpong",
+        "node_a": 0,
+        "node_b": 0,
+        "rounds": 5,
+        "samples": 2000,
+        "rtt_ns_median": 230.6,
+        "rtt_ns_p90": 259.4,
+        "oneway_ns_median": 115.3
+      },
+      "1-1": {
+        "kind": "pingpong",
+        "node_a": 1,
+        "node_b": 1,
+        "rounds": 5,
+        "samples": 2000,
+        "rtt_ns_median": 262.8,
+        "rtt_ns_p90": 310.2,
+        "oneway_ns_median": 131.4
+      },
+      "0-1": {
+        "kind": "pingpong",
+        "node_a": 0,
+        "node_b": 1,
+        "rounds": 5,
+        "samples": 2000,
+        "rtt_ns_median": 524.6,
+        "rtt_ns_p90": 597.0,
+        "oneway_ns_median": 262.3
+      }
+    }
+  },
+  "tcping": {
+    "m0-s0": {
+      "kind": "tcping",
+      "host": "10.0.0.2",
+      "node": 0,
+      "results": [
+        {
+          "name": "ping64B",
+          "bytes": 64,
+          "samples": 1000,
+          "rtt_us_median": 41.5,
+          "rtt_us_p90": 71.5,
+          "bidir_gbps": 0.0
+        },
+        {
+          "name": "act8K",
+          "bytes": 8192,
+          "samples": 1000,
+          "rtt_us_median": 47.3,
+          "rtt_us_p90": 71.1,
+          "bidir_gbps": 0.35
+        },
+        {
+          "name": "act32K",
+          "bytes": 32768,
+          "samples": 1000,
+          "rtt_us_median": 74.5,
+          "rtt_us_p90": 89.3,
+          "bidir_gbps": 0.88
+        },
+        {
+          "name": "act128K",
+          "bytes": 131072,
+          "samples": 200,
+          "rtt_us_median": 137.0,
+          "rtt_us_p90": 181.9,
+          "bidir_gbps": 1.91
+        },
+        {
+          "name": "act512K",
+          "bytes": 524288,
+          "samples": 200,
+          "rtt_us_median": 322.4,
+          "rtt_us_p90": 391.3,
+          "bidir_gbps": 3.25
+        }
+      ]
+    },
+    "m0-s1": {
+      "kind": "tcping",
+      "host": "10.0.0.2",
+      "node": 0,
+      "results": [
+        {
+          "name": "ping64B",
+          "bytes": 64,
+          "samples": 1000,
+          "rtt_us_median": 72.7,
+          "rtt_us_p90": 84.0,
+          "bidir_gbps": 0.0
+        },
+        {
+          "name": "act8K",
+          "bytes": 8192,
+          "samples": 1000,
+          "rtt_us_median": 40.9,
+          "rtt_us_p90": 70.7,
+          "bidir_gbps": 0.4
+        },
+        {
+          "name": "act32K",
+          "bytes": 32768,
+          "samples": 1000,
+          "rtt_us_median": 92.0,
+          "rtt_us_p90": 108.6,
+          "bidir_gbps": 0.71
+        },
+        {
+          "name": "act128K",
+          "bytes": 131072,
+          "samples": 200,
+          "rtt_us_median": 126.2,
+          "rtt_us_p90": 155.8,
+          "bidir_gbps": 2.08
+        },
+        {
+          "name": "act512K",
+          "bytes": 524288,
+          "samples": 200,
+          "rtt_us_median": 294.2,
+          "rtt_us_p90": 355.7,
+          "bidir_gbps": 3.56
+        }
+      ]
+    },
+    "m1-s0": {
+      "kind": "tcping",
+      "host": "10.0.0.2",
+      "node": 1,
+      "results": [
+        {
+          "name": "ping64B",
+          "bytes": 64,
+          "samples": 1000,
+          "rtt_us_median": 131.5,
+          "rtt_us_p90": 142.9,
+          "bidir_gbps": 0.0
+        },
+        {
+          "name": "act8K",
+          "bytes": 8192,
+          "samples": 1000,
+          "rtt_us_median": 50.7,
+          "rtt_us_p90": 66.7,
+          "bidir_gbps": 0.32
+        },
+        {
+          "name": "act32K",
+          "bytes": 32768,
+          "samples": 1000,
+          "rtt_us_median": 69.2,
+          "rtt_us_p90": 131.2,
+          "bidir_gbps": 0.95
+        },
+        {
+          "name": "act128K",
+          "bytes": 131072,
+          "samples": 200,
+          "rtt_us_median": 181.9,
+          "rtt_us_p90": 344.4,
+          "bidir_gbps": 1.44
+        },
+        {
+          "name": "act512K",
+          "bytes": 524288,
+          "samples": 200,
+          "rtt_us_median": 517.8,
+          "rtt_us_p90": 910.0,
+          "bidir_gbps": 2.03
+        }
+      ]
+    },
+    "m1-s1": {
+      "kind": "tcping",
+      "host": "10.0.0.2",
+      "node": 1,
+      "results": [
+        {
+          "name": "ping64B",
+          "bytes": 64,
+          "samples": 1000,
+          "rtt_us_median": 52.9,
+          "rtt_us_p90": 75.8,
+          "bidir_gbps": 0.0
+        },
+        {
+          "name": "act8K",
+          "bytes": 8192,
+          "samples": 1000,
+          "rtt_us_median": 37.6,
+          "rtt_us_p90": 50.1,
+          "bidir_gbps": 0.44
+        },
+        {
+          "name": "act32K",
+          "bytes": 32768,
+          "samples": 1000,
+          "rtt_us_median": 82.8,
+          "rtt_us_p90": 131.7,
+          "bidir_gbps": 0.79
+        },
+        {
+          "name": "act128K",
+          "bytes": 131072,
+          "samples": 200,
+          "rtt_us_median": 147.2,
+          "rtt_us_p90": 179.2,
+          "bidir_gbps": 1.78
+        },
+        {
+          "name": "act512K",
+          "bytes": 524288,
+          "samples": 200,
+          "rtt_us_median": 402.1,
+          "rtt_us_p90": 467.8,
+          "bidir_gbps": 2.61
+        }
+      ]
+    }
+  },
+  "gpu": [
+    {
+      "kind": "gpu",
+      "devices": 2,
+      "transfer": [
+        {
+          "dev": 0,
+          "host_node": 0,
+          "h2d_gbps": 24.23,
+          "d2h_gbps": 23.95,
+          "act_us": [
+            {
+              "name": "act8K",
+              "h2d_us": 3.3,
+              "d2h_us": 2.7
+            },
+            {
+              "name": "act32K",
+              "h2d_us": 4.1,
+              "d2h_us": 3.6
+            },
+            {
+              "name": "act128K",
+              "h2d_us": 8.0,
+              "d2h_us": 7.4
+            },
+            {
+              "name": "act512K",
+              "h2d_us": 23.5,
+              "d2h_us": 22.3
+            }
+          ]
+        },
+        {
+          "dev": 0,
+          "host_node": 1,
+          "h2d_gbps": 25.19,
+          "d2h_gbps": 26.3,
+          "act_us": [
+            {
+              "name": "act8K",
+              "h2d_us": 3.2,
+              "d2h_us": 2.7
+            },
+            {
+              "name": "act32K",
+              "h2d_us": 4.2,
+              "d2h_us": 3.5
+            },
+            {
+              "name": "act128K",
+              "h2d_us": 7.9,
+              "d2h_us": 7.2
+            },
+            {
+              "name": "act512K",
+              "h2d_us": 23.5,
+              "d2h_us": 22.2
+            }
+          ]
+        },
+        {
+          "dev": 1,
+          "host_node": 0,
+          "h2d_gbps": 22.96,
+          "d2h_gbps": 23.29,
+          "act_us": [
+            {
+              "name": "act8K",
+              "h2d_us": 3.5,
+              "d2h_us": 2.8
+            },
+            {
+              "name": "act32K",
+              "h2d_us": 4.4,
+              "d2h_us": 3.8
+            },
+            {
+              "name": "act128K",
+              "h2d_us": 8.3,
+              "d2h_us": 7.6
+            },
+            {
+              "name": "act512K",
+              "h2d_us": 23.8,
+              "d2h_us": 22.5
+            }
+          ]
+        },
+        {
+          "dev": 1,
+          "host_node": 1,
+          "h2d_gbps": 19.56,
+          "d2h_gbps": 19.58,
+          "act_us": [
+            {
+              "name": "act8K",
+              "h2d_us": 3.6,
+              "d2h_us": 2.8
+            },
+            {
+              "name": "act32K",
+              "h2d_us": 4.4,
+              "d2h_us": 3.7
+            },
+            {
+              "name": "act128K",
+              "h2d_us": 8.1,
+              "d2h_us": 7.4
+            },
+            {
+              "name": "act512K",
+              "h2d_us": 23.6,
+              "d2h_us": 22.3
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "kind": "gpu-p2p",
+      "can_0_to_1": 1,
+      "can_1_to_0": 1,
+      "bw_0to1_gbps": 52.85,
+      "bw_1to0_gbps": 52.86,
+      "lat8k_0to1_us": 4.4,
+      "lat8k_1to0_us": 5.2
+    }
+  ]
+}
