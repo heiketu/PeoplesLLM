@@ -18,6 +18,7 @@
 | `GGML_REMOTE_EP_PORT` | 29200 | worker 端口 |
 | `GGML_REMOTE_EP_LAYERS` | 全部 | 远端层范围 `A-B`；范围外的层走本地 |
 | `GGML_REMOTE_EP_DEBUG` | 关 | 置 1 每次 RPC 打印 send/wait 耗时（master）；worker 端置 1 每 REQ 打印 compute 耗时 |
+| `GGML_REMOTE_EP_RDMA` | 关 | 置 1 传输层改用 RDMA（RoCEv2，rdma_cm 自动建连）。需编译时检测到 libibverbs+librdmacm（CMake 打印 `EP RDMA transport (RoCEv2): ON`）；无卡/建连失败时打 warning 并自动回退 TCP。master 与 worker 需同时置 1（协议不同，不互通） |
 
 worker 侧另有：
 
@@ -119,6 +120,42 @@ worker 线程标定（slave：2 socket × 36 核 × 2 HT = 144 线程，prefault
 
 超过物理核数后 ggml 线程 barrier 严重劣化（且非单调，128 比 136 更糟），"留 8-16 核给系统"
 在此 workload 下适得其反。**推荐 worker -t 72（=物理核数，不跨 HT），不要降线程也不要超线程**。
+
+## RDMA（RoCEv2）传输后端实测（2026-07-30，slave 35-42，worker -t 72 + prefault=1）
+
+实现：`tools/epd/llama-ep-rdma.cpp`，rdma_cm 建连（自动 GID 解析），RC QP + Send/Receive，
+每连接预注册 4×256KB 发送环 + 8×256KB 接收环；framing 层依赖字节流语义，后端内部把消息
+切成 `[u32 len + payload]` 块并在接收端拼回字节流；等待走 ibv comp channel 阻塞（不 spin）。
+`GGML_REMOTE_EP_RDMA=1`（默认关）同时置在 master 与 worker；CMake 检测不到
+libibverbs/librdmacm 时不编译该后端，env 开了但无卡/建连失败打 warning 自动回退 TCP，
+纯 TCP 环境行为零变化。`GGML_EP_RDMA_SPIN=1` 为调试开关（busy-poll CQ）。
+
+微基准（`llama-ep-transport-bench`，master↔slave 跨机，echo 往返，同会话 tcp1→rdma1→rdma2→tcp2）：
+
+| payload | TCP RTT med（两轮） | RDMA RTT med（两轮） | TCP p99 | RDMA p99 | TCP CPU/op | RDMA CPU/op |
+| --- | --- | --- | --- | --- | --- | --- |
+| 64B | 74.0 / 41.2 µs | **12.6 / 10.4 µs** | ~145 µs | ~30-35 µs | 5.9-7.1 µs | 4.1-5.2 µs |
+| 4KB | 40.3 / 74.6 µs | **19.8 / 17.7 µs** | ~140 µs | ~40 µs | 6.9-8.1 µs | 6.0-7.1 µs |
+| 64KB | 98.5 / 108.9 µs | **39.9 / 42.4 µs** | ~157-178 µs | ~70-86 µs | ~24 µs | ~11-12 µs |
+| 1MB | 514 / 531 µs | **255 / 256 µs** | 752-878 µs | 300-358 µs | ~270 µs | ~145 µs |
+
+RTT 全面 2-4× 优势，尾延迟（p99）压到 TCP 的 ~1/4，大消息 CPU 减半；两轮同序/反序结论一致。
+
+双机 DSV4 8 层生产配置 A/B（同会话 tcp1→rdma1→rdma2→tcp2，每轮 slave 冷缓存重启 worker）：
+
+| 轮次 | TG96 | TG512 | send 中位/call | wait 中位/call | wait>2ms 尖峰 | wait max |
+| --- | --- | --- | --- | --- | --- | --- |
+| tcp1 | 24.74 t/s | 24.10 t/s | 0.023 ms | 0.971 ms | 1.10% | 9.4 ms |
+| rdma1 | **25.22 t/s** | **24.41 t/s** | 0.014 ms | 0.908 ms | 0.88% | 5.7 ms |
+| rdma2 | **25.12 t/s** | **24.49 t/s** | 0.014 ms | 0.896 ms | 0.98% | 5.9 ms |
+| tcp2 | 24.73 t/s | 24.28 t/s | 0.023 ms | 0.971 ms | 0.91% | 6.8 ms |
+
+结论：RDMA 每 call send 时间 0.023→0.014 ms，8 层 wait 中位 0.971→0.90 ms（≈省 9µs/层/方向，
+与微基准 64B-4KB RTT 差一致）；TG96 +~0.45 t/s（+2%）、TG512 +~0.25 t/s（+1%），两种顺序
+各自一致（无顺序效应）；尖峰率相当（prefault 已把页入尖峰压掉，传输层再降空间有限），
+wait 上限 9.4→5.7ms。每 call 仅 5808 次/token 级采样，收益符合"网络非带宽瓶颈"预期：
+RTT 砍 3/4 换来 TG 均值 +1-2%，主要价值在尾延迟与 CPU 余量。正确性：四轮 gen1/gen2
+（temp 0 / seed 42，英文 48 tok + 中文 64 tok）TCP↔RDMA 两两逐字 MATCH。
 
 ## GLM-5.2 双机实测（commit cbcccef7e，glm-dsa，79层/160专家/top-8，UD-Q2_K_MXFP4 7 分卷 ≈236G）
 
