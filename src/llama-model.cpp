@@ -38,6 +38,14 @@
 #include <thread>
 #include <vector>
 
+#if defined(__gnu_linux__)
+#include <cerrno>
+#include <sys/mman.h>
+#ifndef MADV_COLLAPSE
+#define MADV_COLLAPSE 25 // linux >= 6.1
+#endif
+#endif
+
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
     switch (arch) {
         case LLM_ARCH_LLAMA:
@@ -1253,6 +1261,27 @@ static void llama_numa_mirror_memcpy(void * dst, const void * src, size_t size) 
     for (auto & w : workers) {
         w.join();
     }
+
+#if defined(__gnu_linux__)
+    // env GGML_NUMA_THP=collapse: synchronously collapse the just-populated mirror into
+    // 2 MiB pages (MADV_COLLAPSE, best-effort). The VMA already carries MADV_HUGEPAGE from
+    // ggml_numa_alloc, but under memory fragmentation fault-time THP allocation mostly falls
+    // back to 4 KiB pages; collapse triggers direct compaction instead. One-time cost at
+    // model load; ignored on kernels < 6.1 or when the range cannot collapse.
+    static const bool thp_collapse = []() {
+        const char * e = getenv("GGML_NUMA_THP");
+        return e && strcmp(e, "collapse") == 0;
+    }();
+    if (thp_collapse) {
+        const int64_t t0 = ggml_time_us();
+        if (madvise(dst, size, MADV_COLLAPSE) == 0) {
+            LLAMA_LOG_INFO("%s: MADV_COLLAPSE %.2f GiB in %.1f s\n", __func__,
+                    size / 1073741824.0, (ggml_time_us() - t0) / 1.0e6);
+        } else {
+            LLAMA_LOG_WARN("%s: MADV_COLLAPSE failed (errno=%d); continuing with 4K pages\n", __func__, errno);
+        }
+    }
+#endif
 }
 
 void llama_model::numa_mirror_weights_partial() {
