@@ -40,7 +40,7 @@ Single thread, nc=2048 k=4096, measured on Ice Lake 8360Y (reproduce: `tests/tes
 
 - **NUMA mirror**: duplicate non-expert weights + KV per socket, pin threads per node — zero UPI traffic
 - **NUMA-EP**: single-copy expert placement across sockets (mbind policy-level), local-first `mul_mat_id` — halves expert memory, makes 745B-class models fit
-- **AVX512/VNNI 8×8 repack kernels**: full coverage of Q2_K–Q6_K, Q8_0, MXFP4, IQ1_S/IQ1_M — 2.4–4× on PP batches (gemm nr≥16)
+- **AVX512/VNNI 8×8 repack kernels**: full coverage of Q2_K–Q6_K, Q8_0, MXFP4, IQ1_S/IQ1_M — 2.4–4× on PP batches (gemm nr≥16); the Q3_K/Q5_K/Q6_K/Q8_0 x86 kernels and the entire IQ1_S/IQ1_M stack (block layout + repack + kernels) are new in this fork
 - **Fused ops**: DeepSeek-V4 hyper-connection CUDA kernel, fused MoE router, RMS_NORM absorption, GLM-DSA Lightning Indexer
 - **MTP speculative decoding** (DeepSeek-V4)
 - **Cross-machine EP (WIP)**: activation dispatch (KB-scale traffic) instead of weight transfer, InfiniBand EDR interconnect, scalable CPU MoE nodes — targeting 2.8T-class models

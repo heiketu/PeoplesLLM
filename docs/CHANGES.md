@@ -28,7 +28,7 @@
 
 ### 1. 8×8 interleave repack 内核（`ggml/src/ggml-cpu/arch/x86/repack.cpp` 等）
 - 运行时将量化权重重排为 8×8 interleave 布局，配 AVX512F/BW/VNNI（`_mm512_dpbusd_epi32`）gemv/gemm 内核
-- **支持格式**：Q2_K、Q3_K、Q4_K、Q5_K、Q6_K、Q8_0、Q4_0、MXFP4、IQ1_S、IQ1_M（最后三者为本次新增；Q5_K 内核 + Q2_K/Q5_K `gemm_min_nrows=4` 小批路由为本次新增）
+- **支持格式**：Q2_K、Q3_K、Q4_K、Q5_K、Q6_K、Q8_0、Q4_0、MXFP4、IQ1_S、IQ1_M。其中 x86 AVX512 原生内核 **Q3_K、Q5_K、Q6_K、Q8_0 为本分支新增**（主线仅 NEON/generic），**IQ1_S/IQ1_M 为全套新增**（新块布局 + repack + generic + x86 内核，主线完全没有）；Q2_K、Q4_0、Q4_K、IQ4_NL、MXFP4 内核为主线已有。`gemm_min_nrows=4` 小批路由（Q2_K/Q3_K/Q5_K/IQ1_S/IQ1_M）为本分支新增
 - 效果：gemm（PP 批量）**1.1~4×**（格式相关，单线程微基准全格式详表见 [README](../README.md)）；gemv（TG 单 token）受内存带宽封顶 ≈1×（物理上限，非内核问题）
 - 路由：Q2_K/Q3_K/Q5_K/IQ1_S/IQ1_M 的 4 行尾块全程向量化，`gemm_min_nrows=4`；其余格式 min_nrows=16（Q4_K/Q6_K 尾块为标量实现，小批刻意走 gemv）
 - generic 回退路径全格式可用（非 AVX512 机器）

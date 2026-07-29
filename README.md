@@ -40,7 +40,7 @@ GLM-5.2 745B（UD-Q2_K 量化）：生成 12.0 t/s（EP + GPU 专家卸载）。
 
 - **NUMA 镜像**：非专家权重 + KV 双节点复制，线程绑核，UPI 流量归零
 - **NUMA-EP**：专家单副本按插槽放置（mbind 策略级），mul_mat_id 本地优先计算 —— 内存减半，超大模型可装载
-- **AVX512/VNNI 8×8 重排内核**：Q2_K~Q6_K、Q8_0、MXFP4、IQ1_S/IQ1_M 全格式覆盖，PP 批量（gemm nr≥16）加速 2.4~4×
+- **AVX512/VNNI 8×8 重排内核**：Q2_K~Q6_K、Q8_0、MXFP4、IQ1_S/IQ1_M 全格式覆盖，PP 批量（gemm nr≥16）加速 2.4~4×；其中 Q3_K/Q5_K/Q6_K/Q8_0 x86 内核与 IQ1_S/IQ1_M 全套（块布局+repack+内核）为本分支新增
 - **融合算子**：dsv4 超连接 CUDA 内核、融合 MoE 路由器、RMS_NORM 吸收、GLM-DSA 闪电索引器
 - **MTP 投机解码**（dsv4）
 - **跨机 EP（开发中）**：激活派发（KB 级流量）而非权重传输，InfiniBand EDR 互联可扩展 CPU MoE 节点，目标 2.8T 级模型
