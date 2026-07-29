@@ -39,5 +39,21 @@ MoE 层）；对比生成 token 序列。master 参数为生产镜像基线
 一致，仅速度行不同（本地 31.3 t/s vs 远端 14.0 t/s）。`llama-epd --selftest` 在双机
 各自 PASS 且 |out| 完全一致（32.224439）。
 
-已知限制：master 仍加载全部权重（远端只 offload 计算，尚未 offload 显存/内存占用）；
-单一 worker 端点；阻塞式收发（无流水线）。
+## 权重真分片（commit c2943a784）
+
+`GGML_REMOTE_EP_LAYERS` 范围内层的 `ffn_(up|gate|down)_exps.weight` 在 master 上
+用 TENSOR_SKIP 创建：不分配、不读入、不参与 NUMA 放置（目前仅 deepseek4 arch 实现，
+其他 arch 需要同样的三行改动）。这些层在图里走远端路径是强制的；warmup 图走零输出捷径。
+
+双机 DSV4 实测（master 层 0-21 本地 + server2 层 22-42 ≈ 41G 权重）：
+
+| 配置 | master RSS | master GPU | slave RSS | TG | PP(5 tok) |
+| --- | --- | --- | --- | --- | --- |
+| 单机 mirror 基线 | 59.3G | 17.5+17.0G | — | 29.3 t/s | 39.8 t/s |
+| 双机 EP（22-42 远端） | 17.7G | 17.0+16.9G | 27.2G（上限 ~41G） | 20.9 t/s | 25.9 t/s |
+
+正确性：同 prompt（temp 0 / seed 42）双机与单机输出逐 token 一致（英文 48 tok +
+中文 64 tok，/completion 原始完成模式）。
+
+已知限制：单一 worker 端点；阻塞式收发（无流水线）；GLM-5.2（glm-dsa，7 分卷）还需要
+epd 多分卷支持 + glm-dsa.cpp 的 loader 跳过三行改动。
