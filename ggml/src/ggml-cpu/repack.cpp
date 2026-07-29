@@ -4442,7 +4442,9 @@ template <> void gemm<block_q2_K, 1, 16, GGML_TYPE_Q8_K>(int n, float * s, size_
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PARAM_TYPE>
 struct gemm_min_nrows { static constexpr int64_t value = 16; };
 
+template <> struct gemm_min_nrows<block_q2_K, 8, 8, GGML_TYPE_Q8_K> { static constexpr int64_t value = 4; };
 template <> struct gemm_min_nrows<block_q3_K, 8, 8, GGML_TYPE_Q8_K> { static constexpr int64_t value = 4; };
+template <> struct gemm_min_nrows<block_q5_K, 8, 8, GGML_TYPE_Q8_K> { static constexpr int64_t value = 4; };
 
 class tensor_traits_base : public ggml::cpu::tensor_traits {
   public:
@@ -5159,6 +5161,11 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
             }
         }
     } else if (cur->type == GGML_TYPE_Q5_K) {
+        if (ggml_cpu_has_avx512()) {
+            if (cur->ne[1] % 8 == 0) {
+                return &q5_K_8x8_q8_K;
+            }
+        }
         if (ggml_cpu_has_neon() && ggml_cpu_has_matmul_int8()) {
             if (cur->ne[1] % 8 == 0) {
                 return &q5_K_8x8_q8_K;

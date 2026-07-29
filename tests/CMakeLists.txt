@@ -332,3 +332,14 @@ if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
+
+# standalone numerical tests + microbenchmarks for the 8x8 repack matmul kernels
+# (Q2_K / Q5_K x Q8_K); needs the internal ggml-cpu repack headers and symbols
+if (NOT LLAMA_USE_SYSTEM_GGML AND TARGET ggml-cpu)
+    add_executable(test-repack-kernels test-repack-kernels.cpp)
+    target_link_libraries(test-repack-kernels PRIVATE ggml-cpu ggml)
+    target_include_directories(test-repack-kernels PRIVATE
+        ${PROJECT_SOURCE_DIR}/ggml/src
+        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cpu)
+    add_test(NAME test-repack-kernels COMMAND $<TARGET_FILE:test-repack-kernels>)
+endif()

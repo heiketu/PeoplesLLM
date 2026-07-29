@@ -8967,9 +8967,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
 
     // large GEMV cases for mmvq bandwidth tuning (TG shapes: n = 1..8 tokens)
-    for (ggml_type type_a : {GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0}) {
+    for (ggml_type type_a : {GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0}) {
         for (int n : {1, 2, 4, 8}) {
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4096, n, 4096, {1, 1}, {1, 1}));
+        }
+    }
+    // repack gemm row-tile shapes for the 8x8 kernels (16-row main block, 4-row tail
+    // block, >16 mixed); m is a multiple of 8 columns so the 8x8 interleave applies
+    for (ggml_type type_a : {GGML_TYPE_Q2_K, GGML_TYPE_Q5_K}) {
+        for (int n : {4, 8, 16, 20, 32}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 512, n, 4096, {1, 1}, {1, 1}));
         }
     }
     // DSV4 per-layer attention/shared shapes (q3_K): q_a, q_b, kv, out_a, out_b, shexp
