@@ -56,7 +56,21 @@ MoE 层）；对比生成 token 序列。master 参数为生产镜像基线
 正确性：同 prompt（temp 0 / seed 42）双机与单机输出逐 token 一致（英文 48 tok +
 中文 64 tok，/completion 原始完成模式）。
 
-已知限制：单一 worker 端点；阻塞式收发（无流水线）。
+双机 DSV4 重分层实测（commit d8f7dacf3，slave 31-42 共 12 层，GGML_REMOTE_EP_DEBUG 分段计时）：
+
+| 配置 | master RSS | slave RSS | TG96 | TG512 | PP(5 tok) |
+| --- | --- | --- | --- | --- | --- |
+| 单机 mirror 基线 | 62.3G | — | 25.75 t/s | 24.88 t/s | 34.4 t/s |
+| 双机 EP（31-42 远端） | 37.4G | 14.7G（上限 ~24G） | 22.17 t/s | 21.92 t/s | 30.4 t/s |
+
+一致性：gen1/gen2 与基线逐字 IDENTICAL。每 token 分阶段（decode，server 45.6ms vs 基线 40.2ms）：
+远端 12 层 RPC 10.6ms（send 0.29 + wait 10.30；其中 slave compute 8.74、网络+传输 ~1.6），
+本地 CPU MoE 14 层 ~5.5ms，barrier 2.6ms，GPU 段 ~26.5ms（基线对应：CPU MoE 26 层 9.6ms、
+barrier 4.7ms、GPU 段 ~25.8ms）。实测每层耗时：master 本地 ~0.37ms/层，slave ~0.73ms/层
+（341 vs 174 GB/s 带宽比的真实体现，旧 0.376ms 估计作废）→ 均衡点 N≈8（35-42），
+可再省 ~3.6ms/token 追平平单机；GPU 段 ~26ms（~60%）才是两端共同的最大阶段。
+
+已知限制：单一 worker 端点；阻塞式收发（无流水线，726 token 中 452 次 RPC 尖峰 >2ms）。
 
 ## GLM-5.2 双机实测（commit cbcccef7e，glm-dsa，79层/160专家/top-8，UD-Q2_K_MXFP4 7 分卷 ≈236G）
 
@@ -88,12 +102,13 @@ decode 时每层每 token 专家字节 `E = top_k × 3 × n_embd × n_ff × bpw/
 
 实测 NUMA 本地 read 带宽（membw，干净环境）：master node0 167.5 / node1 173.9
 （合计 ~341 GB/s）；slave node0 93.8 / node1 80.2（合计 ~174 GB/s，
-node1 因 2DPC 内存慢 14%，硬件现状）。对应每层耗时：master CPU 0.31ms/层，
-slave 0.376ms/层 → slave 总算力占比 ~34%。
+node1 因 2DPC 内存慢 14%，硬件现状）→ 带宽比 ~1.96:1。GGML_REMOTE_EP_DEBUG 实测
+每层 decode 耗时：master 本地 ~0.37ms/层，slave ~0.73ms/层（旧 0.31/0.376 估计作废）。
 
 - DSV4（40 MoE 层，GPU 固定卸载 14 层 8-21，CPU 可分配 26 层 3-7+22-42）：
-  0.31×(26-N) = 0.376×N → N ≈ 12 → **slave 31-42（12 层）+ master CPU 14 层
-  （3-7、22-30）+ GPU 14 层**。旧版 21 层（22-42）分配 slave 是瓶颈（7.9ms vs 2.5ms）。
+  0.37×(26-N) = 0.73×N → N ≈ 9；计入每层 ~0.13ms 网络开销后 **N ≈ 8（slave 35-42）
+  为实测均衡点**。当前生产配置 slave 31-42（12 层）是 slave-bound（10.3ms vs master
+  CPU 5.5ms），但 master RSS 省得更多（37.4G vs 基线 62.3G）。
 - GLM-5.2（master CPU 53 层 + GPU 8 层，slave 15 层）：瓶颈在 master CPU；
   受 slave 内存限制建议 slave 30-35 层。
 
