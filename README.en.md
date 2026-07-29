@@ -2,7 +2,7 @@
 
 > **[中文版 README →](README.md)**
 
-**Run giant MoE models locally on cheap hardware.** A specialized llama.cpp fork focused on 200GB – 3TB-class MoE inference on dual-socket CPUs + consumer GPUs.
+**Run giant MoE models locally on cheap hardware.** A specialized llama.cpp fork focused on 200B – 3T-class MoE inference on dual-socket or more CPUs + consumer GPUs.
 
 ## Benchmarks
 
