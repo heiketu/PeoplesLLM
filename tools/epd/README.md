@@ -38,7 +38,7 @@ top-k 从 `<arch>.expert_used_count` 读）构造 dummy 输入，对候选线程
 敏感型，过饱和点后加线程只增 barrier 开销）。标定切换线程走与服务完全相同的
 `ggml_backend_cpu_set_n_threads` 路径，总耗时 <1s。每个候选的 ms/iter 与最终选择均打日志。
 
-实测（slave 2×36 核/144 HT，DSV4 8 层 35-42）：见下文标定实测节。
+实测（slave 2×36 核/144 HT，DSV4 8 层 35-42）：见下文"启动线程自动标定实测"。
 
 仅当层为 SILU+gate MoE、无 expert bias/scale、非 warmup 图时走远端；
 不满足时自动回退本地路径。连接懒建立、跨 decode 复用，传输错误自动重连重试一次。
@@ -133,6 +133,30 @@ worker 线程标定（slave：2 socket × 36 核 × 2 HT = 144 线程，prefault
 
 超过物理核数后 ggml 线程 barrier 严重劣化（且非单调，128 比 136 更糟），"留 8-16 核给系统"
 在此 workload 下适得其反。**推荐 worker -t 72（=物理核数，不跨 HT），不要降线程也不要超线程**。
+
+## 启动线程自动标定实测（2026-07-30，slave 2×36核/144HT，DSV4 8层 35-42，prefault=1）
+
+worker 不带 `-t` 启动，autotune 在 listen 前阶梯实测（首层+中间层共 2 个代表层，decode 形态
+n_tokens=1/top-6，2 warmup + 5 轮中位，总耗时 <0.1s）：
+
+| 候选线程 | 16 | 24 | 32 | 48 | 72 |
+| --- | --- | --- | --- | --- | --- |
+| ms/iter（2 层合计） | 0.975 | 0.623 | 0.530 | 0.432 | 0.412 |
+
+每步边际收益均 ≥3%（48→72 为 4.6%），knee 落在 72 = 物理核数，自动选中 72，落在预期
+[32, 72] 合理区间。（绝对值低于历史 0.73ms/层：dummy 输入固定 6 个热专家、页全热且不含 RPC
+开销，只有跨线程相对比较意义。）
+
+标定后服务验证（同二进制 slave 单机，固定种子 REQ：层 35，n_tokens=1，top-6）：
+
+| 启动方式 | 输出校验 | 每 REQ compute 中位 |
+| --- | --- | --- |
+| 不带 -t（autotune→72） | sum=-0.15102280 norm=14.59143706 | 0.283ms（n=200） |
+| 显式 -t 72 | 同上，逐 bit 一致 | 0.340ms（n=200，轮次噪声） |
+| 显式 -t 48（覆盖生效，日志直接 48 线程不标定） | 同上，逐 bit 一致 | 0.381ms（n=50） |
+
+`--no-autotune` 与 `GGML_EPD_AUTOTUNE=0` 均打 `autotune disabled, using 8 threads` 并以 8 线程
+listen；`--selftest` PASS（max_abs_diff=0）。双机 master 对拍待补（本机被 GLM-5.2 服务占用）。
 
 ## RDMA（RoCEv2）传输后端实测（2026-07-30，slave 35-42，worker -t 72 + prefault=1）
 
