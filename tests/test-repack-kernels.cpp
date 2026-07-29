@@ -1,5 +1,5 @@
 // Numerical correctness tests and microbenchmarks for the 8x8 repack matmul
-// kernels (Q2_K / Q5_K weights, Q8_K activations).
+// kernels (Q2_K / Q3_K / Q5_K / IQ1_S / IQ1_M weights, Q8_K activations).
 //
 // Three comparisons per weight type:
 //   (a) native x86 kernel vs generic scalar kernel on identical repacked data
@@ -60,8 +60,15 @@ bool make_repacked(ggml_type type, const std::vector<float> & w, int nc, int k, 
 
     const size_t row_bytes = ggml_row_size(type, k);
     out.raw.resize(row_bytes * nc);
-    for (int r = 0; r < nc; r++) {
-        traits->from_float_ref(w.data() + (size_t) r * k, out.raw.data() + row_bytes * r, k);
+    if (traits->from_float_ref) {
+        for (int r = 0; r < nc; r++) {
+            traits->from_float_ref(w.data() + (size_t) r * k, out.raw.data() + row_bytes * r, k);
+        }
+    } else {
+        // types without a from_float_ref row quantizer (IQ1_S/IQ1_M): go through
+        // ggml_quantize_chunk with a flat importance matrix
+        const std::vector<float> imatrix((size_t) k, 1.0f);
+        ggml_quantize_chunk(type, w.data(), out.raw.data(), 0, nc, k, imatrix.data());
     }
 
     struct ggml_init_params params = { 1 * 1024 * 1024, nullptr, true };
@@ -262,6 +269,10 @@ int main(int argc, char ** argv) {
           ggml_gemm_q3_K_8x8_q8_K, ggml_gemm_q3_K_8x8_q8_K_generic },
         { GGML_TYPE_Q5_K, "Q5_K", ggml_vec_dot_q5_K_q8_K, ggml_gemv_q5_K_8x8_q8_K, ggml_gemv_q5_K_8x8_q8_K_generic,
           ggml_gemm_q5_K_8x8_q8_K, ggml_gemm_q5_K_8x8_q8_K_generic },
+        { GGML_TYPE_IQ1_S, "IQ1_S", ggml_vec_dot_iq1_s_q8_K, ggml_gemv_iq1_s_8x8_q8_K, ggml_gemv_iq1_s_8x8_q8_K_generic,
+          ggml_gemm_iq1_s_8x8_q8_K, ggml_gemm_iq1_s_8x8_q8_K_generic },
+        { GGML_TYPE_IQ1_M, "IQ1_M", ggml_vec_dot_iq1_m_q8_K, ggml_gemv_iq1_m_8x8_q8_K, ggml_gemv_iq1_m_8x8_q8_K_generic,
+          ggml_gemm_iq1_m_8x8_q8_K, ggml_gemm_iq1_m_8x8_q8_K_generic },
     };
 
     if (perf) {
