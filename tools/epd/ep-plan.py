@@ -41,6 +41,14 @@ T_NET    = 0.13   # ms/层，网络（EDR 100Gb，激活 8KB 量级 RTT + 结果
 BW_MASTER = [167.5, 173.9]   # master node0 / node1 GB/s
 BW_SLAVE  = [93.8, 80.2]     # slave node0（快）/ node1（2DPC 慢 14%）
 
+# ---- 线程模型（2026-07-30 实测标定） ----
+# TG 是内存带宽敏感型：最优线程数 ≈ min(物理核数, 带宽饱和所需线程数)，
+# 超物理核（用满 HT）ggml barrier 严重劣化且非单调（slave -t128/136 TG512 崩到 4-7 t/s）。
+# PP 是计算密集型：可以物理核−少量保留核跑满。
+SLAVE_PHYSICAL_CORES = 72    # slave 物理核（=2×36，HT 共 144）
+PER_CORE_BW = 2.5            # GB/s/核，标定使 slave 推荐 ≈ 实测最优 72
+SLAVE_PP_RESERVE = 4         # PP 保留给系统/后台的核数
+
 # ---- 校准锚点（TG512 t/s → ms/token；Ls=远端层数，Lm=26-Ls） ----
 # 来源：tools/epd/README.md，同会话 A/B 反序复测
 ANCHORS = [
@@ -107,8 +115,12 @@ def main():
     ap.add_argument("--max-remote", type=int, default=16, help="扫描的最大远端层数")
     ap.add_argument("--bw-master", type=float, nargs=2, default=BW_MASTER)
     ap.add_argument("--bw-slave", type=float, nargs=2, default=BW_SLAVE)
-    ap.add_argument("--slave-cores", type=int, default=144, help="slave 总线程数")
-    ap.add_argument("--slave-reserve", type=int, default=12, help="slave 预留系统核（建议 8-16）")
+    ap.add_argument("--slave-physical-cores", type=int, default=SLAVE_PHYSICAL_CORES,
+                    help="slave 物理核数（不是 HT 线程数）")
+    ap.add_argument("--slave-pp-reserve", type=int, default=SLAVE_PP_RESERVE,
+                    help="PP 预留系统核（PP=计算密集，可跑满物理核−保留核）")
+    ap.add_argument("--per-core-bw", type=float, default=PER_CORE_BW,
+                    help="单核内存带宽 GB/s（TG 带宽饱和估算）")
     ap.add_argument("--calibrate", action="store_true", help="只做校准验证并报告误差")
     ap.add_argument("--json", action="store_true", help="输出机器可读 JSON 方案")
     args = ap.parse_args()
@@ -154,7 +166,9 @@ def main():
 
     m0, m1 = split_by_bw(lm, args.bw_master)
     s0, s1 = split_by_bw(ls, args.bw_slave)
-    slave_threads = args.slave_cores - args.slave_reserve
+    bw_sat = math.ceil(sum(args.bw_slave) / args.per_core_bw)  # 带宽饱和所需线程
+    slave_threads = min(args.slave_physical_cores, bw_sat)     # TG：物理核与带宽饱和取小
+    slave_pp = args.slave_physical_cores - args.slave_pp_reserve  # PP：物理核−保留核
     st0 = round(slave_threads * s0 / ls) if ls else 0
     st1 = slave_threads - st0 if ls else 0
 
@@ -192,8 +206,9 @@ def main():
               f" ~{ls * model['layer_weight_gb']:.0f}G")
     else:
         print("  slave 远端: 无（单机最优）")
-    print(f"  worker 线程: slave -t {slave_threads}（{args.slave_cores} 核预留"
-          f" {args.slave_reserve} 核给系统/OS 抖动）")
+    print(f"  worker 线程: TG -t {slave_threads}（min(物理核 {args.slave_physical_cores},"
+          f" 带宽饱和 {bw_sat})，实测最优 72，超物理核崩溃切勿用 HT 数）")
+    print(f"               PP --threads-batch {slave_pp}（物理核−保留 {args.slave_pp_reserve}）")
     print(f"  预期: {ms:.2f} ms/token → TG ≈ {tg:.2f} t/s")
     base_ms = rows[0][2]
     print(f"  对比单机基线: {base_ms:.2f} ms ({1000/base_ms:.2f} t/s)，"
@@ -210,6 +225,7 @@ def main():
                    slave=dict(layers=ls,
                               range=[remote_layers[0], remote_layers[-1]] if ls else None,
                               snode0=s0, snode1=s1, threads=slave_threads,
+                              pp_threads=slave_pp,
                               snode0_threads=st0, snode1_threads=st1),
                    predicted_ms=round(ms, 2), predicted_tg=round(tg, 2),
                    params=dict(t_m=t_m, t_s=t_s, t_net=t_net, beta=beta, c=c))
