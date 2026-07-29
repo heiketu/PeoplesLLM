@@ -22,6 +22,8 @@ DeepSeek-V4 284B（Q3_K 量化），双路 Xeon 8360Y（Ice Lake）+ 2× RTX 309
 | **PeoplesLLM（NUMA 镜像）** | **~33** | — |
 | **PeoplesLLM（NUMA-EP）** | **28.5** | **310** |
 
+> 注：以上 DeepSeek-V4 速度均为**未启用 MTP 投机解码**的实测值；开启 MTP 后 TG 还会更高（MTP 数据另行补充）。
+
 GLM-5.2 745B（UD-Q2_K 量化）：生成 12.0 t/s（EP + GPU 专家卸载）。
 
 ### CPU 内核完整基准（AVX512/VNNI/VBMI 8×8 重排 vs 主线 legacy vec_dot）

@@ -22,6 +22,8 @@ DeepSeek-V4 284B (Q3_K quant), dual Xeon 8360Y (Ice Lake) + 2× RTX 3090:
 | **PeoplesLLM (NUMA mirror)** | **~33** | — |
 | **PeoplesLLM (NUMA-EP)** | **28.5** | **310** |
 
+> Note: all DeepSeek-V4 numbers above are measured **without MTP speculative decoding**; TG goes higher with MTP enabled (MTP figures to be published separately).
+
 GLM-5.2 745B (UD-Q2_K quant): TG 12.0 t/s (EP + GPU expert offload).
 
 ### CPU kernel full benchmark (AVX512/VNNI/VBMI 8×8 repack vs upstream legacy vec_dot)
