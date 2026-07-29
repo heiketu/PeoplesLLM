@@ -19,6 +19,7 @@
 #include "ggml-cpu.h"
 #include "gguf.h"
 
+#include <atomic>
 #include <cerrno>
 #include <cmath>
 #include <cstdint>
@@ -42,6 +43,15 @@
 static bool ep_debug_enabled() {
     static const bool v = []() {
         const char * e = getenv("GGML_REMOTE_EP_DEBUG");
+        return e && e[0] != '\0' && strcmp(e, "0") != 0;
+    }();
+    return v;
+}
+
+// env-gated startup weight prefault (GGML_EP_PREFAULT=1), default off
+static bool ep_prefault_enabled() {
+    static const bool v = []() {
+        const char * e = getenv("GGML_EP_PREFAULT");
         return e && e[0] != '\0' && strcmp(e, "0") != 0;
     }();
     return v;
@@ -306,6 +316,68 @@ static bool ep_model_load(ep_model & m, const char * path, int layer_first, int 
         return false;
     }
     return true;
+}
+
+// fault in every page of the owned layers' expert weights at startup, so the
+// first request that hits a cold expert does not stall on mmap page-in
+// (observed as multi-ms compute spikes, worst for rarely-routed experts)
+static void ep_prefault_weights(const ep_model & m) {
+    std::vector<std::pair<const char *, size_t>> ranges;
+    ranges.reserve(m.layers.size() * 3);
+    for (const auto & kv : m.layers) {
+        const ep_layer & L = kv.second;
+        for (const ggml_tensor * t : {L.gate_up, L.gate, L.up, L.down}) {
+            if (t && t->data) {
+                ranges.emplace_back((const char *) t->data, ggml_nbytes(t));
+            }
+        }
+    }
+
+    size_t total = 0;
+    for (const auto & r : ranges) {
+        total += r.second;
+    }
+
+    int nth = 16;
+    if (const char * e = getenv("GGML_EP_PREFAULT_THREADS")) {
+        const int v = atoi(e);
+        if (v > 0) {
+            nth = v;
+        }
+    }
+
+    LOG("llama-epd: prefault: touching %.2f GiB of expert weights (%zu tensors) with %d threads\n",
+        total / 1073741824.0, ranges.size(), nth);
+    const int64_t t0 = ggml_time_us();
+
+    std::atomic<size_t> next{0};
+    std::atomic<uint64_t> sink{0};
+    std::vector<std::thread> pool;
+    pool.reserve((size_t) nth);
+    for (int i = 0; i < nth; ++i) {
+        pool.emplace_back([&]() {
+            uint64_t acc = 0;
+            for (;;) {
+                const size_t idx = next.fetch_add(1);
+                if (idx >= ranges.size()) {
+                    break;
+                }
+                const char * p = ranges[idx].first;
+                const size_t n = ranges[idx].second;
+                for (size_t off = 0; off < n; off += 4096) {
+                    acc += *(volatile const uint8_t *) (p + off);
+                }
+                acc += *(volatile const uint8_t *) (p + n - 1);
+            }
+            sink += acc;
+        });
+    }
+    for (auto & th : pool) {
+        th.join();
+    }
+
+    LOG("llama-epd: prefault: done in %.1f s (sink %llu)\n",
+        (ggml_time_us() - t0) / 1e6, (unsigned long long) sink.load());
 }
 
 // ---------------------------------------------------------------------------
@@ -824,6 +896,10 @@ int main(int argc, char ** argv) {
 
     if (selftest) {
         return ep_selftest(m, cfg, selftest_layer, selftest_tokens, 6);
+    }
+
+    if (ep_prefault_enabled()) {
+        ep_prefault_weights(m);
     }
 
     ggml_backend_t backend = ggml_backend_cpu_init();
