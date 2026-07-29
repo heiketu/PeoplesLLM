@@ -36,6 +36,8 @@ add_library(llama
             llama-model-saver.cpp
             llama-model.cpp
             llama-quant.cpp
+            llama-remote-ep.cpp
+            ../tools/epd/llama-ep-transport.cpp
             llama-sampler.cpp
             llama-vocab.cpp
             unicode-data.cpp

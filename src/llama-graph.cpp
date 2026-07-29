@@ -12,6 +12,7 @@
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
+#include "llama-remote-ep.h"
 
 #include <cassert>
 #include <cmath>
@@ -2009,6 +2010,29 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_build_forward_expand(gf, weights);
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+
+    // remote expert-parallel dispatch (GGML_REMOTE_EP=1): ship the activations of this
+    // layer to an EPD worker (tools/epd/llama-epd) and block on the merged expert output.
+    // warmup graphs keep the local path (there n_expert_used == n_expert, which would
+    // flood the worker), as do layouts whose math the worker does not implement.
+    if (!cparams.warmup && n_tokens > 0 && !weight_before_ffn && type_op == LLM_FFN_SILU &&
+        (gate_exps != nullptr || gate_up_exps != nullptr) &&
+        up_exps_b == nullptr && gate_exps_b == nullptr && down_exps_b == nullptr && gate_up_exps_b == nullptr &&
+        up_exps_s == nullptr && gate_exps_s == nullptr && down_exps_s == nullptr &&
+        llama_remote_ep_enabled_for_layer(il)) {
+
+        cur              = ggml_cont(ctx0, cur);
+        selected_experts = ggml_cont(ctx0, selected_experts);
+        weights          = ggml_cont(ctx0, weights);
+
+        ggml_tensor * moe_out = ggml_map_custom3(ctx0, cur, selected_experts, weights,
+                llama_remote_ep_graph_cb, 1, (void *) (intptr_t) il);
+        cb(moe_out, "ffn_moe_out", il);
+
+        ggml_build_forward_expand(gf, moe_out);
+
+        return ggml_reshape_2d(ctx0, moe_out, n_embd, n_tokens);
+    }
 
     if (weight_before_ffn) {
         // repeat cur to [n_embd, n_expert_used, n_tokens]
