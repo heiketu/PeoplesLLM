@@ -16,43 +16,65 @@ DeepSeek-V4 284B (Q3_K quant), dual Xeon 8360Y (Ice Lake) + 2× RTX 3090:
 
 GLM-5.2 745B (UD-Q2_K quant): TG 12.0 t/s (EP + GPU expert offload).
 
-### CPU kernel microbenchmark (AVX512/VNNI/VBMI 8×8 repack vs upstream legacy vec_dot)
+### CPU kernel full benchmark (AVX512/VNNI/VBMI 8×8 repack vs upstream legacy vec_dot)
 
-Single thread, nc=2048 k=4096, measured on Ice Lake 8360Y (reproduce: `tests/test-repack-kernels --perf`):
+Measured on Ice Lake 8360Y, shape nc=16384 k=8192 (exceeds L3 — the real DRAM-bandwidth view); values are speedups (reproduce: `tests/test-repack-kernels --perf [threads]`; * = x86 kernels new/completed in this fork):
 
-| Format | gemv (TG, 1 token) | gemm nr=4 (small batch) | gemm nr=16 (PP batch) |
-|---|---|---|---|
-| Q2_K | 0.98× | 0.90× | 1.10× |
-| Q3_K | 0.92× | 1.85× | 2.44× |
-| Q4_0 | 1.68× | — | 3.03× |
-| Q4_K | 1.10× | — | 3.21× |
-| Q5_K | 1.02× | 3.01× | 3.99× |
-| Q6_K | 0.64× | — | 2.63× |
-| MXFP4 | 1.40× | — | 2.78× |
-| IQ1_S | 1.17× | 3.28× | 3.00× |
-| IQ1_M | 0.92× | 2.18× | 3.87× |
+**Single thread:**
 
-- gemv (TG) ≈1× is the physical memory-bandwidth ceiling for single-token decode, not a kernel issue; the gemm (PP) gains come from the 8×8 repack amortizing weight-read bandwidth
-- "—": these formats use `gemm_min_nrows=16`, so small batches route to gemv and nr=4 gemm is never hit in production (the Q4_K/Q6_K 4-row tail blocks are scalar — the router deliberately avoids them)
-- Known items: Q2_K gemm nr=4 is a slight loss (0.90×); Q6_K gemv 0.64× is a pre-existing upstream regression — both on the fix list
+| Format | gemv (TG) | gemm nr=4 | nr=8 | nr=16 | nr=32 |
+|---|---|---|---|---|---|
+| Q2_K | 0.98× | 0.91× | 0.89× | 1.13× | 1.03× |
+| Q3_K* | 1.03× | 2.14× | 2.68× | 2.63× | 3.02× |
+| Q4_0 | 1.21× | 2.82× | 2.75× | 3.46× | 3.67× |
+| Q4_K | 1.26× | 0.07× | 0.08× | 4.85× | 4.87× |
+| Q5_K* | 1.03× | 3.24× | 3.22× | 4.70× | 4.23× |
+| Q6_K* | 0.88× | 0.01× | 0.01× | 4.70× | 4.85× |
+| MXFP4 | 1.20× | 2.42× | 2.43× | 3.42× | 3.53× |
+| Q8_0* | 1.16× | 3.69× | 3.69× | 3.65× | 3.76× |
+| IQ1_S* | 1.20× | 3.00× | 3.05× | 3.64× | 3.67× |
+| IQ1_M* | 0.91× | 2.22× | 2.27× | 3.59× | 3.81× |
 
-### repack end-to-end comparison (DeepSeek-V4 284B, CPU-only)
+**72 threads (both sockets, production config):**
 
-Identical llama-bench config (NUMA-EP + mirror, 72 threads, fa=1, batch 4096/ubatch 1024, no GPU offload); `--no-repack` is a switch this fork adds to llama-bench:
+| Format | gemv (TG) | gemm nr=4 | nr=8 | nr=16 | nr=32 |
+|---|---|---|---|---|---|
+| Q2_K | 1.32× | 1.31× | 0.59× | 1.09× | 0.95× |
+| Q3_K* | 1.25× | 1.28× | 1.36× | 1.38× | 1.54× |
+| Q4_0 | 1.12× | 1.93× | 1.99× | 2.31× | 3.04× |
+| Q4_K | 1.45× | 0.09× | 0.14× | 1.72× | 2.01× |
+| Q5_K* | 0.96× | 1.94× | 2.32× | 2.41× | 2.53× |
+| Q6_K* | 1.03× | 0.04× | 0.03× | 2.12× | 2.96× |
+| MXFP4 | 1.45× | 1.74× | 1.70× | 2.06× | 3.01× |
+| Q8_0* | 1.26× | 1.62× | 1.52× | 2.09× | 2.79× |
+| IQ1_S* | 1.23× | 2.11× | 2.05× | 2.49× | 3.15× |
+| IQ1_M* | 1.20× | 1.90× | 1.73× | 2.71× | 3.11× |
+
+- gemv (TG, single token) ≈1× is the physical memory-bandwidth ceiling; the gemm (PP) gains come from the 8×8 repack amortizing weight-read bandwidth
+- Q4_K/Q6_K at nr≤8 use scalar tail blocks (0.01–0.14×) — the production router deliberately avoids them with `gemm_min_nrows=16`; all other formats have fully vectorized 4-row tails
+- Known items: Q2_K shows no gain anywhere (weights already at ~2.6 bit — nothing left to amortize); Q6_K gemv 0.62× on cache-resident shapes is a pre-existing upstream regression (back to ~1× on large shapes/multithread)
+- The cache-resident small shape (2048×4096) follows the same pattern: best nr=16 is 3.96× (IQ1_M), best gemv 1.39× (Q4_0); all 300 cells reproducible with the command above
+
+### repack end-to-end comparison (DeepSeek-V4 284B, llama-bench A/B)
+
+Identical config (NUMA-EP + mirror, 72 threads, fa=1, batch 4096/ubatch 1024); `--no-repack` is a switch this fork adds to llama-bench:
 
 | Config | pp512 (t/s) | tg128 (t/s) |
 |---|---|---|
-| repack on (default) | **114.33** | 17.34 |
-| repack off | 97.17 | **17.66** |
+| CPU-only · repack on (default) | **114.33** | 17.34 |
+| CPU-only · repack off | 97.17 | **17.66** |
+| GPU expert offload · repack on (production) | **151.12** | 29.04 |
+| GPU expert offload · repack off | 151.09 | **29.10** |
 
-- PP **+17.7%**: the end-to-end gain is smaller than the kernel microbenchmark (2.4–4×) because attention and other non-matmul work dominates
-- TG **-1.8%**: single-token decode is bandwidth-bound and repack gemv is slightly slower than legacy vec_dot (matches the microbenchmark); if you never run long prompts and only chase peak TG, use `--no-repack`
+- CPU-only: PP **+17.7%**, TG **-1.8%** (TG is bandwidth-bound; repack gemv is slightly slower than legacy, matching the microbenchmark)
+- GPU offload: difference **<1%** — the bottleneck moves to GPU-side attention and expert compute, and the repack gain washes out as the CPU matmul share shrinks
+- Takeaway: keep repack on (default) for CPU-only / long-prompt workloads; either way is fine with GPU offload; use `--no-repack` only if chasing peak TG
 
 ## What's inside
 
 - **NUMA mirror**: duplicate non-expert weights + KV per socket, pin threads per node — zero UPI traffic
 - **NUMA-EP**: single-copy expert placement across sockets (mbind policy-level), local-first `mul_mat_id` — halves expert memory, makes 745B-class models fit
-- **AVX512/VNNI 8×8 repack kernels**: full coverage of Q2_K–Q6_K, Q8_0, MXFP4, IQ1_S/IQ1_M — 2.4–4× on PP batches (gemm nr≥16); the Q3_K/Q5_K/Q6_K/Q8_0 x86 kernels and the entire IQ1_S/IQ1_M stack (block layout + repack + kernels) are new in this fork
+- **AVX512/VNNI 8×8 repack kernels**: full coverage of Q2_K–Q6_K, Q8_0, MXFP4, IQ1_S/IQ1_M — up to 4.9× on PP batches (gemm nr≥16); the Q3_K/Q5_K/Q6_K/Q8_0 x86 kernels and the entire IQ1_S/IQ1_M stack (block layout + repack + kernels) are new in this fork
 - **Fused ops**: DeepSeek-V4 hyper-connection CUDA kernel, fused MoE router, RMS_NORM absorption, GLM-DSA Lightning Indexer
 - **MTP speculative decoding** (DeepSeek-V4)
 - **Cross-machine EP (WIP)**: activation dispatch (KB-scale traffic) instead of weight transfer, InfiniBand EDR interconnect, scalable CPU MoE nodes — targeting 2.8T-class models

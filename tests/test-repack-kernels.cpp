@@ -21,6 +21,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <chrono>
+#include <thread>
+#include <utility>
 #include <random>
 #include <string>
 #include <vector>
@@ -164,18 +166,19 @@ bool test_type(const kernel_fns & fn, int nc, int k, const std::vector<int> & ge
         std::vector<float> s_nat(nc, 0.0f), s_gen(nc, 0.0f);
 
         fn.gemv(k, s_nat.data(), nc, rw.data, q8.data(), 1, nc);
-        fn.gemv_generic(k, s_gen.data(), nc, rw.data, q8.data(), 1, nc);
+        if (fn.gemv_generic) fn.gemv_generic(k, s_gen.data(), nc, rw.data, q8.data(), 1, nc);
+        const bool has_gen_gemv = fn.gemv_generic != nullptr;
 
         diff_stats st_ng, st_nl;
         for (int c = 0; c < nc; c++) {
-            diff_update(st_ng, s_nat[c], s_gen[c], tol);
+            if (has_gen_gemv) diff_update(st_ng, s_nat[c], s_gen[c], tol);
             float ref = 0.0f;
             fn.vec_dot(k, &ref, 0, rw.raw.data() + row_bytes * c, 0, q8.data(), 0, 1);
             diff_update(st_nl, s_nat[c], ref, tol);
         }
         printf("  [%s] gemv nc=%-4d k=%-5d native-vs-generic: max_abs=%.3g max_rel=%.3g bad=%d | native-vs-legacy: max_abs=%.3g max_rel=%.3g bad=%d\n",
                fn.name, nc, k, st_ng.max_abs, st_ng.max_rel, st_ng.n_bad, st_nl.max_abs, st_nl.max_rel, st_nl.n_bad);
-        ok = ok && st_ng.n_bad == 0 && st_nl.n_bad == 0;
+        ok = ok && (!has_gen_gemv || st_ng.n_bad == 0) && st_nl.n_bad == 0;
     }
 
     // ---- gemm: native vs generic vs legacy vec_dot ----
@@ -185,7 +188,8 @@ bool test_type(const kernel_fns & fn, int nc, int k, const std::vector<int> & ge
         std::vector<float> s_nat((size_t) nr * nc, 0.0f), s_gen((size_t) nr * nc, 0.0f);
 
         fn.gemm(k, s_nat.data(), nc, rw.data, q8.data(), nr, nc);
-        fn.gemm_generic(k, s_gen.data(), nc, rw.data, q8.data(), nr, nc);
+        if (fn.gemm_generic) fn.gemm_generic(k, s_gen.data(), nc, rw.data, q8.data(), nr, nc);
+        const bool has_gen_gemm = fn.gemm_generic != nullptr;
 
         diff_stats st_ng, st_nl;
         for (int r = 0; r < nr; r++) {
@@ -193,7 +197,7 @@ bool test_type(const kernel_fns & fn, int nc, int k, const std::vector<int> & ge
             std::vector<char> q8row = quantize_act_row(std::vector<float>(x.begin() + (size_t) r * k, x.begin() + (size_t) (r + 1) * k), k, fn.act_type);
             for (int c = 0; c < nc; c++) {
                 const double a = s_nat[(size_t) r * nc + c];
-                diff_update(st_ng, a, s_gen[(size_t) r * nc + c], tol);
+                if (has_gen_gemm) diff_update(st_ng, a, s_gen[(size_t) r * nc + c], tol);
                 float ref = 0.0f;
                 fn.vec_dot(k, &ref, 0, rw.raw.data() + row_bytes * c, 0, q8row.data(), 0, 1);
                 diff_update(st_nl, a, ref, tol);
@@ -201,7 +205,7 @@ bool test_type(const kernel_fns & fn, int nc, int k, const std::vector<int> & ge
         }
         printf("  [%s] gemm nc=%-4d k=%-5d nr=%-3d native-vs-generic: max_abs=%.3g max_rel=%.3g bad=%d | native-vs-legacy: max_abs=%.3g max_rel=%.3g bad=%d\n",
                fn.name, nc, k, nr, st_ng.max_abs, st_ng.max_rel, st_ng.n_bad, st_nl.max_abs, st_nl.max_rel, st_nl.n_bad);
-        ok = ok && st_ng.n_bad == 0 && st_nl.n_bad == 0;
+        ok = ok && (!has_gen_gemm || st_ng.n_bad == 0) && st_nl.n_bad == 0;
     }
 
     GGML_UNUSED(verbose);
@@ -209,7 +213,7 @@ bool test_type(const kernel_fns & fn, int nc, int k, const std::vector<int> & ge
     return ok;
 }
 
-void perf_type(const kernel_fns & fn, int nc, int k, int nr, int n_iter) {
+void perf_type(const kernel_fns & fn, int nc, int k, int nr, int nthreads, int n_iter) {
     std::vector<float> w = make_random_f32((int64_t) nc * k, 42);
 
     repacked_weights rw;
@@ -222,11 +226,32 @@ void perf_type(const kernel_fns & fn, int nc, int k, int nr, int n_iter) {
 
     std::vector<float> x = make_random_f32((int64_t) nr * k, 43);
 
+    // column slices aligned to 8 (kernels require nc % 8 == 0)
+    std::vector<std::pair<int, int>> slices;
+    {
+        int c = 0;
+        for (int t = 0; t < nthreads && c < nc; t++) {
+            int n = ((nc - c) / (nthreads - t)) & ~7;
+            if (n == 0) n = std::min(8, nc - c);
+            slices.push_back({c, n});
+            c += n;
+        }
+    }
+
+    // times total wall time per iteration (columns partitioned across threads)
     auto time_it = [&](const char * label, auto && body) {
-        // warmup
-        body();
+        body(slices[0].first, slices[0].second); // warmup
         const auto t0 = std::chrono::steady_clock::now();
-        for (int i = 0; i < n_iter; i++) body();
+        if ((int) slices.size() <= 1) {
+            for (int i = 0; i < n_iter; i++) body(0, nc);
+        } else {
+            std::vector<std::thread> ths;
+            ths.reserve(slices.size());
+            for (const auto & sl : slices) {
+                ths.emplace_back([&] { for (int i = 0; i < n_iter; i++) body(sl.first, sl.second); });
+            }
+            for (auto & th : ths) th.join();
+        }
         const auto t1 = std::chrono::steady_clock::now();
         const double us = std::chrono::duration<double, std::micro>(t1 - t0).count() / n_iter;
         printf("  [%s] %-28s %12.1f us\n", fn.name, label, us);
@@ -239,26 +264,25 @@ void perf_type(const kernel_fns & fn, int nc, int k, int nr, int n_iter) {
         q8rows[r] = quantize_act_row(std::vector<float>(x.begin() + (size_t) r * k, x.begin() + (size_t) (r + 1) * k), k, fn.act_type);
     }
     std::vector<float> s((size_t) nr * nc);
-    const double t_legacy = time_it("legacy vec_dot (nr rows)", [&] {
+    const double t_legacy = time_it("legacy vec_dot (nr rows)", [&](int c0, int ncols) {
         for (int r = 0; r < nr; r++) {
-            for (int c = 0; c < nc; c++) {
+            for (int c = c0; c < c0 + ncols; c++) {
                 fn.vec_dot(k, &s[(size_t) r * nc + c], 0, rw.raw.data() + row_bytes * c, 0, q8rows[r].data(), 0, 1);
             }
         }
     });
 
     if (nr == 1) {
-        std::vector<float> s1(nc);
-        const double t = time_it("repack gemv", [&] {
-            fn.gemv(k, s1.data(), nc, rw.data, q8rows[0].data(), 1, nc);
+        const double t = time_it("repack gemv", [&](int c0, int ncols) {
+            fn.gemv(k, s.data() + c0, nc, (const char *) rw.data + row_bytes * c0, q8rows[0].data(), 1, ncols);
         });
         printf("  [%s] speedup gemv vs legacy:      %.2fx\n", fn.name, t_legacy / t);
     } else {
         std::vector<char> q8 = quantize_acts_4x8(x, nr, k, fn.act_type);
-        const double t = time_it(("repack gemm nr=" + std::to_string(nr)).c_str(), [&] {
-            fn.gemm(k, s.data(), nc, rw.data, q8.data(), nr, nc);
+        const double t = time_it(("repack gemm nr=" + std::to_string(nr)).c_str(), [&](int c0, int ncols) {
+            fn.gemm(k, s.data() + c0, nc, (const char *) rw.data + row_bytes * c0, q8.data(), nr, ncols);
         });
-        printf("  [%s] speedup gemm vs legacy:      %.2fx\n", fn.name, t_legacy / t);
+        printf("  [%s] speedup gemm nr=%-3d vs legacy: %.2fx\n", fn.name, nr, t_legacy / t);
     }
 
     free_repacked(rw);
@@ -288,14 +312,26 @@ int main(int argc, char ** argv) {
           ggml_gemm_q6_K_8x8_q8_K, ggml_gemm_q6_K_8x8_q8_K_generic },
         { GGML_TYPE_MXFP4, "MXFP4", ggml_vec_dot_mxfp4_q8_0, ggml_gemv_mxfp4_8x8_q8_0, ggml_gemv_mxfp4_8x8_q8_0_generic,
           ggml_gemm_mxfp4_8x8_q8_0, ggml_gemm_mxfp4_8x8_q8_0_generic, GGML_TYPE_Q8_0 },
+        // Q8_0 has no generic 8x8 kernels; native-vs-generic checks are skipped for it
+        { GGML_TYPE_Q8_0, "Q8_0", ggml_vec_dot_q8_0_q8_0, ggml_gemv_q8_0_8x8_q8_0, nullptr,
+          ggml_gemm_q8_0_8x8_q8_0, nullptr, GGML_TYPE_Q8_0 },
     };
 
     if (perf) {
-        printf("microbenchmark: nc=2048 k=4096, single thread (dot kernels only)\n");
-        for (const auto & fn : types) {
-            perf_type(fn, 2048, 4096, 1, 20);
-            perf_type(fn, 2048, 4096, 4, 20);
-            perf_type(fn, 2048, 4096, 16, 10);
+        const int nthreads = argc > 2 ? atoi(argv[2]) : 1;
+        const std::string only = argc > 3 ? argv[3] : "";
+        const struct { int nc, k; } shapes[] = { { 2048, 4096 }, { 16384, 8192 } };
+        const int nrs[] = { 1, 4, 8, 16, 32 };
+        for (const auto & sh : shapes) {
+            printf("== shape nc=%d k=%d threads=%d ==\n", sh.nc, sh.k, nthreads);
+            for (const auto & fn : types) {
+                if (!only.empty() && only != fn.name) continue;
+                for (const int nr : nrs) {
+                    const int64_t dots = (int64_t) sh.nc * nr;
+                    const int n_iter = dots > 200000 ? 2 : (dots > 50000 ? 4 : 10);
+                    perf_type(fn, sh.nc, sh.k, nr, nthreads, n_iter);
+                }
+            }
         }
         return 0;
     }
