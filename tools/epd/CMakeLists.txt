@@ -3,6 +3,18 @@ add_executable(${TARGET} llama-epd.cpp llama-ep-transport.cpp llama-ep-transport
 target_link_libraries(${TARGET} PRIVATE llama ${CMAKE_THREAD_LIBS_INIT})
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 
+set(TARGET llama-ep-transport-bench)
+add_executable(${TARGET} ep-transport-bench.cpp llama-ep-transport.cpp llama-ep-transport.h)
+target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
+if (LLAMA_EP_RDMA_ENABLED)
+    foreach (T llama-epd llama-ep-transport-bench)
+        target_sources(${T} PRIVATE llama-ep-rdma.cpp)
+        target_compile_definitions(${T} PRIVATE LLAMA_EP_HAVE_RDMA)
+        target_link_libraries(${T} PRIVATE ${LLAMA_EP_IBVERBS_LIBRARY} ${LLAMA_EP_RDMACM_LIBRARY})
+    endforeach()
+endif()
+
 if(LLAMA_TOOLS_INSTALL)
-    install(TARGETS ${TARGET} RUNTIME)
+    install(TARGETS llama-epd RUNTIME)
 endif()

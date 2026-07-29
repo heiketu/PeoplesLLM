@@ -910,12 +910,36 @@ int main(int argc, char ** argv) {
     ggml_backend_cpu_set_n_threads(backend, cfg.n_threads);
 
     std::string err;
-    llama_ep_listener * listener = llama_ep_tcp_listen(nullptr, port, &err);
+    llama_ep_listener * listener = nullptr;
+    bool rdma_mode = false;
+#ifdef LLAMA_EP_HAVE_RDMA
+    if (llama_ep_rdma_requested()) {
+        listener = llama_ep_rdma_listen(nullptr, port, &err);
+        if (listener) {
+            rdma_mode = true;
+        } else {
+            LOG("llama-epd: RDMA listen failed (%s), falling back to TCP\n", err.c_str());
+            err.clear();
+        }
+    }
+#endif
+    if (!listener) {
+        listener = llama_ep_tcp_listen(nullptr, port, &err);
+    }
     if (!listener) {
         LOG("llama-epd: listen failed: %s\n", err.c_str());
         return 1;
     }
-    LOG("llama-epd: listening on port %d (%d threads)\n", llama_ep_tcp_listener_port(listener), cfg.n_threads);
+    int bound_port = 0;
+    if (rdma_mode) {
+#ifdef LLAMA_EP_HAVE_RDMA
+        bound_port = llama_ep_rdma_listener_port(listener);
+#endif
+    } else {
+        bound_port = llama_ep_tcp_listener_port(listener);
+    }
+    LOG("llama-epd: listening on port %d (%d threads)%s\n",
+        bound_port, cfg.n_threads, rdma_mode ? " [rdma]" : "");
 
     for (;;) {
         llama_ep_transport conn;

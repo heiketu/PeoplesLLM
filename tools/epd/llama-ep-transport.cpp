@@ -1,6 +1,7 @@
 #include "llama-ep-transport.h"
 
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 
 #ifdef _WIN32
@@ -212,6 +213,14 @@ llama_ep_listener * llama_ep_tcp_listen(const char * host, int port, std::string
 
 int llama_ep_tcp_listener_port(const llama_ep_listener * l) {
     return static_cast<tcp_listener *>(l->ctx)->port;
+}
+
+bool llama_ep_rdma_requested() {
+    static const bool v = []() {
+        const char * e = getenv("GGML_REMOTE_EP_RDMA");
+        return e && e[0] != '\0' && strcmp(e, "0") != 0;
+    }();
+    return v;
 }
 
 bool llama_ep_send_frame(llama_ep_transport * t, uint32_t type, const void * payload, size_t payload_len) {

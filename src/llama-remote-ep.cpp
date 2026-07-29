@@ -72,7 +72,20 @@ struct remote_ep_state {
         if (conn) {
             return true;
         }
-        conn = llama_ep_tcp_connect(host.c_str(), port, &err);
+#ifdef LLAMA_EP_HAVE_RDMA
+        if (llama_ep_rdma_requested()) {
+            conn = llama_ep_rdma_connect(host.c_str(), port, &err);
+            if (conn) {
+                LLAMA_LOG_INFO("%s: connected to %s:%d via RDMA (RoCEv2)\n", __func__, host.c_str(), port);
+            } else {
+                LLAMA_LOG_WARN("%s: RDMA connect failed (%s), falling back to TCP\n", __func__, err.c_str());
+                err.clear();
+            }
+        }
+#endif
+        if (!conn) {
+            conn = llama_ep_tcp_connect(host.c_str(), port, &err);
+        }
         return conn != nullptr;
     }
 

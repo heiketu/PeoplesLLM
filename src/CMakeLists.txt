@@ -58,6 +58,12 @@ target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 target_link_libraries(llama PUBLIC ggml)
 
+if (LLAMA_EP_RDMA_ENABLED)
+    target_sources(llama PRIVATE ../tools/epd/llama-ep-rdma.cpp)
+    target_compile_definitions(llama PRIVATE LLAMA_EP_HAVE_RDMA)
+    target_link_libraries(llama PRIVATE ${LLAMA_EP_IBVERBS_LIBRARY} ${LLAMA_EP_RDMACM_LIBRARY})
+endif()
+
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_compile_definitions(llama PRIVATE LLAMA_BUILD)

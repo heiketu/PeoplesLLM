@@ -190,6 +190,21 @@ if (NOT TARGET ggml AND NOT LLAMA_USE_SYSTEM_GGML)
 endif()
 
 #
+# EP RDMA (RoCEv2) transport backend: auto-detected at configure time,
+# opt-in at runtime (GGML_REMOTE_EP_RDMA=1), callers fall back to TCP.
+#
+
+find_library(LLAMA_EP_IBVERBS_LIBRARY NAMES ibverbs)
+find_library(LLAMA_EP_RDMACM_LIBRARY  NAMES rdmacm)
+find_path(LLAMA_EP_RDMA_INCLUDE_DIR NAMES rdma/rdma_cma.h infiniband/verbs.h)
+if (LLAMA_EP_IBVERBS_LIBRARY AND LLAMA_EP_RDMACM_LIBRARY AND LLAMA_EP_RDMA_INCLUDE_DIR)
+    set(LLAMA_EP_RDMA_ENABLED ON)
+else()
+    set(LLAMA_EP_RDMA_ENABLED OFF)
+endif()
+message(STATUS "EP RDMA transport (RoCEv2): ${LLAMA_EP_RDMA_ENABLED}")
+
+#
 # build the library
 #
 

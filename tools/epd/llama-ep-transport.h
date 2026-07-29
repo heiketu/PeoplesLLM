@@ -91,6 +91,16 @@ llama_ep_listener  * llama_ep_tcp_listen(const char * host, int port, std::strin
 // port the listener is actually bound to (useful with port 0)
 int llama_ep_tcp_listener_port(const llama_ep_listener * l);
 
+// RDMA (RoCEv2) backend via rdma_cm, same blocking byte-stream semantics as TCP.
+// Built only when CMake detects libibverbs + librdmacm (LLAMA_EP_HAVE_RDMA);
+// callers must be compiled with that define and fall back to TCP on nullptr.
+llama_ep_transport * llama_ep_rdma_connect(const char * host, int port, std::string * err = nullptr);
+llama_ep_listener  * llama_ep_rdma_listen(const char * host, int port, std::string * err = nullptr);
+int llama_ep_rdma_listener_port(const llama_ep_listener * l);
+
+// true when GGML_REMOTE_EP_RDMA is set (always available, no RDMA build required)
+bool llama_ep_rdma_requested();
+
 // framing helpers built on top of send_all/recv_all (backend-agnostic)
 bool llama_ep_send_frame(llama_ep_transport * t, uint32_t type, const void * payload, size_t payload_len);
 // gathered send: parts are concatenated into the payload (avoids one big copy for large hiddens)
