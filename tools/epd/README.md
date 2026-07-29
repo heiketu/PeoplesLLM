@@ -17,6 +17,7 @@
 | `GGML_REMOTE_EP_HOST` | 127.0.0.1 | worker 地址 |
 | `GGML_REMOTE_EP_PORT` | 29200 | worker 端口 |
 | `GGML_REMOTE_EP_LAYERS` | 全部 | 远端层范围 `A-B`；范围外的层走本地 |
+| `GGML_REMOTE_EP_DEBUG` | 关 | 置 1 每次 RPC 打印 send/wait 耗时（master）；worker 端置 1 每 REQ 打印 compute 耗时 |
 
 仅当层为 SILU+gate MoE、无 expert bias/scale、非 warmup 图时走远端；
 不满足时自动回退本地路径。连接懒建立、跨 decode 复用，传输错误自动重连重试一次。
@@ -82,13 +83,18 @@ slave（server2）认领层 3-17（15 层 ≈43.5G 权重）。模型在 exfat U
 ## 层数分配：按内存带宽均衡
 
 decode 时每层每 token 专家字节 `E = top_k × 3 × n_embd × n_ff × bpw/8`（DSV4 ≈48MB/层）。
-两端 CPU 侧耗时相等时最快：`N_slave = N_CPU层数 × B_slave / (B_master + B_slave)`
-（GPU 卸载层先扣除）。
+两端 CPU 侧耗时相等时最快：`N_slave = N_CPU层数 × t_master / (t_master + t_slave)`
+（GPU 卸载层先扣除；--numa mirror 走节点本地访问，用 NUMA 本地口径）。
 
-实测带宽（membw，read，整机 interleave）：master 94.5 GB/s，slave 128.2 GB/s
-（node0 本地 93.2 / node1 本地 80.6，不对称）→ slave 应承担约 57.6% 的 CPU 层。
+实测 NUMA 本地 read 带宽（membw，干净环境）：master node0 167.5 / node1 173.9
+（合计 ~341 GB/s）；slave node0 93.8 / node1 80.2（合计 ~174 GB/s，
+node1 因 2DPC 内存慢 14%，硬件现状）。对应每层耗时：master CPU 0.31ms/层，
+slave 0.376ms/层 → slave 总算力占比 ~34%。
 
-- DSV4（master GPU 已卸 14 层）：当前 slave 21 层 ≈7.9ms/token、master CPU 5 层 ≈2.5ms，
-  slave 是瓶颈；平衡点 slave ~15 层（28-42）+ master CPU 11 层 + GPU 14 层 ≈5.6ms。
-- GLM-5.2（master CPU 53 层 + GPU 8 层，slave 15 层）：瓶颈在 master CPU（耗时比 ≈1:4.8），
-  理论平衡 slave ~38 层；受 slave 125G 内存限制（≈2.5G/层）建议 30-35 层。
+- DSV4（40 MoE 层，GPU 固定卸载 14 层 8-21，CPU 可分配 26 层 3-7+22-42）：
+  0.31×(26-N) = 0.376×N → N ≈ 12 → **slave 31-42（12 层）+ master CPU 14 层
+  （3-7、22-30）+ GPU 14 层**。旧版 21 层（22-42）分配 slave 是瓶颈（7.9ms vs 2.5ms）。
+- GLM-5.2（master CPU 53 层 + GPU 8 层，slave 15 层）：瓶颈在 master CPU；
+  受 slave 内存限制建议 slave 30-35 层。
+
+interleave 整机口径（旧数据，仅供参考）：master read 94.5 GB/s，slave 128.2 GB/s。

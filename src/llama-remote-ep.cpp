@@ -14,6 +14,15 @@
 
 namespace {
 
+// env-gated per-call RPC timing (GGML_REMOTE_EP_DEBUG=1), default off
+bool remote_ep_debug_enabled() {
+    static const bool v = []() {
+        const char * e = getenv("GGML_REMOTE_EP_DEBUG");
+        return e && e[0] != '\0' && strcmp(e, "0") != 0;
+    }();
+    return v;
+}
+
 struct remote_ep_state {
     bool        enabled     = false;
     std::string host        = "127.0.0.1";
@@ -106,16 +115,23 @@ bool remote_ep_roundtrip(
         n_sel * sizeof(float),
         (size_t) n_tokens * n_embd * sizeof(float),
     };
+    const bool dbg = remote_ep_debug_enabled();
+    const int64_t t0 = dbg ? ggml_time_us() : 0;
     if (!llama_ep_send_framev(st.conn, LLAMA_EP_MSG_REQ, parts, lens, 4)) {
         err = "send REQ failed";
         return false;
     }
+    const int64_t t_sent = dbg ? ggml_time_us() : 0;
 
     std::vector<uint8_t> payload;
     uint32_t type = 0;
     if (!llama_ep_recv_frame(st.conn, type, payload)) {
         err = "recv RESP failed";
         return false;
+    }
+    if (dbg) {
+        fprintf(stderr, "GGML_REMOTE_EP: [ep-debug] layer %d n_tokens=%lld send %.3f ms wait %.3f ms\n",
+                il, (long long) n_tokens, (t_sent - t0) / 1000.0, (ggml_time_us() - t_sent) / 1000.0);
     }
     if (type == LLAMA_EP_MSG_ERR) {
         int32_t code = 0;

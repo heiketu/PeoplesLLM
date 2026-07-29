@@ -38,6 +38,15 @@
 
 #define LOG(...) fprintf(stderr, __VA_ARGS__)
 
+// env-gated per-REQ compute timing (GGML_REMOTE_EP_DEBUG=1), default off
+static bool ep_debug_enabled() {
+    static const bool v = []() {
+        const char * e = getenv("GGML_REMOTE_EP_DEBUG");
+        return e && e[0] != '\0' && strcmp(e, "0") != 0;
+    }();
+    return v;
+}
+
 // ---------------------------------------------------------------------------
 // model (gguf metadata + read-only mmap, tensors point into the mapping)
 //
@@ -467,8 +476,13 @@ static bool ep_handle_req(
 
     std::vector<float> out((size_t) n_tokens * L.n_embd);
     std::string err;
+    const int64_t t0 = ep_debug_enabled() ? ggml_time_us() : 0;
     if (!ep_moe_ffn(backend, L, (int) n_tokens, (int) n_ids, ids, weights, hidden, out.data(), err)) {
         return ep_send_err(t, LLAMA_EP_ERR_COMPUTE, err);
+    }
+    if (ep_debug_enabled()) {
+        LOG("llama-epd: [ep-debug] layer %d n_tokens=%d compute %.3f ms\n",
+            hdr.layer, (int) n_tokens, (ggml_time_us() - t0) / 1000.0);
     }
 
     llama_ep_resp_header rhdr;
