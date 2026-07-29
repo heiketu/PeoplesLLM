@@ -1104,10 +1104,16 @@ void ggml_numa_bind_policy(void * ptr, size_t size, int node) {
 
 // Configure the hierarchical barrier for the given thread count. Called single-threaded from
 // ggml_graph_compute before workers start. Allocates the node-local counter lines once.
-// Activates only when NUMA mirroring is on (threads are pinned per node, matching the block split
-// used by ggml_numa_node_for_thread); otherwise leaves the flat barrier in place.
+// Opt-in via GGML_NUMA_HIER_BARRIER=1 (default off keeps the flat barrier), and only when NUMA
+// mirroring is on (threads are pinned per node, matching the block split used by
+// ggml_numa_node_for_thread); otherwise leaves the flat barrier in place.
 static void ggml_numa_barrier_setup(int n_threads) {
-    if (g_state.numa.numa_strategy != GGML_NUMA_STRATEGY_MIRROR || g_state.numa.n_nodes < 2 || n_threads <= 1) {
+    static int hier_enabled = -1;
+    if (hier_enabled < 0) {
+        const char * env = getenv("GGML_NUMA_HIER_BARRIER");
+        hier_enabled = (env && atoi(env)) ? 1 : 0;
+    }
+    if (!hier_enabled || g_state.numa.numa_strategy != GGML_NUMA_STRATEGY_MIRROR || g_state.numa.n_nodes < 2 || n_threads <= 1) {
         g_numa_barrier.active = 0;
         return;
     }
