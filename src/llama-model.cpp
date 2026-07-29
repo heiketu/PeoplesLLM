@@ -1487,6 +1487,17 @@ void llama_model::numa_ep_place_experts(bool used_mmap) {
 
     int n_placed = 0;
     size_t placed_bytes = 0;
+#if defined(__gnu_linux__)
+    // env GGML_NUMA_THP=collapse: after binding each expert range to its node (pages are
+    // already populated by the weight read + mbind migration), synchronously collapse it
+    // into 2 MiB pages (MADV_COLLAPSE, best-effort). This is where the bulk of CPU-side
+    // weight bytes live under GGML_NUMA_EP, so it is the main TLB-miss lever for TG.
+    static const bool thp_collapse = []() {
+        const char * e = getenv("GGML_NUMA_THP");
+        return e && strcmp(e, "collapse") == 0;
+    }();
+    size_t collapsed_bytes = 0;
+#endif
     for (auto & [ctx, bufs] : pimpl->ctxs_bufs) {
         GGML_UNUSED(bufs);
         for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
@@ -1507,9 +1518,9 @@ void llama_model::numa_ep_place_experts(bool used_mmap) {
                 }
                 char * p = base + e0 * eb;
                 size_t sz = (size_t) (e1 - e0) * eb;
+                // keep the boundary page on the earlier node: only bind whole pages
+                const uintptr_t up = ((uintptr_t) p + pg - 1) & ~((uintptr_t) pg - 1);
                 if (n > 0) {
-                    // keep the boundary page on the earlier node: only bind whole pages
-                    const uintptr_t up = ((uintptr_t) p + pg - 1) & ~((uintptr_t) pg - 1);
                     if ((size_t) (up - (uintptr_t) p) >= sz) {
                         continue;
                     }
@@ -1521,11 +1532,34 @@ void llama_model::numa_ep_place_experts(bool used_mmap) {
                 } else {
                     llama_numa_bind(p, sz, n);
                 }
+#if defined(__gnu_linux__)
+                if (thp_collapse) {
+                    const uintptr_t ua = ((uintptr_t) p + pg - 1) & ~((uintptr_t) pg - 1);
+                    if ((size_t) (ua - (uintptr_t) p) < sz) {
+                        const size_t csz = sz - (ua - (uintptr_t) p);
+                        // the weight buffer is plain posix_memalign memory: make sure the
+                        // VMA is THP-eligible before asking for a synchronous collapse
+                        madvise((void *) ua, csz, MADV_HUGEPAGE);
+                        if (madvise((void *) ua, csz, MADV_COLLAPSE) == 0) {
+                            collapsed_bytes += csz;
+                        } else {
+                            LLAMA_LOG_WARN("%s: MADV_COLLAPSE failed on %.2f MiB (errno=%d); continuing\n",
+                                    __func__, csz/1048576.0, errno);
+                        }
+                    }
+                }
+#endif
             }
             ++n_placed;
             placed_bytes += ggml_nbytes(t);
         }
     }
+#if defined(__gnu_linux__)
+    if (thp_collapse) {
+        LLAMA_LOG_INFO("%s: MADV_COLLAPSE applied to %.2f GiB of expert weights\n",
+                __func__, collapsed_bytes/1073741824.0);
+    }
+#endif
     LLAMA_LOG_INFO("%s: NUMA EP: placed %d expert tensors (%.2f GiB) across %d nodes\n",
             __func__, n_placed, placed_bytes/1073741824.0, n_nodes);
 }
