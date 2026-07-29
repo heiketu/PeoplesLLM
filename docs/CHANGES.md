@@ -15,10 +15,10 @@
 - 环境变量：`GGML_NUMA_MIRROR_THREADS`（镜像构建并行度）
 
 ### 2. NUMA-EP（机箱内专家并行）
-- MoE 专家**单副本**按 socket 切分放置（`owner(e) = e × n_nodes / n_expert`），专家内存减半——这是 236G 级模型能装下的关键
+- MoE 专家**单副本**按 socket 切分放置（`owner(e) = e × n_nodes / n_expert`），专家内存减半——这是 745B 级模型能装下的关键
 - 计算侧：`mul_mat_id` 双路径（legacy ggml-cpu.c + repack.cpp）phase 0 每节点只算本节点专家（权重 100% 本地读），phase 1 大 batch 时跨节点偷取（阈值 `GGML_NUMA_EP_STEAL_MIN_TOKENS`，默认 32）
 - **mbind 策略级放置补丁**（本项目原创）：`ggml_numa_bind_policy` 对 mmap 文件映射做 MPOL_BIND 策略绑定，零页面迁移、无 OOM 风险，`GGML_NUMA_EP_MMAP=1` 启用
-- 实测（GLM-5.2 236G）：TG +3~4%，PP +12.6%；dsv4 上 EP 比 mirror 慢 14% 但内存减半——EP 是容量技术，mirror 是速度技术
+- 实测（GLM-5.2 745B）：TG +3~4%，PP +12.6%；dsv4 上 EP 比 mirror 慢 14% 但内存减半——EP 是容量技术，mirror 是速度技术
 - 环境变量：`GGML_NUMA_EP=1`、`GGML_NUMA_EP_MMAP=1`
 
 ### 3. NUMA 层级 barrier
@@ -29,7 +29,8 @@
 ### 1. 8×8 interleave repack 内核（`ggml/src/ggml-cpu/arch/x86/repack.cpp` 等）
 - 运行时将量化权重重排为 8×8 interleave 布局，配 AVX512F/BW/VNNI（`_mm512_dpbusd_epi32`）gemv/gemm 内核
 - **支持格式**：Q2_K、Q3_K、Q4_K、Q5_K、Q6_K、Q8_0、Q4_0、MXFP4、IQ1_S、IQ1_M（最后三者为本次新增；Q5_K 内核 + Q2_K/Q5_K `gemm_min_nrows=4` 小批路由为本次新增）
-- 效果：gemm（PP，nr≥4）**2-4×**；gemv（TG 单 token）受内存带宽封顶 ≈1×（物理上限，非内核问题）
+- 效果：gemm（PP 批量）**1.1~4×**（格式相关，单线程微基准全格式详表见 [README](../README.md)）；gemv（TG 单 token）受内存带宽封顶 ≈1×（物理上限，非内核问题）
+- 路由：Q2_K/Q3_K/Q5_K/IQ1_S/IQ1_M 的 4 行尾块全程向量化，`gemm_min_nrows=4`；其余格式 min_nrows=16（Q4_K/Q6_K 尾块为标量实现，小批刻意走 gemv）
 - generic 回退路径全格式可用（非 AVX512 机器）
 
 ### 2. 图级融合
@@ -55,7 +56,7 @@
 
 - **架构**：激活 dispatch（每 token 每层 KB 级流量），非权重传输——这是跨机场景唯一可行的数据通路（权重流 ~700MB/token vs 激活流 ~1.8MB/token）
 - `llama-ep-transport`：帧协议 LEP1 + 传输函数表隔离（TCP 实现已就绪，RDMA verbs 后端预留接口）
-- `llama-epd`：专家计算守护进程，gguf 元数据 + 只读 mmap 直接加载（94.6G 模型 0.3s 启动），单层数值验证 diff=0（逐位一致）
+- `llama-epd`：专家计算守护进程，gguf 元数据 + 只读 mmap 直接加载（284B 模型 0.3s 启动），单层数值验证 diff=0（逐位一致）
 - 目标：双路 8360Y 节点经 InfiniBand EDR 互联，可横向扩展 CPU MoE 节点，跑 2.8T 级模型
 
 ## 六、版本控制策略

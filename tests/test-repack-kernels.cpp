@@ -104,23 +104,29 @@ std::vector<float> make_random_f32(int64_t n, uint32_t seed) {
     return v;
 }
 
-// Quantize nr activation rows of k floats each into the block_q8_Kx4
+// Quantize nr activation rows of k floats each into the block_q8_{K,0}x4
 // interleaved layout used by the gemm kernels (nr must be a multiple of 4).
-std::vector<char> quantize_acts_4x8(const std::vector<float> & x, int nr, int k) {
-    const int    nb       = k / QK_K;
-    const size_t row_size = ggml_row_size(GGML_TYPE_Q8_K, k) * 4;
+std::vector<char> quantize_acts_4x8(const std::vector<float> & x, int nr, int k, ggml_type act = GGML_TYPE_Q8_K) {
+    const size_t row_size = ggml_row_size(act, k) * 4;
     std::vector<char> vy(row_size * (nr / 4));
     for (int g = 0; g < nr / 4; g++) {
-        ggml_quantize_mat_q8_K_4x8(x.data() + (size_t) g * 4 * k, vy.data() + row_size * g, k);
+        if (act == GGML_TYPE_Q8_K) {
+            ggml_quantize_mat_q8_K_4x8(x.data() + (size_t) g * 4 * k, vy.data() + row_size * g, k);
+        } else {
+            ggml_quantize_mat_q8_0_4x8(x.data() + (size_t) g * 4 * k, vy.data() + row_size * g, k);
+        }
     }
-    GGML_UNUSED(nb);
     return vy;
 }
 
-// Quantize a single activation row into plain block_q8_K blocks (gemv path).
-std::vector<char> quantize_act_row(const std::vector<float> & x, int k) {
-    std::vector<char> vy(ggml_row_size(GGML_TYPE_Q8_K, k));
-    quantize_row_q8_K(x.data(), vy.data(), k);
+// Quantize a single activation row into plain block_q8_K / block_q8_0 blocks (gemv path).
+std::vector<char> quantize_act_row(const std::vector<float> & x, int k, ggml_type act = GGML_TYPE_Q8_K) {
+    std::vector<char> vy(ggml_row_size(act, k));
+    if (act == GGML_TYPE_Q8_K) {
+        quantize_row_q8_K(x.data(), vy.data(), k);
+    } else {
+        quantize_row_q8_0(x.data(), vy.data(), k);
+    }
     return vy;
 }
 
@@ -134,6 +140,7 @@ struct kernel_fns {
     void (*gemv_generic)(int, float *, size_t, const void *, const void *, int, int);
     void (*gemm)(int, float *, size_t, const void *, const void *, int, int);
     void (*gemm_generic)(int, float *, size_t, const void *, const void *, int, int);
+    ggml_type    act_type = GGML_TYPE_Q8_K;
 };
 
 bool test_type(const kernel_fns & fn, int nc, int k, const std::vector<int> & gemm_nrs, bool verbose) {
@@ -153,7 +160,7 @@ bool test_type(const kernel_fns & fn, int nc, int k, const std::vector<int> & ge
     // ---- gemv: native vs generic vs legacy vec_dot ----
     {
         std::vector<float> x   = make_random_f32(k, 777);
-        std::vector<char>  q8  = quantize_act_row(x, k);
+        std::vector<char>  q8  = quantize_act_row(x, k, fn.act_type);
         std::vector<float> s_nat(nc, 0.0f), s_gen(nc, 0.0f);
 
         fn.gemv(k, s_nat.data(), nc, rw.data, q8.data(), 1, nc);
@@ -174,7 +181,7 @@ bool test_type(const kernel_fns & fn, int nc, int k, const std::vector<int> & ge
     // ---- gemm: native vs generic vs legacy vec_dot ----
     for (int nr : gemm_nrs) {
         std::vector<float> x  = make_random_f32((int64_t) nr * k, 999 + nr);
-        std::vector<char>  q8 = quantize_acts_4x8(x, nr, k);
+        std::vector<char>  q8 = quantize_acts_4x8(x, nr, k, fn.act_type);
         std::vector<float> s_nat((size_t) nr * nc, 0.0f), s_gen((size_t) nr * nc, 0.0f);
 
         fn.gemm(k, s_nat.data(), nc, rw.data, q8.data(), nr, nc);
@@ -183,7 +190,7 @@ bool test_type(const kernel_fns & fn, int nc, int k, const std::vector<int> & ge
         diff_stats st_ng, st_nl;
         for (int r = 0; r < nr; r++) {
             // legacy reference needs the plain block_q8_K layout for row r
-            std::vector<char> q8row = quantize_act_row(std::vector<float>(x.begin() + (size_t) r * k, x.begin() + (size_t) (r + 1) * k), k);
+            std::vector<char> q8row = quantize_act_row(std::vector<float>(x.begin() + (size_t) r * k, x.begin() + (size_t) (r + 1) * k), k, fn.act_type);
             for (int c = 0; c < nc; c++) {
                 const double a = s_nat[(size_t) r * nc + c];
                 diff_update(st_ng, a, s_gen[(size_t) r * nc + c], tol);
@@ -229,7 +236,7 @@ void perf_type(const kernel_fns & fn, int nc, int k, int nr, int n_iter) {
     // legacy: nr rows x nc cols via per-row vec_dot (dot only, acts pre-quantized)
     std::vector<std::vector<char>> q8rows(nr);
     for (int r = 0; r < nr; r++) {
-        q8rows[r] = quantize_act_row(std::vector<float>(x.begin() + (size_t) r * k, x.begin() + (size_t) (r + 1) * k), k);
+        q8rows[r] = quantize_act_row(std::vector<float>(x.begin() + (size_t) r * k, x.begin() + (size_t) (r + 1) * k), k, fn.act_type);
     }
     std::vector<float> s((size_t) nr * nc);
     const double t_legacy = time_it("legacy vec_dot (nr rows)", [&] {
@@ -247,7 +254,7 @@ void perf_type(const kernel_fns & fn, int nc, int k, int nr, int n_iter) {
         });
         printf("  [%s] speedup gemv vs legacy:      %.2fx\n", fn.name, t_legacy / t);
     } else {
-        std::vector<char> q8 = quantize_acts_4x8(x, nr, k);
+        std::vector<char> q8 = quantize_acts_4x8(x, nr, k, fn.act_type);
         const double t = time_it(("repack gemm nr=" + std::to_string(nr)).c_str(), [&] {
             fn.gemm(k, s.data(), nc, rw.data, q8.data(), nr, nc);
         });
@@ -273,6 +280,14 @@ int main(int argc, char ** argv) {
           ggml_gemm_iq1_s_8x8_q8_K, ggml_gemm_iq1_s_8x8_q8_K_generic },
         { GGML_TYPE_IQ1_M, "IQ1_M", ggml_vec_dot_iq1_m_q8_K, ggml_gemv_iq1_m_8x8_q8_K, ggml_gemv_iq1_m_8x8_q8_K_generic,
           ggml_gemm_iq1_m_8x8_q8_K, ggml_gemm_iq1_m_8x8_q8_K_generic },
+        { GGML_TYPE_Q4_0, "Q4_0", ggml_vec_dot_q4_0_q8_0, ggml_gemv_q4_0_8x8_q8_0, ggml_gemv_q4_0_8x8_q8_0_generic,
+          ggml_gemm_q4_0_8x8_q8_0, ggml_gemm_q4_0_8x8_q8_0_generic, GGML_TYPE_Q8_0 },
+        { GGML_TYPE_Q4_K, "Q4_K", ggml_vec_dot_q4_K_q8_K, ggml_gemv_q4_K_8x8_q8_K, ggml_gemv_q4_K_8x8_q8_K_generic,
+          ggml_gemm_q4_K_8x8_q8_K, ggml_gemm_q4_K_8x8_q8_K_generic },
+        { GGML_TYPE_Q6_K, "Q6_K", ggml_vec_dot_q6_K_q8_K, ggml_gemv_q6_K_8x8_q8_K, ggml_gemv_q6_K_8x8_q8_K_generic,
+          ggml_gemm_q6_K_8x8_q8_K, ggml_gemm_q6_K_8x8_q8_K_generic },
+        { GGML_TYPE_MXFP4, "MXFP4", ggml_vec_dot_mxfp4_q8_0, ggml_gemv_mxfp4_8x8_q8_0, ggml_gemv_mxfp4_8x8_q8_0_generic,
+          ggml_gemm_mxfp4_8x8_q8_0, ggml_gemm_mxfp4_8x8_q8_0_generic, GGML_TYPE_Q8_0 },
     };
 
     if (perf) {
