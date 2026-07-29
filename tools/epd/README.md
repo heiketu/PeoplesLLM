@@ -19,6 +19,13 @@
 | `GGML_REMOTE_EP_LAYERS` | 全部 | 远端层范围 `A-B`；范围外的层走本地 |
 | `GGML_REMOTE_EP_DEBUG` | 关 | 置 1 每次 RPC 打印 send/wait 耗时（master）；worker 端置 1 每 REQ 打印 compute 耗时 |
 
+worker 侧另有：
+
+| env | 默认 | 说明 |
+| --- | --- | --- |
+| `GGML_EP_PREFAULT` | 关 | 置 1 启动时预触认领层专家权重的全部 mmap 页（多线程），消除冷专家首次命中时页入造成的多 ms compute 尖峰 |
+| `GGML_EP_PREFAULT_THREADS` | 16 | 预触线程数 |
+
 仅当层为 SILU+gate MoE、无 expert bias/scale、非 warmup 图时走远端；
 不满足时自动回退本地路径。连接懒建立、跨 decode 复用，传输错误自动重连重试一次。
 
