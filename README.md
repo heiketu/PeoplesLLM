@@ -36,6 +36,18 @@ GLM-5.2 745B（UD-Q2_K 量化）：生成 12.0 t/s（EP + GPU 专家卸载）。
 - "—"：这些格式 `gemm_min_nrows=16`，小批量走 gemv，nr=4 的 gemm 生产路径不触发（Q4_K/Q6_K 的 4 行尾块是标量实现，路由刻意避开）
 - 已知观察项：Q2_K gemm nr=4 略亏（0.90×）；Q6_K gemv 0.64× 为主线内核的既有回退，均在待修清单上
 
+### repack 端到端对比（DeepSeek-V4 284B，纯 CPU）
+
+同一 llama-bench 配置（NUMA-EP + mirror、72 线程、fa=1、batch 4096/ubatch 1024、无 GPU 卸载），`--no-repack` 为本分支给 llama-bench 补的开关：
+
+| 配置 | pp512 (t/s) | tg128 (t/s) |
+|---|---|---|
+| repack 开（默认） | **114.33** | 17.34 |
+| repack 关 | 97.17 | **17.66** |
+
+- PP **+17.7%**：端到端增幅小于内核微基准（2.4~4×），因为注意力等非矩阵乘开销占比大
+- TG **-1.8%**：单 token 受内存带宽封顶，repack gemv 略慢于 legacy vec_dot（与微基准一致）；不跑长 prompt、只追求极限 TG 时可 `--no-repack`
+
 ## 核心技术
 
 - **NUMA 镜像**：非专家权重 + KV 双节点复制，线程绑核，UPI 流量归零

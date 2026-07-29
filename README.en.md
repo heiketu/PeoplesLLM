@@ -36,6 +36,18 @@ Single thread, nc=2048 k=4096, measured on Ice Lake 8360Y (reproduce: `tests/tes
 - "—": these formats use `gemm_min_nrows=16`, so small batches route to gemv and nr=4 gemm is never hit in production (the Q4_K/Q6_K 4-row tail blocks are scalar — the router deliberately avoids them)
 - Known items: Q2_K gemm nr=4 is a slight loss (0.90×); Q6_K gemv 0.64× is a pre-existing upstream regression — both on the fix list
 
+### repack end-to-end comparison (DeepSeek-V4 284B, CPU-only)
+
+Identical llama-bench config (NUMA-EP + mirror, 72 threads, fa=1, batch 4096/ubatch 1024, no GPU offload); `--no-repack` is a switch this fork adds to llama-bench:
+
+| Config | pp512 (t/s) | tg128 (t/s) |
+|---|---|---|
+| repack on (default) | **114.33** | 17.34 |
+| repack off | 97.17 | **17.66** |
+
+- PP **+17.7%**: the end-to-end gain is smaller than the kernel microbenchmark (2.4–4×) because attention and other non-matmul work dominates
+- TG **-1.8%**: single-token decode is bandwidth-bound and repack gemv is slightly slower than legacy vec_dot (matches the microbenchmark); if you never run long prompts and only chase peak TG, use `--no-repack`
+
 ## What's inside
 
 - **NUMA mirror**: duplicate non-expert weights + KV per socket, pin threads per node — zero UPI traffic
