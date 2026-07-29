@@ -2013,25 +2013,40 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     // remote expert-parallel dispatch (GGML_REMOTE_EP=1): ship the activations of this
     // layer to an EPD worker (tools/epd/llama-epd) and block on the merged expert output.
-    // warmup graphs keep the local path (there n_expert_used == n_expert, which would
-    // flood the worker), as do layouts whose math the worker does not implement.
-    if (!cparams.warmup && n_tokens > 0 && !weight_before_ffn && type_op == LLM_FFN_SILU &&
-        (gate_exps != nullptr || gate_up_exps != nullptr) &&
-        up_exps_b == nullptr && gate_exps_b == nullptr && down_exps_b == nullptr && gate_up_exps_b == nullptr &&
-        up_exps_s == nullptr && gate_exps_s == nullptr && down_exps_s == nullptr &&
-        llama_remote_ep_enabled_for_layer(il)) {
+    //
+    // when the loader skipped this layer's expert weights (they live on the worker), all
+    // expert tensors are null here and the remote path is mandatory. warmup graphs take a
+    // zero shortcut instead: there n_expert_used == n_expert, which would flood the worker.
+    const bool exps_absent = gate_exps == nullptr && gate_up_exps == nullptr && down_exps == nullptr;
 
-        cur              = ggml_cont(ctx0, cur);
-        selected_experts = ggml_cont(ctx0, selected_experts);
-        weights          = ggml_cont(ctx0, weights);
+    if (exps_absent || llama_remote_ep_enabled_for_layer(il)) {
+        const bool remote_ok = n_tokens > 0 && !weight_before_ffn && type_op == LLM_FFN_SILU &&
+            up_exps_b == nullptr && gate_exps_b == nullptr && down_exps_b == nullptr && gate_up_exps_b == nullptr &&
+            up_exps_s == nullptr && gate_exps_s == nullptr && down_exps_s == nullptr;
 
-        ggml_tensor * moe_out = ggml_map_custom3(ctx0, cur, selected_experts, weights,
-                llama_remote_ep_graph_cb, 1, (void *) (intptr_t) il);
-        cb(moe_out, "ffn_moe_out", il);
+        if (!remote_ok) {
+            if (exps_absent) {
+                GGML_ABORT("remote EP: layer %d has no local expert weights and its MoE flavor is not supported by the EPD worker", il);
+            }
+            // weights are local and the flavor is unsupported: fall through to the local path
+        } else if (cparams.warmup) {
+            // emit a zero output of the right shape; the warmup batch is garbage anyway
+            return ggml_reshape_2d(ctx0, ggml_scale(ctx0, cur, 0.0f), n_embd, n_tokens);
+        } else if (!llama_remote_ep_enabled_for_layer(il)) {
+            GGML_ABORT("remote EP: expert weights of layer %d were skipped at load (GGML_REMOTE_EP_LAYERS) but the layer is not dispatched remotely", il);
+        } else {
+            cur              = ggml_cont(ctx0, cur);
+            selected_experts = ggml_cont(ctx0, selected_experts);
+            weights          = ggml_cont(ctx0, weights);
 
-        ggml_build_forward_expand(gf, moe_out);
+            ggml_tensor * moe_out = ggml_map_custom3(ctx0, cur, selected_experts, weights,
+                    llama_remote_ep_graph_cb, 1, (void *) (intptr_t) il);
+            cb(moe_out, "ffn_moe_out", il);
 
-        return ggml_reshape_2d(ctx0, moe_out, n_embd, n_tokens);
+            ggml_build_forward_expand(gf, moe_out);
+
+            return ggml_reshape_2d(ctx0, moe_out, n_embd, n_tokens);
+        }
     }
 
     if (weight_before_ffn) {
