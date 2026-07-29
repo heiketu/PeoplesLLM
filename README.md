@@ -29,6 +29,8 @@ GLM-5.2 (UD-Q2_K, 236GB GGUF)：TG 12.0 t/s（EP + GPU 专家卸载）。
 
 早期开发阶段。`main` 分支 = 生产可用；跨机 EP 传输层（`tools/epd`）已就绪，master 集成进行中。
 
+**完整改动清单见 [docs/CHANGES.md](docs/CHANGES.md)**（NUMA 体系、CPU 内核格式支持、融合算子、环境变量速查）。
+
 跟踪主线：基于 llama.cpp `e8f19cc0a` (2026-07-16)，vendor 分支保留 base，定期 merge。
 
 ## License
