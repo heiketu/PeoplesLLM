@@ -7,7 +7,7 @@
 // output. No attention, no router: the master sends expert ids + weights.
 //
 // Modes:
-//   llama-epd -m model.gguf --port 29200 --layers 3-42 [--experts 0-255] [--threads N] [--no-autotune]
+//   llama-epd -m model.gguf --port 29200 --layers 3-42 [--experts 0-255] [--threads N] [--no-autotune] [--no-mmap]
 //   llama-epd -m model.gguf --selftest [--selftest-layer N]   # local vs loopback diff
 //
 // Without -t the worker autotunes the compute thread count at startup (after the
@@ -15,6 +15,12 @@
 // representative owned layers over a {16,24,32,48,physical cores} ladder and picks
 // the knee point (smallest count with < 3% marginal gain). Disable with
 // --no-autotune or GGML_EPD_AUTOTUNE=0.
+//
+// --no-mmap replaces the default read-only MAP_SHARED mapping with a one-time
+// sequential pread of the owned layers' expert weights into anonymous memory:
+// slow start (full read), RSS = owned weights permanently resident, zero page-in
+// stalls, immune to page-cache eviction (slow-disk setups where mmap page-in
+// dominates). GGML_EP_PREFAULT is skipped (meaningless) when --no-mmap is on.
 
 #include "llama-ep-transport.h"
 
@@ -104,7 +110,13 @@ struct ep_shard {
 
     const char * data_base = nullptr;
 
+    // --no-mmap: per-tensor anonymous buffers holding this shard's owned weights
+    std::vector<void *> load_bufs;
+
     ~ep_shard() {
+        for (void * p : load_bufs) {
+            free(p);
+        }
         if (mmap_base && mmap_base != MAP_FAILED) {
             munmap(mmap_base, mmap_size);
         }
@@ -122,6 +134,9 @@ struct ep_model {
 
     std::map<std::string, ggml_tensor *> tensors; // name -> tensor (any shard)
 
+    // --no-mmap: name -> (shard, absolute file offset of tensor data)
+    std::map<std::string, std::pair<ep_shard *, uint64_t>> tensor_src;
+
     std::string arch;
     int n_layer = 0;
 
@@ -137,8 +152,10 @@ static bool gguf_get_str(gguf_context * g, const char * key, std::string & out) 
     return true;
 }
 
-// open + mmap one split and register all of its tensors
-static bool ep_shard_load(ep_model & m, const char * path) {
+// open one split and register all of its tensors; mmap mode points tensor data
+// into a read-only shared mapping, no-mmap mode records file offsets for the
+// post-claiming bulk read (ep_nommap_load_weights)
+static bool ep_shard_load(ep_model & m, const char * path, bool no_mmap) {
     std::unique_ptr<ep_shard> sh(new ep_shard);
 
     gguf_init_params iparams = {/*.no_alloc =*/ true, /*.ctx =*/ &sh->ctx};
@@ -159,15 +176,19 @@ static bool ep_shard_load(ep_model & m, const char * path) {
         return false;
     }
     sh->mmap_size = (size_t) st.st_size;
-    sh->mmap_base = mmap(nullptr, sh->mmap_size, PROT_READ, MAP_SHARED, sh->fd, 0);
-    if (sh->mmap_base == MAP_FAILED) {
-        LOG("llama-epd: mmap: %s\n", strerror(errno));
-        sh->mmap_base = nullptr;
-        return false;
-    }
-    // lazy page-in: the worker only touches the experts it is asked for
-    sh->data_base = (const char *) sh->mmap_base + gguf_get_data_offset(sh->gguf);
 
+    if (!no_mmap) {
+        sh->mmap_base = mmap(nullptr, sh->mmap_size, PROT_READ, MAP_SHARED, sh->fd, 0);
+        if (sh->mmap_base == MAP_FAILED) {
+            LOG("llama-epd: mmap: %s\n", strerror(errno));
+            sh->mmap_base = nullptr;
+            return false;
+        }
+        // lazy page-in: the worker only touches the experts it is asked for
+        sh->data_base = (const char *) sh->mmap_base + gguf_get_data_offset(sh->gguf);
+    }
+
+    const uint64_t data_off = gguf_get_data_offset(sh->gguf);
     const int64_t n_tensors = gguf_get_n_tensors(sh->gguf);
     for (int64_t tid = 0; tid < n_tensors; ++tid) {
         const char * name = gguf_get_tensor_name(sh->gguf, tid);
@@ -176,16 +197,81 @@ static bool ep_shard_load(ep_model & m, const char * path) {
             LOG("llama-epd: tensor %s in gguf but not in ctx (%s)\n", name, path);
             return false;
         }
-        t->data = const_cast<char *>(sh->data_base + gguf_get_tensor_offset(sh->gguf, tid));
+        if (no_mmap) {
+            // data stays nullptr until the owned tensors are read in after layer claiming
+            m.tensor_src.emplace(name, std::make_pair(sh.get(), data_off + gguf_get_tensor_offset(sh->gguf, tid)));
+        } else {
+            t->data = const_cast<char *>(sh->data_base + gguf_get_tensor_offset(sh->gguf, tid));
+        }
         if (!m.tensors.emplace(name, t).second) {
             LOG("llama-epd: duplicate tensor name %s across splits\n", name);
             return false;
         }
     }
-    LOG("llama-epd: split %s: %lld tensors, %.2f GiB mapped\n",
-        path, (long long) n_tensors, sh->mmap_size / 1073741824.0);
+    LOG("llama-epd: split %s: %lld tensors, %.2f GiB %s\n",
+        path, (long long) n_tensors, sh->mmap_size / 1073741824.0,
+        no_mmap ? "to be read (--no-mmap)" : "mapped");
 
     m.shards.push_back(std::move(sh));
+    return true;
+}
+
+// --no-mmap: read every owned tensor's byte range into an anonymous buffer
+// (sequential pread per tensor; tensors are stored in file order, so the sweep
+// is near-sequential). Unlike mmap the pages cannot be evicted or re-faulted.
+static bool ep_nommap_load_weights(ep_model & m) {
+    size_t total = 0;
+    for (const auto & kv : m.layers) {
+        for (const ggml_tensor * t : {kv.second.gate_up, kv.second.gate, kv.second.up, kv.second.down}) {
+            if (t) {
+                total += ggml_nbytes(t);
+            }
+        }
+    }
+    LOG("llama-epd: no-mmap: reading %.2f GiB of owned expert weights into anonymous memory\n",
+        total / 1073741824.0);
+    const int64_t t0 = ggml_time_us();
+
+    for (const auto & kv : m.layers) {
+        for (ggml_tensor * t : {kv.second.gate_up, kv.second.gate, kv.second.up, kv.second.down}) {
+            if (!t) {
+                continue;
+            }
+            auto it = m.tensor_src.find(t->name);
+            if (it == m.tensor_src.end()) {
+                LOG("llama-epd: no-mmap: no source for tensor %s\n", t->name);
+                return false;
+            }
+            ep_shard * sh = it->second.first;
+            const uint64_t off = it->second.second;
+            if (off % 32 != 0) {
+                LOG("llama-epd: no-mmap: tensor %s file offset %llu not 32-byte aligned\n",
+                    t->name, (unsigned long long) off);
+                return false;
+            }
+            const size_t n = ggml_nbytes(t);
+            void * buf = nullptr;
+            if (posix_memalign(&buf, 64, n) != 0) {
+                LOG("llama-epd: no-mmap: posix_memalign %.2f GiB failed\n", n / 1073741824.0);
+                return false;
+            }
+            size_t done = 0;
+            while (done < n) {
+                const ssize_t r = pread(sh->fd, (char *) buf + done, std::min<size_t>(n - done, 32 << 20), off + done);
+                if (r <= 0) {
+                    LOG("llama-epd: no-mmap: pread %s: %s\n", t->name, r == 0 ? "unexpected EOF" : strerror(errno));
+                    free(buf);
+                    return false;
+                }
+                done += (size_t) r;
+            }
+            t->data = buf;
+            sh->load_bufs.push_back(buf);
+        }
+    }
+
+    LOG("llama-epd: no-mmap: done in %.1f s (%.2f GB/s)\n",
+        (ggml_time_us() - t0) / 1e6, total / 1073741824.0 / ((ggml_time_us() - t0) / 1e6));
     return true;
 }
 
@@ -195,9 +281,9 @@ static ggml_tensor * ep_get_tensor(ep_model & m, const char * name) {
     return it == m.tensors.end() ? nullptr : it->second;
 }
 
-static bool ep_model_load(ep_model & m, const char * path, int layer_first, int layer_last) {
+static bool ep_model_load(ep_model & m, const char * path, int layer_first, int layer_last, bool no_mmap) {
     // first split (or the only file)
-    if (!ep_shard_load(m, path)) {
+    if (!ep_shard_load(m, path, no_mmap)) {
         return false;
     }
 
@@ -225,7 +311,7 @@ static bool ep_model_load(ep_model & m, const char * path, int layer_first, int 
                     LOG("llama-epd: failed to build split path %d/%d\n", idx, n_split);
                     return false;
                 }
-                if (!ep_shard_load(m, spath)) {
+                if (!ep_shard_load(m, spath, no_mmap)) {
                     return false;
                 }
             }
@@ -323,6 +409,9 @@ static bool ep_model_load(ep_model & m, const char * path, int layer_first, int 
 
     if (m.layers.empty()) {
         LOG("llama-epd: no MoE layers in range %d-%d\n", layer_first, layer_last);
+        return false;
+    }
+    if (no_mmap && !ep_nommap_load_weights(m)) {
         return false;
     }
     return true;
@@ -963,6 +1052,8 @@ static void ep_usage(const char * argv0) {
         "  --experts A-B          owned expert range, half-open [A,B) (default: all)\n"
         "  -t, --threads N        compute threads (default: startup autotune; 8 if disabled)\n"
         "  --no-autotune          disable startup thread autotune (also GGML_EPD_AUTOTUNE=0)\n"
+        "  --no-mmap              read owned expert weights into anonymous memory at startup\n"
+        "                         (slow start, RSS = owned weights resident, no page-in ever)\n"
         "  --selftest             local vs loopback numerical check, then exit\n"
         "  --selftest-layer N     layer for selftest (default: first owned MoE layer)\n"
         "  --selftest-tokens N    tokens for selftest (default 4)\n"
@@ -994,6 +1085,7 @@ int main(int argc, char ** argv) {
     bool have_layers = false;
     bool threads_set = false;
     bool autotune = ep_autotune_enabled();
+    bool no_mmap = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -1027,6 +1119,8 @@ int main(int argc, char ** argv) {
             threads_set = true;
         } else if (a == "--no-autotune") {
             autotune = false;
+        } else if (a == "--no-mmap") {
+            no_mmap = true;
         } else if (a == "--selftest") {
             selftest = true;
         } else if (a == "--selftest-layer") {
@@ -1055,7 +1149,7 @@ int main(int argc, char ** argv) {
     ggml_backend_load_all(); // no-op for static builds, keeps dl builds working
 
     ep_model m;
-    if (!ep_model_load(m, model_path.c_str(), cfg.layer_first, cfg.layer_last)) {
+    if (!ep_model_load(m, model_path.c_str(), cfg.layer_first, cfg.layer_last, no_mmap)) {
         return 1;
     }
     LOG("llama-epd: arch=%s n_layer=%d, owning %zu MoE layers, experts [%d, %s)\n",
@@ -1067,7 +1161,11 @@ int main(int argc, char ** argv) {
     }
 
     if (ep_prefault_enabled()) {
-        ep_prefault_weights(m);
+        if (no_mmap) {
+            LOG("llama-epd: prefault skipped (--no-mmap: weights already fully resident)\n");
+        } else {
+            ep_prefault_weights(m);
+        }
     }
 
     ggml_backend_t backend = ggml_backend_cpu_init();
