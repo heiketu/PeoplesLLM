@@ -12,6 +12,8 @@
 
 #include "llama-ep-transport.h"
 
+#include "llama.h"
+
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -24,6 +26,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -37,6 +40,11 @@
 
 // ---------------------------------------------------------------------------
 // model (gguf metadata + read-only mmap, tensors point into the mapping)
+//
+// multi-split GGUF: each split's metadata lists only its own tensors (the first
+// split may have none at all). every split is opened + mmap'd; tensors are
+// registered in a global name -> tensor map with data pointing into the split's
+// mapping. pages are only faulted in for the experts actually requested.
 // ---------------------------------------------------------------------------
 
 struct ep_layer {
@@ -57,20 +65,17 @@ struct ep_layer {
     float clamp = 0.0f; // swiglu_clamp_exp[il], 0 = disabled
 };
 
-struct ep_model {
-    gguf_context   * gguf = nullptr;
-    ggml_context   * ctx  = nullptr; // weight tensors (data -> mmap)
+struct ep_shard {
+    gguf_context * gguf = nullptr;
+    ggml_context * ctx  = nullptr; // weight tensors (data -> this shard's mmap); freed by gguf_free
 
     int    fd        = -1;
     void * mmap_base = nullptr;
     size_t mmap_size = 0;
 
-    std::string arch;
-    int n_layer = 0;
+    const char * data_base = nullptr;
 
-    std::map<int, ep_layer> layers; // owned MoE layers
-
-    ~ep_model() {
+    ~ep_shard() {
         if (mmap_base && mmap_base != MAP_FAILED) {
             munmap(mmap_base, mmap_size);
         }
@@ -83,6 +88,17 @@ struct ep_model {
     }
 };
 
+struct ep_model {
+    std::vector<std::unique_ptr<ep_shard>> shards;
+
+    std::map<std::string, ggml_tensor *> tensors; // name -> tensor (any shard)
+
+    std::string arch;
+    int n_layer = 0;
+
+    std::map<int, ep_layer> layers; // owned MoE layers
+};
+
 static bool gguf_get_str(gguf_context * g, const char * key, std::string & out) {
     int64_t id = gguf_find_key(g, key);
     if (id < 0) {
@@ -92,82 +108,133 @@ static bool gguf_get_str(gguf_context * g, const char * key, std::string & out) 
     return true;
 }
 
-// probe one tensor name and point it into the mmap; returns nullptr if absent
-static ggml_tensor * ep_get_tensor(ep_model & m, const char * data_base, const char * name) {
-    int64_t tid = gguf_find_tensor(m.gguf, name);
-    if (tid < 0) {
-        return nullptr;
-    }
-    ggml_tensor * t = ggml_get_tensor(m.ctx, gguf_get_tensor_name(m.gguf, tid));
-    if (!t) {
-        LOG("llama-epd: tensor %s in gguf but not in ctx\n", name);
-        return nullptr;
-    }
-    t->data = const_cast<char *>(data_base + gguf_get_tensor_offset(m.gguf, tid));
-    return t;
-}
+// open + mmap one split and register all of its tensors
+static bool ep_shard_load(ep_model & m, const char * path) {
+    std::unique_ptr<ep_shard> sh(new ep_shard);
 
-static bool ep_model_load(ep_model & m, const char * path, int layer_first, int layer_last) {
-    gguf_init_params iparams = {/*.no_alloc =*/ true, /*.ctx =*/ &m.ctx};
-    m.gguf = gguf_init_from_file(path, iparams);
-    if (!m.gguf) {
+    gguf_init_params iparams = {/*.no_alloc =*/ true, /*.ctx =*/ &sh->ctx};
+    sh->gguf = gguf_init_from_file(path, iparams);
+    if (!sh->gguf) {
         LOG("llama-epd: failed to read gguf header from %s\n", path);
         return false;
     }
 
-    if (!gguf_get_str(m.gguf, "general.architecture", m.arch)) {
+    sh->fd = ::open(path, O_RDONLY);
+    if (sh->fd < 0) {
+        LOG("llama-epd: open %s: %s\n", path, strerror(errno));
+        return false;
+    }
+    struct stat st;
+    if (fstat(sh->fd, &st) != 0) {
+        LOG("llama-epd: fstat: %s\n", strerror(errno));
+        return false;
+    }
+    sh->mmap_size = (size_t) st.st_size;
+    sh->mmap_base = mmap(nullptr, sh->mmap_size, PROT_READ, MAP_SHARED, sh->fd, 0);
+    if (sh->mmap_base == MAP_FAILED) {
+        LOG("llama-epd: mmap: %s\n", strerror(errno));
+        sh->mmap_base = nullptr;
+        return false;
+    }
+    // lazy page-in: the worker only touches the experts it is asked for
+    sh->data_base = (const char *) sh->mmap_base + gguf_get_data_offset(sh->gguf);
+
+    const int64_t n_tensors = gguf_get_n_tensors(sh->gguf);
+    for (int64_t tid = 0; tid < n_tensors; ++tid) {
+        const char * name = gguf_get_tensor_name(sh->gguf, tid);
+        ggml_tensor * t = ggml_get_tensor(sh->ctx, name);
+        if (!t) {
+            LOG("llama-epd: tensor %s in gguf but not in ctx (%s)\n", name, path);
+            return false;
+        }
+        t->data = const_cast<char *>(sh->data_base + gguf_get_tensor_offset(sh->gguf, tid));
+        if (!m.tensors.emplace(name, t).second) {
+            LOG("llama-epd: duplicate tensor name %s across splits\n", name);
+            return false;
+        }
+    }
+    LOG("llama-epd: split %s: %lld tensors, %.2f GiB mapped\n",
+        path, (long long) n_tensors, sh->mmap_size / 1073741824.0);
+
+    m.shards.push_back(std::move(sh));
+    return true;
+}
+
+// probe one tensor name in the global map; returns nullptr if absent
+static ggml_tensor * ep_get_tensor(ep_model & m, const char * name) {
+    auto it = m.tensors.find(name);
+    return it == m.tensors.end() ? nullptr : it->second;
+}
+
+static bool ep_model_load(ep_model & m, const char * path, int layer_first, int layer_last) {
+    // first split (or the only file)
+    if (!ep_shard_load(m, path)) {
+        return false;
+    }
+
+    gguf_context * g0 = m.shards[0]->gguf;
+
+    // discover additional splits via split.count / split.no (must load from the first split)
+    {
+        int64_t id = gguf_find_key(g0, "split.count");
+        const uint16_t n_split = id >= 0 ? gguf_get_val_u16(g0, id) : 1;
+        if (n_split > 1) {
+            id = gguf_find_key(g0, "split.no");
+            const uint16_t split_no = id >= 0 ? gguf_get_val_u16(g0, id) : 0;
+            if (split_no != 0) {
+                LOG("llama-epd: model must be loaded with the first split (got split.no = %d)\n", split_no);
+                return false;
+            }
+            char prefix[4096];
+            if (llama_split_prefix(prefix, sizeof(prefix), path, split_no, n_split) <= 0) {
+                LOG("llama-epd: invalid split file name: %s\n", path);
+                return false;
+            }
+            for (int idx = 1; idx < n_split; ++idx) {
+                char spath[4096];
+                if (llama_split_path(spath, sizeof(spath), prefix, idx, n_split) <= 0) {
+                    LOG("llama-epd: failed to build split path %d/%d\n", idx, n_split);
+                    return false;
+                }
+                if (!ep_shard_load(m, spath)) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    if (!gguf_get_str(g0, "general.architecture", m.arch)) {
         LOG("llama-epd: missing general.architecture\n");
         return false;
     }
 
     {
         std::string key = m.arch + ".block_count";
-        int64_t id = gguf_find_key(m.gguf, key.c_str());
+        int64_t id = gguf_find_key(g0, key.c_str());
         if (id < 0) {
             LOG("llama-epd: missing %s\n", key.c_str());
             return false;
         }
-        m.n_layer = (int) gguf_get_val_u32(m.gguf, id);
+        m.n_layer = (int) gguf_get_val_u32(g0, id);
     }
 
     // optional per-layer swiglu clamp (deepseek4)
     std::vector<float> clamps((size_t) m.n_layer, 0.0f);
     {
         std::string key = m.arch + ".swiglu_clamp_exp";
-        int64_t id = gguf_find_key(m.gguf, key.c_str());
+        int64_t id = gguf_find_key(g0, key.c_str());
         if (id >= 0) {
-            if (gguf_get_arr_type(m.gguf, id) != GGUF_TYPE_FLOAT32) {
+            if (gguf_get_arr_type(g0, id) != GGUF_TYPE_FLOAT32) {
                 LOG("llama-epd: %s has unexpected type\n", key.c_str());
                 return false;
             }
-            size_t n = gguf_get_arr_n(m.gguf, id);
-            const float * v = (const float *) gguf_get_arr_data(m.gguf, id);
+            size_t n = gguf_get_arr_n(g0, id);
+            const float * v = (const float *) gguf_get_arr_data(g0, id);
             for (size_t i = 0; i < n && i < clamps.size(); ++i) {
                 clamps[i] = v[i];
             }
         }
     }
-
-    m.fd = ::open(path, O_RDONLY);
-    if (m.fd < 0) {
-        LOG("llama-epd: open %s: %s\n", path, strerror(errno));
-        return false;
-    }
-    struct stat st;
-    if (fstat(m.fd, &st) != 0) {
-        LOG("llama-epd: fstat: %s\n", strerror(errno));
-        return false;
-    }
-    m.mmap_size = (size_t) st.st_size;
-    m.mmap_base = mmap(nullptr, m.mmap_size, PROT_READ, MAP_SHARED, m.fd, 0);
-    if (m.mmap_base == MAP_FAILED) {
-        LOG("llama-epd: mmap: %s\n", strerror(errno));
-        m.mmap_base = nullptr;
-        return false;
-    }
-    // lazy page-in: the worker only touches the experts it is asked for
-
-    const char * data_base = (const char *) m.mmap_base + gguf_get_data_offset(m.gguf);
 
     char name[128];
     for (int il = layer_first; il <= layer_last && il < m.n_layer; ++il) {
@@ -175,15 +242,15 @@ static bool ep_model_load(ep_model & m, const char * path, int layer_first, int 
         L.il = il;
 
         snprintf(name, sizeof(name), "blk.%d.ffn_gate_up_exps.weight", il);
-        L.gate_up = ep_get_tensor(m, data_base, name);
+        L.gate_up = ep_get_tensor(m, name);
         if (!L.gate_up) {
             snprintf(name, sizeof(name), "blk.%d.ffn_gate_exps.weight", il);
-            L.gate = ep_get_tensor(m, data_base, name);
+            L.gate = ep_get_tensor(m, name);
             snprintf(name, sizeof(name), "blk.%d.ffn_up_exps.weight", il);
-            L.up = ep_get_tensor(m, data_base, name);
+            L.up = ep_get_tensor(m, name);
         }
         snprintf(name, sizeof(name), "blk.%d.ffn_down_exps.weight", il);
-        L.down = ep_get_tensor(m, data_base, name);
+        L.down = ep_get_tensor(m, name);
 
         const bool has_ffn = L.gate_up || (L.gate && L.up);
         if (!has_ffn && !L.down) {
@@ -211,7 +278,7 @@ static bool ep_model_load(ep_model & m, const char * path, int layer_first, int 
 
         // expert biases are not expected for supported archs; refuse rather than compute wrong math
         snprintf(name, sizeof(name), "blk.%d.ffn_down_exps.bias", il);
-        if (gguf_find_tensor(m.gguf, name) >= 0) {
+        if (ep_get_tensor(m, name) != nullptr) {
             LOG("llama-epd: layer %d: expert biases not supported\n", il);
             return false;
         }
