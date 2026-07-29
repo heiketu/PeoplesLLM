@@ -28,6 +28,12 @@ worker 侧另有：
 | `GGML_EP_PREFAULT_THREADS` | 16 | 预触线程数 |
 | `GGML_EPD_AUTOTUNE` | 开 | 置 0 关闭启动线程自动标定（同 `--no-autotune`） |
 
+worker 选项 `--no-mmap`：启动时把**认领层**的专家权重按张量一次性顺序 pread 进匿名内存
+（per-tensor posix_memalign，64B 对齐校验），张量指向该缓冲区，进程退出时 free。行为：启动慢
+（冷缓存全量读 15.75 GiB ~11s），运行时 RSS=认领权重全量常驻、**零页入、免疫页缓存驱逐**——
+解决慢盘（exFAT U盘实测 9.5-27MB/s）下 mmap 完全不可用、以及 mmap 页被回收再页入的风险。
+`GGML_EP_PREFAULT=1` 与 `--no-mmap` 同开时 prefault 跳过并打日志（已无意义）。默认 mmap 不变。
+
 ## 启动线程自动标定（autotune）
 
 **仅当未显式传 `-t` 时生效**（显式 `-t` 行为完全不变）。模型映射 + 层认领 + prefault 之后、
@@ -156,7 +162,24 @@ n_tokens=1/top-6，2 warmup + 5 轮中位，总耗时 <0.1s）：
 | 显式 -t 48（覆盖生效，日志直接 48 线程不标定） | 同上，逐 bit 一致 | 0.381ms（n=50） |
 
 `--no-autotune` 与 `GGML_EPD_AUTOTUNE=0` 均打 `autotune disabled, using 8 threads` 并以 8 线程
-listen；`--selftest` PASS（max_abs_diff=0）。双机 master 对拍待补（本机被 GLM-5.2 服务占用）。
+listen；`--selftest` PASS（max_abs_diff=0）。
+
+## --no-mmap 双机实测（2026-07-30，slave 35-42 冷缓存，xcache drop 后 mincore 0.0%，不开 prefault）
+
+同会话两轮（master build-epdev-autotune llama-server 生产配置，slave build-cpu-autotune）：
+
+| worker 配置 | 启动 | VmRSS | 每 REQ compute 中位/p90 | >2ms 尖峰 | TG512 |
+| --- | --- | --- | --- | --- | --- |
+| `--no-mmap` + autotune（选中 48） | 读 15.75 GiB / 11.3s（1.40 GB/s 冷 NVMe） | **15.78 GiB 常驻** | 0.719 / 0.997 ms | **89/5032（1.8%，avg 3.3ms / max 7.5）** | 25.34 t/s |
+| mmap 默认 + `-t 72` | 秒启 | 0.02 GiB（懒分页） | 0.553 / 4.606 ms | **618/5032（12.3%，前 500 REQ 59%、avg 10.3ms / max 58.6）** | 24.91 t/s |
+
+结论：mmap 冷缓存尖峰是典型页入模式（首轮 59% 尖峰、max 58.6ms，长尾贯穿全程——冷专家
+持续页入）；`--no-mmap` 把尖峰压到 prefault 热态同级（~1-2%、幅度 3-8ms 的 barrier jitter
+地板），且全程无页入型长尾（p90 0.997 vs 4.606ms）。正确性：两轮 gen1/gen2（temp 0/seed 42，
+英文 48 + 中文 64 token）与基线 /tmp/dsv4-base-gen{1,2}.json **逐字 MATCH**，两轮 gen512
+互比 MATCH；`--no-mmap --selftest` PASS 且 |out|=36.206464 与 mmap 逐 bit 一致。
+注：N1 autotune 选中 48（48→72 边际 2.4% < 3%，与上轮选中 72 属 knee 边界噪声，均在 [32,72]
+合理区间）。
 
 ## RDMA（RoCEv2）传输后端实测（2026-07-30，slave 35-42，worker -t 72 + prefault=1）
 
