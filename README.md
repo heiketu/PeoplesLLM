@@ -1,5 +1,7 @@
 # PeoplesLLM
 
+> **[English README →](README.en.md)**
+
 **让超大 MoE 模型在本地廉价硬件上跑起来。** llama.cpp 特化分支，专注：双路 CPU + 消费级 GPU 上的 200G ~ 3T 级 MoE 推理。
 
 Run giant MoE models (200GB – 3TB) locally on cheap hardware: dual-socket CPUs + consumer GPUs. A specialized llama.cpp fork.
