@@ -4,6 +4,14 @@
 
 **让超大 MoE 模型在本地廉价硬件上跑起来。** llama.cpp 特化分支，专注：双路乃至多路 CPU + 消费级 GPU 上的 200B ~ 3T 参数级 MoE 推理。
 
+## 前情提要
+
+作者是硬件方向出身，大学里只教过简单的 C、Python 和嵌入式汇编，对本地跑大模型一直有两点不满：**速度慢、门槛高**。于是选择使用 Kimi K3 配合 Kimi Code CLI 进行本项目调优。
+
+本人只对技术概念进行指定——EP（专家并行）、GEMM 内核、指令集优化（AVX512/VNNI/VBMI）、NUMA 优化等——其余设计、编码、测试、调参**全部由 AI 完成**。因此代码可读性可能不佳，且可能存在潜在 BUG。本人目前只对**个人平台**（双路 Xeon 8360Y + 2× RTX 3090）上的运行负责。
+
+目前主要调优对象：**GLM-5.2** 与 **DeepSeek-V4**。有问题欢迎提 issue。
+
 ## 实测数据
 
 DeepSeek-V4 284B（Q3_K 量化），双路 Xeon 8360Y（Ice Lake）+ 2× RTX 3090：
@@ -87,6 +95,6 @@ NUMA-EP + mirror、72 线程、fa=1、batch 4096/ubatch 1024；`--no-repack` 为
 
 主线跟踪：基于 llama.cpp `e8f19cc0a`（2026-07-16），`vendor` 分支保留基线，定期合并。
 
-## 许可证
+## 许可证与版权
 
-MIT（与上游 llama.cpp 一致）
+本项目是 [llama.cpp](https://github.com/ggml-org/llama.cpp) 的分支。**原项目版权归 ggml-org 及 llama.cpp 全体贡献者所有**，采用 MIT 许可证发布。本分支的全部改动同样以 MIT 许可证发布，并保留原项目的版权声明与许可证全文（见 [LICENSE](LICENSE)）。

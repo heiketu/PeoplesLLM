@@ -4,6 +4,14 @@
 
 **Run giant MoE models locally on cheap hardware.** A specialized llama.cpp fork focused on 200B – 3T-parameter-class MoE inference on dual-socket or more CPUs + consumer GPUs.
 
+## Background
+
+The author comes from a hardware background — university courses covered only basic C, Python, and embedded assembly — and has long been unhappy with two things about running LLMs locally: **slow speed and a high barrier to entry**. This project was therefore tuned using Kimi K3 together with Kimi Code CLI.
+
+The author only specified the technical concepts — EP (expert parallelism), GEMM kernels, instruction-set optimization (AVX512/VNNI/VBMI), NUMA optimization, and the like. Everything else — design, coding, testing, and tuning — was **done entirely by AI**. As a result, code readability may be poor and latent bugs may exist. The author takes responsibility only for running on their **own platform** (dual Xeon 8360Y + 2× RTX 3090).
+
+Current tuning targets: **GLM-5.2** and **DeepSeek-V4**. Issues are welcome.
+
 ## Benchmarks
 
 DeepSeek-V4 284B (Q3_K quant), dual Xeon 8360Y (Ice Lake) + 2× RTX 3090:
@@ -87,6 +95,6 @@ Early development. `main` branch = production-ready; cross-machine EP transport 
 
 Upstream tracking: based on llama.cpp `e8f19cc0a` (2026-07-16); `vendor` branch holds the base, merged regularly.
 
-## License
+## License & Copyright
 
-MIT (same as upstream llama.cpp)
+This project is a fork of [llama.cpp](https://github.com/ggml-org/llama.cpp). **The original project is copyrighted by ggml-org and the llama.cpp contributors** and released under the MIT License. All modifications in this fork are likewise released under the MIT License, with the original copyright and license notices retained (see [LICENSE](LICENSE)).
