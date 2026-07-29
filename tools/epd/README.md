@@ -89,7 +89,36 @@ barrier 4.7ms、GPU 段 ~25.8ms）。实测每层耗时：master 本地 ~0.37ms/
 与单机基线均逐字 IDENTICAL。
 可再省 ~3.6ms/token 追平平单机；GPU 段 ~26ms（~60%）才是两端共同的最大阶段。
 
-已知限制：单一 worker 端点；阻塞式收发（无流水线，726 token 中 452 次 RPC 尖峰 >2ms）。
+已知限制：单一 worker 端点；阻塞式收发（无流水线）。修复前冷缓存下 726 token 中 452 次
+RPC 尖峰 >2ms，根因为 slave 冷专家 mmap 磁盘页入；GGML_EP_PREFAULT=1 后尖峰基本消除（见下）。
+
+## GGML_EP_PREFAULT A/B 实测（2026-07-30，slave 35-42）
+
+方法：每轮先 `posix_fadvise(DONTNEED)` 把 slave 模型页缓存降到 0% 再起 worker（mincore 核实），
+on/off 同会话正序+反序复测（on1→off1→off2→on2）。尖峰口径：master ep-debug 按 decode token
+（8 层连续 n_tokens=1）分组，token 内任一层 wait>2ms 记 1 尖峰，共 719 token/轮。
+
+| 配置 | TG96 | TG512 | >2ms 尖峰 | worker compute >2ms | slave RSS |
+| --- | --- | --- | --- | --- | --- |
+| prefault=1（on1/on2） | 24.54 / 25.23 t/s | 24.49 / 24.59 t/s | 1.1% / 0.8%（max 5.0ms） | 1/5752 | 16.5G |
+| prefault=0 冷缓存（off1/off2） | 24.29 / 24.92 t/s | 24.97 / 24.88 t/s | 30.6% / 30.5%（max 19.4ms） | 586/5752 | 10.0G |
+
+结论：尖峰率两种顺序各自一致（无顺序效应），prefault 把 >2ms 尖峰从 ~30% 压到 ~1%，
+残余 ≤5ms；TG 差异在噪声内（尖峰摊薄仅 ~3%，故均值不敏感，尖峰主要影响尾延迟/流式体感）。
+prefault 启动耗时 ~4.5s（16 线程预触 15.75 GiB，slave NVMe ~3.5GB/s），代价是 slave RSS
+从 10.0G 升到 16.5G（认领层权重全量常驻——本来也是稳定态上限）。六轮 gen1/gen2（temp 0 /
+seed 42）与单机基线全部逐字 IDENTICAL。**建议生产开启 GGML_EP_PREFAULT=1**。
+
+worker 线程标定（slave：2 socket × 36 核 × 2 HT = 144 线程，prefault=1）：
+
+| worker -t | 每层 compute 均值 | TG96 | TG512 |
+| --- | --- | --- | --- |
+| 72（=物理核数） | 0.84-1.17ms | 24.54-25.23 t/s | 24.49-24.59 t/s |
+| 136 | ~10.4ms | 21.61 t/s | 6.89 t/s |
+| 128 | ~19.4ms | 5.87 t/s | 4.44 t/s |
+
+超过物理核数后 ggml 线程 barrier 严重劣化（且非单调，128 比 136 更糟），"留 8-16 核给系统"
+在此 workload 下适得其反。**推荐 worker -t 72（=物理核数，不跨 HT），不要降线程也不要超线程**。
 
 ## GLM-5.2 双机实测（commit cbcccef7e，glm-dsa，79层/160专家/top-8，UD-Q2_K_MXFP4 7 分卷 ≈236G）
 
