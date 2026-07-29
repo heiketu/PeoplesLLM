@@ -78,3 +78,17 @@ slave（server2）认领层 3-17（15 层 ≈43.5G 权重）。模型在 exfat U
 
 注：生产单机基线（build-cuda 二进制）TG ~12.0 t/s；build-epdev 基线 10.5 t/s 的差距
 来自构建差异而非 EP 改动（EP 关闭时同一二进制）。双机 TG 约为同二进制单机 mirror 的 93%。
+
+## 层数分配：按内存带宽均衡
+
+decode 时每层每 token 专家字节 `E = top_k × 3 × n_embd × n_ff × bpw/8`（DSV4 ≈48MB/层）。
+两端 CPU 侧耗时相等时最快：`N_slave = N_CPU层数 × B_slave / (B_master + B_slave)`
+（GPU 卸载层先扣除）。
+
+实测带宽（membw，read，整机 interleave）：master 94.5 GB/s，slave 128.2 GB/s
+（node0 本地 93.2 / node1 本地 80.6，不对称）→ slave 应承担约 57.6% 的 CPU 层。
+
+- DSV4（master GPU 已卸 14 层）：当前 slave 21 层 ≈7.9ms/token、master CPU 5 层 ≈2.5ms，
+  slave 是瓶颈；平衡点 slave ~15 层（28-42）+ master CPU 11 层 + GPU 14 层 ≈5.6ms。
+- GLM-5.2（master CPU 53 层 + GPU 8 层，slave 15 层）：瓶颈在 master CPU（耗时比 ≈1:4.8），
+  理论平衡 slave ~38 层；受 slave 125G 内存限制（≈2.5G/层）建议 30-35 层。
