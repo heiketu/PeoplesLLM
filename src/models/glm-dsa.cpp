@@ -125,8 +125,10 @@ void llama_model_glm_dsa::load_arch_tensors(llama_model_loader &) {
 
             // MoE branch
             // remote EP (GGML_REMOTE_EP): expert weights of remote layers live on the
-            // EPD worker — skip them entirely (see deepseek4.cpp / build_moe_ffn hook)
-            const int exps_flags = llama_remote_ep_enabled_for_layer(i) ? TENSOR_SKIP : flags;
+            // EPD worker — skip them unless the layer is mirrored (GGML_REMOTE_EP_MIRROR),
+            // in which case the master keeps a local copy for the slot-split path
+            // (see deepseek4.cpp / build_moe_ffn hook)
+            const int exps_flags = llama_remote_ep_skip_weights_for_layer(i) ? TENSOR_SKIP : flags;
             layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {  n_embd, n_ff_exp, n_expert}, exps_flags);
             layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, exps_flags);
             layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {  n_embd, n_ff_exp, n_expert}, exps_flags);

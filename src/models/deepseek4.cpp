@@ -178,10 +178,11 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader & ml) {
         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, flags);
 
         // remote EP (GGML_REMOTE_EP): the expert weights of remote layers live on the
-        // EPD worker — skip them entirely (no allocation, no read, no NUMA placement).
-        // the graph hook (build_moe_ffn) dispatches these layers remotely and never
-        // dereferences the local expert tensors.
-        const int exps_flags = llama_remote_ep_enabled_for_layer(i) ? TENSOR_SKIP : flags;
+        // EPD worker — skip them (no allocation, no read, no NUMA placement) unless
+        // the layer is mirrored (GGML_REMOTE_EP_MIRROR), in which case the master
+        // keeps a local copy for the expert-slot-split path.
+        // the graph hook (build_moe_ffn) dispatches these layers remotely.
+        const int exps_flags = llama_remote_ep_skip_weights_for_layer(i) ? TENSOR_SKIP : flags;
         layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd,   n_ff_exp, n_expert}, exps_flags);
         layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp, n_embd,   n_expert}, exps_flags);
         layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd,   n_ff_exp, n_expert}, exps_flags);
