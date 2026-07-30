@@ -43,6 +43,7 @@
 #include <iterator>
 #include <map>
 #include <memory>
+#include <numeric>
 #include <set>
 #include <string>
 #include <thread>
@@ -50,8 +51,11 @@
 #include <vector>
 
 #include <fcntl.h>
+#include <pthread.h>
+#include <sched.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 #define LOG(...) fprintf(stderr, __VA_ARGS__)
@@ -736,6 +740,327 @@ static int ep_autotune_threads(ggml_backend_t backend, ggml_gallocr_t gallocr, c
 }
 
 // ---------------------------------------------------------------------------
+// NUMA placement policy (GGML_EPD_NUMA=off|interleave|weighted, default off)
+//
+// The expert FFN is memory-bandwidth bound, so which NUMA nodes the weight
+// pages land on matters. off keeps the historical behavior: mmap mode scatters
+// page-cache pages by first-touch, --no-mmap faults every anonymous page on
+// the loading thread's node. interleave applies MPOL_INTERLEAVE over all
+// online nodes; weighted applies MPOL_WEIGHTED_INTERLEAVE (kernel >= 6.9)
+// with per-node weights from, in priority order:
+//   1. GGML_EPD_NUMA_WEIGHT (e.g. "2:3" or "2,3", one value per online node)
+//   2. a startup bandwidth probe (per-node pinned streaming read, ~150 ms/node)
+//   3. the weights already in /sys/kernel/mm/mempolicy/weighted_interleave/
+//      (used as-is when the sysfs write is not permitted — no root needed if
+//      the administrator preconfigured them)
+// The policy is set before any weight allocation/first-touch, so both the
+// --no-mmap pread buffers and later mmap page-ins follow it. All failures
+// degrade to a warning + fallback, never a refused start.
+// ---------------------------------------------------------------------------
+
+#ifndef MPOL_BIND
+#define MPOL_BIND 2
+#endif
+#ifndef MPOL_INTERLEAVE
+#define MPOL_INTERLEAVE 3
+#endif
+#ifndef MPOL_WEIGHTED_INTERLEAVE
+#define MPOL_WEIGHTED_INTERLEAVE 6
+#endif
+
+// parse a sysfs id list ("0-3,8-11") into individual ids
+static std::vector<int> ep_parse_id_list(const std::string & s) {
+    std::vector<int> out;
+    size_t i = 0;
+    while (i < s.size()) {
+        int a = 0, b = 0, n = 0;
+        if (sscanf(s.c_str() + i, "%d-%d%n", &a, &b, &n) == 2 && a <= b) {
+            for (int v = a; v <= b; ++v) {
+                out.push_back(v);
+            }
+        } else if (sscanf(s.c_str() + i, "%d%n", &a, &n) == 1) {
+            out.push_back(a);
+        } else {
+            break;
+        }
+        i += (size_t) n;
+        if (i < s.size() && s[i] == ',') {
+            ++i;
+        }
+    }
+    return out;
+}
+
+static bool ep_read_first_line(const char * path, std::string & out) {
+    FILE * f = fopen(path, "r");
+    if (!f) {
+        return false;
+    }
+    char buf[256];
+    const bool ok = fgets(buf, sizeof(buf), f) != nullptr;
+    fclose(f);
+    if (ok) {
+        out = buf;
+        while (!out.empty() && (out.back() == '\n' || out.back() == ' ')) {
+            out.pop_back();
+        }
+    }
+    return ok;
+}
+
+static std::vector<int> ep_numa_online_nodes() {
+    std::string s;
+    if (ep_read_first_line("/sys/devices/system/node/online", s)) {
+        std::vector<int> v = ep_parse_id_list(s);
+        if (!v.empty()) {
+            return v;
+        }
+    }
+    return {0}; // UMA or unreadable sysfs: single node, policy is a no-op
+}
+
+static std::vector<int> ep_numa_node_cpus(int node) {
+    char path[128];
+    snprintf(path, sizeof(path), "/sys/devices/system/node/node%d/cpulist", node);
+    std::string s;
+    if (!ep_read_first_line(path, s)) {
+        return {};
+    }
+    return ep_parse_id_list(s);
+}
+
+// streaming-read bandwidth probe for one node: a 1 GiB anonymous buffer is
+// mbind(MPOL_BIND)'d to the node, faulted, then read by T = min(8, n_cpus)
+// threads pinned to the node's cpus for ~150 ms. returns GB/s, 0 on failure.
+static double ep_numa_probe_bw_gbps(int node, const std::vector<int> & cpus) {
+    if (cpus.empty()) {
+        return 0.0;
+    }
+    const size_t len = (size_t) 1 << 30;
+    char * buf = (char *) mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (buf == MAP_FAILED) {
+        return 0.0;
+    }
+    unsigned long mask[16] = {0};
+    mask[node / 64] |= 1UL << (node % 64);
+    if (syscall(SYS_mbind, buf, len, MPOL_BIND, mask, 1024, 0) != 0) {
+        LOG("llama-epd: numa: mbind node %d failed: %s\n", node, strerror(errno));
+        munmap(buf, len);
+        return 0.0;
+    }
+    memset(buf, 0x5a, len); // first touch after mbind: pages land on this node
+
+    const int T = std::min(8, (int) cpus.size());
+    const size_t slice = len / (size_t) T / 64 * 64; // 64-byte multiple
+    std::atomic<bool> go{false}, halt{false};
+    std::vector<std::atomic<uint64_t>> bytes((size_t) T);
+    std::vector<std::thread> ths;
+    for (int i = 0; i < T; ++i) {
+        ths.emplace_back([&, i]() {
+            cpu_set_t set;
+            CPU_ZERO(&set);
+            CPU_SET(cpus[(size_t) i % cpus.size()], &set);
+            pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+            const uint64_t * p = (const uint64_t *) (buf + (size_t) i * slice);
+            const size_t n = slice / 8;
+            while (!go.load(std::memory_order_acquire)) {
+            }
+            uint64_t done = 0;
+            volatile uint64_t sink = 0;
+            while (!halt.load(std::memory_order_relaxed)) {
+                uint64_t s = 0;
+                for (size_t j = 0; j < n; ++j) {
+                    s += p[j];
+                }
+                sink = s;
+                done += slice;
+            }
+            (void) sink;
+            bytes[(size_t) i].store(done, std::memory_order_relaxed);
+        });
+    }
+    go.store(true, std::memory_order_release);
+    const int64_t t0 = ggml_time_us();
+    usleep(150000);
+    const int64_t t1 = ggml_time_us();
+    halt.store(true, std::memory_order_relaxed);
+    uint64_t total = 0;
+    for (auto & b : bytes) {
+        total += b.load(std::memory_order_relaxed);
+    }
+    for (auto & t : ths) {
+        t.join();
+    }
+    munmap(buf, len);
+    const double sec = (t1 - t0) / 1e6;
+    return sec > 0 ? (double) total / sec / 1e9 : 0.0;
+}
+
+// scale bandwidths to small integer weights (max 16), reduced by their gcd
+static std::vector<int> ep_numa_weights_from_bw(const std::vector<double> & bw) {
+    double mx = 0.0;
+    for (double b : bw) {
+        mx = std::max(mx, b);
+    }
+    std::vector<int> w(bw.size(), 1);
+    if (mx <= 0.0) {
+        return w;
+    }
+    int g = 0;
+    for (size_t i = 0; i < bw.size(); ++i) {
+        w[i] = std::max(1, (int) lround(16.0 * bw[i] / mx));
+        g = (i == 0) ? w[i] : std::gcd(g, w[i]);
+    }
+    if (g > 1) {
+        for (int & v : w) {
+            v /= g;
+        }
+    }
+    return w;
+}
+
+static bool ep_numa_write_weight(int node, int w) {
+    char path[160];
+    snprintf(path, sizeof(path), "/sys/kernel/mm/mempolicy/weighted_interleave/node%d", node);
+    FILE * f = fopen(path, "w");
+    if (!f) {
+        return false;
+    }
+    const bool ok = fprintf(f, "%d", w) > 0;
+    fclose(f);
+    return ok;
+}
+
+static int ep_numa_read_weight(int node) {
+    char path[160];
+    snprintf(path, sizeof(path), "/sys/kernel/mm/mempolicy/weighted_interleave/node%d", node);
+    std::string s;
+    int w = 1;
+    if (ep_read_first_line(path, s)) {
+        sscanf(s.c_str(), "%d", &w);
+    }
+    return w;
+}
+
+// apply the env-configured NUMA policy; called once from main() before the
+// model is loaded so every weight page (pread buffer or mmap fault) follows it
+static void ep_numa_apply_policy() {
+    const char * e = getenv("GGML_EPD_NUMA");
+    if (!e || e[0] == '\0' || strcmp(e, "off") == 0 || strcmp(e, "0") == 0) {
+        return;
+    }
+    int mode = 0;
+    if (strcmp(e, "interleave") == 0) {
+        mode = MPOL_INTERLEAVE;
+    } else if (strcmp(e, "weighted") == 0) {
+        mode = MPOL_WEIGHTED_INTERLEAVE;
+    } else {
+        LOG("llama-epd: numa: unknown GGML_EPD_NUMA='%s' (want off|interleave|weighted), ignoring\n", e);
+        return;
+    }
+
+    const std::vector<int> nodes = ep_numa_online_nodes();
+    if (nodes.size() < 2) {
+        LOG("llama-epd: numa: only %zu online node(s), policy not applied\n", nodes.size());
+        return;
+    }
+
+    std::vector<int> weights(nodes.size(), 1);
+    if (mode == MPOL_WEIGHTED_INTERLEAVE) {
+        bool have = false;
+        // 1) explicit GGML_EPD_NUMA_WEIGHT ("a:b" or "a,b", one per online node)
+        if (const char * w = getenv("GGML_EPD_NUMA_WEIGHT")) {
+            std::string s = w;
+            for (char & c : s) {
+                if (c == ':' || c == ',') {
+                    c = ' ';
+                }
+            }
+            std::vector<int> v;
+            int x = 0, n = 0;
+            size_t off = 0;
+            while (sscanf(s.c_str() + off, "%d%n", &x, &n) == 1) {
+                v.push_back(x);
+                off += (size_t) n;
+            }
+            if (v.size() == nodes.size()) {
+                weights = v;
+                have = true;
+                LOG("llama-epd: numa: weights from GGML_EPD_NUMA_WEIGHT\n");
+            } else {
+                LOG("llama-epd: numa: GGML_EPD_NUMA_WEIGHT='%s' has %zu values, want %zu — ignoring\n",
+                    w, v.size(), nodes.size());
+            }
+        }
+        // 2) startup bandwidth probe (layout-agnostic: adapts to whatever DIMM
+        //    config the machine currently has)
+        if (!have) {
+            std::vector<double> bw(nodes.size(), 0.0);
+            for (size_t i = 0; i < nodes.size(); ++i) {
+                bw[i] = ep_numa_probe_bw_gbps(nodes[i], ep_numa_node_cpus(nodes[i]));
+            }
+            bool ok = true;
+            for (double b : bw) {
+                ok = ok && b > 0.0;
+            }
+            if (ok) {
+                weights = ep_numa_weights_from_bw(bw);
+                have = true;
+                LOG("llama-epd: numa: bandwidth probe:");
+                for (size_t i = 0; i < nodes.size(); ++i) {
+                    LOG(" node%d=%.1f GB/s", nodes[i], bw[i]);
+                }
+                LOG("\n");
+            } else {
+                LOG("llama-epd: numa: bandwidth probe failed, keeping sysfs weights\n");
+            }
+        }
+        // write the weights; without permission fall back to whatever the
+        // administrator already configured (never refuse to start)
+        if (have) {
+            bool wrote = true;
+            for (size_t i = 0; i < nodes.size(); ++i) {
+                wrote = ep_numa_write_weight(nodes[i], weights[i]) && wrote;
+            }
+            if (!wrote) {
+                LOG("llama-epd: numa: cannot write sysfs weights (need root); using current values. to apply:");
+                for (size_t i = 0; i < nodes.size(); ++i) {
+                    LOG(" echo %d | sudo tee /sys/kernel/mm/mempolicy/weighted_interleave/node%d;", weights[i], nodes[i]);
+                }
+                LOG("\n");
+            }
+        }
+        for (size_t i = 0; i < nodes.size(); ++i) {
+            weights[i] = ep_numa_read_weight(nodes[i]);
+        }
+    }
+
+    unsigned long mask[16] = {0};
+    for (int nd : nodes) {
+        mask[nd / 64] |= 1UL << (nd % 64);
+    }
+    if (syscall(SYS_set_mempolicy, mode, mask, 1024) != 0) {
+        if (mode == MPOL_WEIGHTED_INTERLEAVE && errno == EINVAL) {
+            LOG("llama-epd: numa: MPOL_WEIGHTED_INTERLEAVE unsupported (kernel < 6.9?), falling back to plain interleave\n");
+            mode = MPOL_INTERLEAVE;
+            if (syscall(SYS_set_mempolicy, mode, mask, 1024) != 0) {
+                LOG("llama-epd: numa: set_mempolicy(interleave) failed: %s — continuing without policy\n", strerror(errno));
+                return;
+            }
+        } else {
+            LOG("llama-epd: numa: set_mempolicy failed: %s — continuing without policy\n", strerror(errno));
+            return;
+        }
+    }
+    LOG("llama-epd: numa: policy %s over nodes", mode == MPOL_WEIGHTED_INTERLEAVE ? "weighted-interleave" : "interleave");
+    for (size_t i = 0; i < nodes.size(); ++i) {
+        LOG(" %d%s", nodes[i], mode == MPOL_WEIGHTED_INTERLEAVE ?
+            (std::string("(w=") + std::to_string(weights[i]) + ")").c_str() : "");
+    }
+    LOG("\n");
+}
+
+// ---------------------------------------------------------------------------
 // server
 // ---------------------------------------------------------------------------
 
@@ -1062,6 +1387,10 @@ static void ep_usage(const char * argv0) {
         "  --selftest             local vs loopback numerical check, then exit\n"
         "  --selftest-layer N     layer for selftest (default: first owned MoE layer)\n"
         "  --selftest-tokens N    tokens for selftest (default 4)\n"
+        "\n"
+        "env: GGML_EPD_NUMA=off|interleave|weighted (default off) — weight page NUMA\n"
+        "     placement; weighted uses GGML_EPD_NUMA_WEIGHT=a:b or a startup bandwidth\n"
+        "     probe (MPOL_WEIGHTED_INTERLEAVE, kernel >= 6.9)\n"
         "\n",
         argv0);
 }
@@ -1150,6 +1479,11 @@ int main(int argc, char ** argv) {
 
     cfg.layer_first = layer_first;
     cfg.layer_last  = layer_last;
+
+    // NUMA placement policy (GGML_EPD_NUMA): must run before any weight
+    // allocation/first-touch (both --no-mmap pread buffers and mmap page-ins
+    // follow the process mempolicy)
+    ep_numa_apply_policy();
 
     ggml_backend_load_all(); // no-op for static builds, keeps dl builds working
 
