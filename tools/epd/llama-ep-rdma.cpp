@@ -299,20 +299,29 @@ bool cm_wait(rdma_event_channel * ec, rdma_cm_event_type want, rdma_cm_id ** id_
 // huge (min_rnr_timer can be ~80 ms): a single RNR NAK — inevitable once a bulk
 // frame overruns the 8-slot receive ring — then stalls the stream by ~80 ms per
 // chunk (measured ~77 ms/chunk on 6 MB GLM prefill frames, i.e. ~3 MB/s).
-// Setting fast recovery keeps an occasional RNR/ACK-timeout at sub-ms cost.
-bool tune_qp(ibv_qp * qp, std::string * err) {
+// RTS->RTS only accepts a subset of attributes depending on the driver, so each
+// knob is tried independently and failure degrades to a warning.
+void tune_one(ibv_qp * qp, int which, uint32_t value, const char * name) {
     ibv_qp_attr attr = {};
-    attr.qp_state        = IBV_QPS_RTS;
-    attr.timeout         = 14;  // local ACK timeout 4.096us * 2^14 ~= 67 ms
-    attr.retry_cnt       = 7;   // infinite
-    attr.rnr_retry       = 7;   // infinite
-    attr.min_rnr_timer   = 1;   // 0.01 ms RNR retry delay
-    if (ibv_modify_qp(qp, &attr,
-                      IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
-                      IBV_QP_RNR_RETRY | IBV_QP_MIN_RNR_TIMER) != 0) {
-        set_err(err, "ibv_modify_qp(tune retry timers)");
-        return false;
+    attr.qp_state = IBV_QPS_RTS;
+    switch (which) {
+    case IBV_QP_TIMEOUT:        attr.timeout       = value; break;
+    case IBV_QP_RETRY_CNT:      attr.retry_cnt     = value; break;
+    case IBV_QP_RNR_RETRY:      attr.rnr_retry     = value; break;
+    case IBV_QP_MIN_RNR_TIMER:  attr.min_rnr_timer = value; break;
     }
+    if (ibv_modify_qp(qp, &attr, IBV_QP_STATE | which) != 0) {
+        fprintf(stderr, "llama-ep-rdma: tune_qp %s=%u failed: %s (ignored)\n",
+                name, value, strerror(errno));
+    }
+}
+
+bool tune_qp(ibv_qp * qp, std::string * err) {
+    (void) err;
+    tune_one(qp, IBV_QP_MIN_RNR_TIMER, 1, "min_rnr_timer"); // 0.01 ms
+    tune_one(qp, IBV_QP_TIMEOUT,       14, "timeout");      // ~67 ms
+    tune_one(qp, IBV_QP_RETRY_CNT,     7, "retry_cnt");     // infinite
+    tune_one(qp, IBV_QP_RNR_RETRY,     7, "rnr_retry");     // infinite
     return true;
 }
 
