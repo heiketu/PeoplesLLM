@@ -19,6 +19,8 @@
 | `GGML_REMOTE_EP_LAYERS` | 全部 | 远端层范围 `A-B`；范围外的层走本地 |
 | `GGML_REMOTE_EP_DEBUG` | 关 | 置 1 每次 RPC 打印 send/wait 耗时（master）；worker 端置 1 每 REQ 打印 compute 耗时 |
 | `GGML_REMOTE_EP_RDMA` | 关 | 置 1 传输层改用 RDMA（RoCEv2，rdma_cm 自动建连）。需编译时检测到 libibverbs+librdmacm（CMake 打印 `EP RDMA transport (RoCEv2): ON`）；无卡/建连失败时打 warning 并自动回退 TCP。master 与 worker 需同时置 1（协议不同，不互通） |
+| `GGML_REMOTE_EP_PIPELINE` | 关 | 置 1 启用流水线分块投递：多 token 层（PP）把 token 维切成块，W=1 滑动窗口发送（发块 i 后收块 i-1 的响应），worker 计算与 master 收发重叠。协议不变（每块是一个普通 REQ 帧），逐 token 数值不变；decode（1 token）不受影响自动走原路径。TCP/RDMA 均可用 |
+| `GGML_REMOTE_EP_PIPELINE_CHUNK` | 256 | 每块 token 数上限；再按隐藏层字节数封顶（TCP ≤3MiB、RDMA ≤1.5MiB，保证 W=1 窗口在 socket buffer / RDMA 接收环容量内，不会死锁） |
 
 worker 侧另有：
 
@@ -258,3 +260,44 @@ node1 因 2DPC 内存慢 14%，硬件现状）→ 带宽比 ~1.96:1。GGML_REMOT
   受 slave 内存限制建议 slave 30-35 层。
 
 interleave 整机口径（旧数据，仅供参考）：master read 94.5 GB/s，slave 128.2 GB/s。
+
+## 流水线分块投递 + worker 固定开销消除（2026-07-30，commit d583d8b61 / 25e38646b）
+
+**worker 每 REQ 固定开销修复**（默认行为，无需 env）：原 `ep_moe_ffn` 每 REQ
+`ggml_backend_alloc_ctx_tensors` + free（数百 MB 中间 buffer 每次首触页错误）且
+`ggml_graph_compute` 无线程池时每次 spawn+join 一次性池（70-72 线程）。实测固定开销
+~7ms/REQ：GLM slave 15 层合计（n_tokens=63）882→458ms（-48%），（n=128）980→717ms，
+（n=1020）6889→5560ms（-19%）。修复：持久 `ggml_threadpool`（autotune 后用最终线程数
+挂 `ggml_backend_cpu_set_threadpool`）+ `ggml_gallocr` grow-only 计算 buffer。
+端到端：DSV4 PP(985 tok) 157→274.5 t/s（+75%）；GLM PP 63档 11.5→15.6、1020档
+66.6→74.3 t/s；小 prompt 冷/热首轮效应（原 5-tok 8.0 vs 17.5 t/s）基本消除。
+decode 不变（DSV4 TG512 24.7 vs 基线 24.7）。
+
+**流水线分块投递**（`GGML_REMOTE_EP_PIPELINE=1`，默认关）：多 token 层按 token 维切块
+（默认 256 tok，按 hidden 字节封顶 TCP ≤3MiB / RDMA ≤1.5MiB，`..._PIPELINE_CHUNK` 可调），
+W=1 滑动窗口发送（发块 i 后收块 i-1 响应），worker 计算与 master 收发重叠；RESP 直接收进
+`out` 切片省一次整层 memcpy。协议零改动（每块=普通 REQ 帧），worker 无需知晓；K<2 自动
+回退原阻塞路径（decode 不受影响）；失败重连用整体单块重发。TCP transport 两侧装 4MiB
+socket buffer（W=1 窗口内至多 1 REQ+1 RESP 在飞，块不超预期缓冲，无死锁；RDMA 接收环
+8×256KB 同理）。注意：worker 修复前分块把固定开销 ×K 放大，GLM 1020 档曾 -4.8% 回归；
+修复后块开销≈0（n=128 每 token 0.373ms vs n=1020 0.363ms），流水线转为小幅净正。
+
+A/B（同会话 off→on→on→off→on(RDMA) 五轮 ABBA 反序，逐字对拍 temp0/seed42 全 IDENTICAL）：
+
+| 模型/档 | off 均值 | on 均值 | on(RDMA) | 备注 |
+| --- | --- | --- | --- | --- |
+| DSV4 TG512 | 24.75 t/s | 24.69 t/s | 24.72 | decode 路径不变，符合零影响 |
+| DSV4 PP 245 tok | 123.7 | 123.5 | 123.6 | 传输占比小，±顺序噪声 |
+| DSV4 PP 985 tok | 274.5 | 273.6 | 275.1 | 同上（轮间顺序效应 ±3%） |
+| GLM PP 63 tok | 15.60 | 16.21 | 16.11 | 63<chunk，走原路径；差值为顺序噪声 |
+| GLM PP 254 tok | 34.65 | 35.14 | 35.20 | +1.4% |
+| GLM PP 1020 tok | 74.30 | 74.83 | 75.01 | +0.7~1.0% |
+
+**GLM PP 63-token 档异常根因**（GGML_REMOTE_EP_DEBUG 双侧分解，同会话冷/热 63 复测）：
+非冷缓存（热复测仅快 ~12%）、非 RPC（15 层远程 wait 合计仅 ~0.6s/4.0s）。主因是
+**master 本地 CPU MoE 的每 ubatch 固定权重读取**：63 tok×top-8=504 指派激活 ~220/256
+专家（5 tok 仅 ~40），每层读 ~2.7GB 权重实测 ~87ms（有效带宽仅 ~25GB/s），39 个本地
+CPU 层 ≈3.4s，小档无法摊薄（63档本地 54ms/tok vs 1020档 7.6ms/tok）；次因是上述
+worker 固定开销（修复后 63档 11.5→15.6 t/s）。遗留：master 本地小批次有效带宽偏低
+（numa_balancing 未关/线程划分待查）；远程层在模型前部时跨 ubatch 流水上限仅层 0-2，
+远程层若放尾部可与下一 ubatch 本地段大幅重叠（MAX-EFFORT 方向）。
