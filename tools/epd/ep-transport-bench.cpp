@@ -77,7 +77,7 @@ static int cmd_echo(const char * kind, int port) {
         return 1;
     }
     fprintf(stderr, "echo server (%s) on :%d\n", kind, port);
-    std::vector<uint8_t> buf(4 << 20);
+    std::vector<uint8_t> buf(64 << 20);
     for (;;) {
         llama_ep_transport conn;
         if (!l->ops.accept(l->ctx, &conn)) {
@@ -111,15 +111,16 @@ static int cmd_ping(const char * kind, const char * host, int port) {
         return 1;
     }
 
-    static const size_t sizes[]   = {64, 4096, 65536, 1048576};
-    static const char * names[]   = {"ping64B", "act4K", "act64K", "act1M"};
-    static const int    samples[] = {2000, 2000, 1000, 200};
+    static const size_t sizes[]   = {64, 4096, 65536, 1048576, 4194304, 16777216};
+    static const char * names[]   = {"ping64B", "act4K", "act64K", "act1M", "act4M", "act16M"};
+    static const int    samples[] = {2000, 2000, 1000, 200, 100, 50};
+    const int n_sizes = 6;
 
-    std::vector<uint8_t> buf(1 << 20, 0x5a);
+    std::vector<uint8_t> buf(16 << 20, 0x5a);
     std::vector<double>  us;
 
     printf("{\"transport\":\"%s\",\"host\":\"%s\",\"results\":[\n", kind, host);
-    for (int s = 0; s < 4; ++s) {
+    for (int s = 0; s < n_sizes; ++s) {
         const size_t len = sizes[s];
         const int    n   = samples[s];
         us.resize(n);
@@ -144,11 +145,14 @@ static int cmd_ping(const char * kind, const char * host, int port) {
         const double p99 = us[(int) (0.99 * (n - 1))];
         printf("  {\"name\":\"%s\",\"bytes\":%zu,\"samples\":%d,"
                "\"rtt_us_median\":%.1f,\"rtt_us_p90\":%.1f,\"rtt_us_p99\":%.1f,"
-               "\"cpu_us_per_op\":%.1f,\"cpu_frac\":%.3f}%s\n",
+               "\"cpu_us_per_op\":%.1f,\"cpu_frac\":%.3f,\"mb_per_s\":%.1f}%s\n",
                names[s], len, n, med, p90, p99,
-               cpu * 1e6 / n, wall > 0 ? cpu / wall : 0.0, s == 3 ? "" : ",");
-        fprintf(stderr, "  %-7s %8zu B x%-5d rtt med %7.1f us  p90 %7.1f us  p99 %8.1f us  cpu %6.1f us/op (%4.1f%%)\n",
-                names[s], len, n, med, p90, p99, cpu * 1e6 / n, 100.0 * cpu / wall);
+               cpu * 1e6 / n, wall > 0 ? cpu / wall : 0.0,
+               wall > 0 ? (double) len * n / wall / 1e6 : 0.0,
+               s == n_sizes - 1 ? "" : ",");
+        fprintf(stderr, "  %-7s %8zu B x%-5d rtt med %7.1f us  p90 %7.1f us  p99 %8.1f us  cpu %6.1f us/op (%4.1f%%)  %8.1f MB/s\n",
+                names[s], len, n, med, p90, p99, cpu * 1e6 / n, 100.0 * cpu / wall,
+                wall > 0 ? (double) len * n / wall / 1e6 : 0.0);
     }
     printf("]}\n");
 
