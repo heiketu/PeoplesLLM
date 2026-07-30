@@ -43,6 +43,7 @@
 #include <iterator>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <set>
 #include <string>
@@ -1073,6 +1074,13 @@ static void ep_numa_apply_policy() {
 // server
 // ---------------------------------------------------------------------------
 
+// serializes graph alloc + compute across concurrently served connections:
+// the SCHED master holds a persistent connection per endpoint, and a second
+// connection may arrive for the classic REQ fallback (PP/warmup batches) —
+// the accept loop serves every connection on its own thread, but the shared
+// backend/gallocr may only run one graph at a time
+static std::mutex ep_compute_mtx;
+
 static bool ep_send_err(llama_ep_transport * t, int32_t code, const std::string & msg) {
     std::vector<uint8_t> payload(sizeof(int32_t) + msg.size());
     memcpy(payload.data(), &code, sizeof(code));
@@ -1136,8 +1144,11 @@ static bool ep_handle_req(
     std::vector<float> out((size_t) n_tokens * L.n_embd);
     std::string err;
     const int64_t t0 = ep_debug_enabled() ? ggml_time_us() : 0;
-    if (!ep_moe_ffn(backend, gallocr, L, (int) n_tokens, (int) n_ids, ids, weights, hidden, out.data(), false, err)) {
-        return ep_send_err(t, LLAMA_EP_ERR_COMPUTE, err);
+    {
+        std::lock_guard<std::mutex> lock(ep_compute_mtx);
+        if (!ep_moe_ffn(backend, gallocr, L, (int) n_tokens, (int) n_ids, ids, weights, hidden, out.data(), false, err)) {
+            return ep_send_err(t, LLAMA_EP_ERR_COMPUTE, err);
+        }
     }
     if (ep_debug_enabled()) {
         LOG("llama-epd: [ep-debug] layer %d n_tokens=%d compute %.3f ms\n",
@@ -1281,9 +1292,12 @@ static bool ep_handle_req2(
     std::vector<float> experts((size_t) n_tokens * n_max * L.n_embd);
     std::string err;
     const int64_t t0 = ep_debug_enabled() ? ggml_time_us() : 0;
-    if (!ep_moe_ffn(backend, gallocr, L, (int) n_tokens, n_max, ids_dense.data(), w_dense.data(),
-            hidden, experts.data(), true, err)) {
-        return ep_send_err(t, LLAMA_EP_ERR_COMPUTE, err);
+    {
+        std::lock_guard<std::mutex> lock(ep_compute_mtx);
+        if (!ep_moe_ffn(backend, gallocr, L, (int) n_tokens, n_max, ids_dense.data(), w_dense.data(),
+                hidden, experts.data(), true, err)) {
+            return ep_send_err(t, LLAMA_EP_ERR_COMPUTE, err);
+        }
     }
     if (ep_debug_enabled()) {
         LOG("llama-epd: [ep-debug] layer %d n_tokens=%d n_sel=%d compute %.3f ms\n",
@@ -1908,9 +1922,15 @@ int main(int argc, char ** argv) {
             continue;
         }
         LOG("llama-epd: client connected\n");
-        ep_serve_connection(&conn, backend, gallocr, m, cfg);
-        conn.ops.close(conn.ctx);
-        LOG("llama-epd: client disconnected\n");
+        // serve every connection on its own thread (compute is serialized by
+        // ep_compute_mtx): the SCHED master holds a persistent connection per
+        // endpoint, and the classic REQ fallback (PP/warmup batches) arrives on
+        // a second connection that must not starve behind the first
+        std::thread([conn, backend, gallocr, &m, &cfg]() mutable {
+            ep_serve_connection(&conn, backend, gallocr, m, cfg);
+            conn.ops.close(conn.ctx);
+            LOG("llama-epd: client disconnected\n");
+        }).detach();
     }
     return 0;
 }
