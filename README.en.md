@@ -88,14 +88,14 @@ Topology: master (dual Xeon 8360Y-class / 251G / 2×3090) ←100G RoCEv2 direct 
 |---|---|---|---|---|---|---|
 | Single machine (NUMA-EP + mirror) | — | **13.20-13.25** | ~20 | 5.94 | 13.9 | 34.9-35.1 |
 | Two-machine 15L (TCP) | 11.64 | 11.58-11.85 | 18.2 | 7.17 | 18.7 | 34.1-34.5 |
-| Two-machine 15L (RDMA) | 12.21 | **12.01-12.16** | 19.9 | ⚠collapsed | ⚠collapsed | ⚠collapsed |
+| Two-machine 15L (RDMA) | 12.21 | **12.01-12.16** | 19.9 | ~~collapsed~~ fixed | ~~collapsed~~ fixed | ~~collapsed~~ fixed |
 | 15L + `MIRROR=1` (TCP, ABBA) | 12.76 | **12.53-12.93 (+9.4%)** | 19.9 | 4.31-5.33 (-31%) | 15.1 (-19%) | 31.1-33.1 (-6%) |
 | Two-machine 32L (3-34, TCP; planner's new optimum, measured) | 9.24 | 9.46-10.26 | 16.4 | 8.30 | 19.2 | 31.7 |
 
 Highlights:
 
 - **Decode sped up across the board with 1.8× slave bandwidth**: worker compute is now 0.85-0.94 ms/layer (2.6 ms estimated on the old memory); two-machine TCP TG512 10.71→11.8 (+10%), RDMA →12.1; single-machine TG512 ~10→13.2. RDMA adds another +3% for decode (KB-scale frames).
-- **⚠ RDMA large-frame collapse (newly found, fix pending)**: MB-scale PP request frames crawl at ~3 MB/s on the RDMA ring (~77 ms per 256 KB chunk), making PP unusable over RDMA; TCP handles the same frames fine. Use RDMA for decode only, TCP for PP.
+- **RDMA large-frame collapse FIXED (2026-07-31, root cause: min_rnr_timer)**: rdma_cm's default RNR retry timer (~80 ms scale) meant that once a bulk frame drained the 8-slot receive ring, every RNR NAK cost a full timer tick and cascaded (measured: 6.2 MB frames at ~3 MB/s, 16 MB frames with p99 7.5 s stalls). Setting min_rnr_timer=0.01 ms via `ibv_modify_qp` after connect gives **5.5 GB/s on 16 MB frames with zero stalls (2× TCP) — GLM two-machine PP now beats TCP across the board: PP63 14.4 / PP254 38.1 / PP1020 up to 76.1 t/s (same-session TCP: 7.4 / ~18.7 / 33.4)**, with decode (small frames) unchanged. Also fixed: rdma_cm connect had no timeout (now 5 s + existing TCP fallback; stale workers no longer hang the master).
 - **MAX-EFFORT layer mirroring (`GGML_REMOTE_EP_MIRROR=1`)**: decode gain holds (TG512 +9.4%, vs +10.6% on the old memory), but the PP gain has **inverted** (PP1020: +27% before → -6% now; PP63: -18.6% → -31%) — master-local MoE prefill bandwidth measured ~2× lower this session (reproduced on both old and new binaries; post-reboot environment suspected, numa_balancing ruled out), so moving prefill compute back to the master now loses. **Mirror on for decode, off for PP.**
 - **Layer split stays at 15 slave layers**: the EP planner (`tools/epd/ep-plan.py`, new `--model glm` preset) predicted Ls* shifting 15→32 with the new bandwidth, but measurement refutes it (32L TG -13%) — the remote segment is nearly serial in decode, so a remote layer still costs more than a local one; DSV4 prediction 8→11 layers (not measured).
 - Worker thread scan: -t 70 (12.16) beats -t 36 (11.66) — stay at physical cores; worker `GGML_EPD_NUMA=weighted` (NUMA weighted interleave) verified in production (symmetric slave nodes, 1:1 weights ≡ interleave).

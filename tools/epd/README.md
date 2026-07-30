@@ -18,7 +18,7 @@
 | `GGML_REMOTE_EP_PORT` | 29200 | worker 端口 |
 | `GGML_REMOTE_EP_LAYERS` | 全部 | 远端层范围 `A-B`；范围外的层走本地 |
 | `GGML_REMOTE_EP_DEBUG` | 关 | 置 1 每次 RPC 打印 send/wait 耗时（master）；worker 端置 1 每 REQ 打印 compute 耗时 |
-| `GGML_REMOTE_EP_RDMA` | 关 | 置 1 传输层改用 RDMA（RoCEv2，rdma_cm 自动建连）。需编译时检测到 libibverbs+librdmacm（CMake 打印 `EP RDMA transport (RoCEv2): ON`）；无卡/建连失败时打 warning 并自动回退 TCP。master 与 worker 需同时置 1（协议不同，不互通）。**⚠ 2026-07-31：MB 级大帧（PP）在 RDMA 环上严重塌陷（~77ms/256KB chunk），修复前 RDMA 仅建议 decode 场景，PP 用 TCP** |
+| `GGML_REMOTE_EP_RDMA` | 关 | 置 1 传输层改用 RDMA（RoCEv2，rdma_cm 自动建连）。需编译时检测到 libibverbs+librdmacm（CMake 打印 `EP RDMA transport (RoCEv2): ON`）；无卡/建连失败时打 warning 并自动回退 TCP。master 与 worker 需同时置 1（协议不同，不互通）。**2026-07-31 大帧塌陷已修复（根因 rdma_cm 默认 min_rnr_timer ~80ms，建连后改 0.01ms），大帧 5.5GB/s ≥2× TCP，全场景可用** |
 | `GGML_REMOTE_EP_PIPELINE` | 关 | 置 1 启用流水线分块投递：多 token 层（PP）把 token 维切成块，W=1 滑动窗口发送（发块 i 后收块 i-1 的响应），worker 计算与 master 收发重叠。协议不变（每块是一个普通 REQ 帧），逐 token 数值不变；decode（1 token）不受影响自动走原路径。TCP/RDMA 均可用 |
 | `GGML_REMOTE_EP_PIPELINE_CHUNK` | 256 | 每块 token 数上限；再按隐藏层字节数封顶（TCP ≤3MiB、RDMA ≤1.5MiB，保证 W=1 窗口在 socket buffer / RDMA 接收环容量内，不会死锁） |
 | `GGML_REMOTE_EP_MIRROR` | 关 | 置 1 启用层镜像 + 专家 slot 拆分：master 同时加载远程层专家权重（这些层不再 TENSOR_SKIP），每层 MoE 沿 slot 维切两半——slot [0,k_r) 发 worker（只发不等的 send op），slot [k_r,k) 在 master 本地走与单机 MoE 完全相同的链路，wait op 收 partial_r 后按 slot 升序合并（与全远程基线结合顺序一致，逐字对拍 bit 一致）。decode 与 PP 均生效；详见下文实测节 |
@@ -430,3 +430,44 @@ PP 持平 → 与 07-30 的 25 层否定一致：**decode 远程段近串行，�
 
 **slave 内存核算**：32 层 --no-mmap RSS 98G/188G（available 89G）无压力；
 master 侧 32 层非镜像 ~114G/251G；**镜像在 Ls=32 不可行**（163+32×2.9≈256G > 251G）。
+
+## RDMA 大帧塌陷根因与修复（2026-07-31，commit e6e40b42b）
+
+**根因**：rdma_cm 建连的 RC QP 使用默认 `min_rnr_timer`（~80ms 级）。大帧打空
+8 槽接收环后触发 RNR NAK（slave 侧 `rnr_nak_retry_err` 计数器实测递增），
+`rnr_retry_count=7`（无限重试）下每次重试睡一个定时器，雪崩级联：
+6.2MB GLM PP 帧 ~3MB/s（77ms/chunk）、bench 16MB 帧 p99 7.5s、SPIN 忙轮询
+反而更差（排除 CQ 事件通道嫌疑，坐实重试定时器）。
+
+**修复**：ESTABLISHED 后 `ibv_modify_qp` 设 `min_rnr_timer=1`（0.01ms；
+mlx5 RTS→RTS 唯一允许修改的属性，失败降级 warning 不影响行为）。顺带修复
+rdma_cm 建连无超时：`cm_wait` 加 5s poll 上限（listener 保持无限等待），
+陈旧 worker 状态下 master 不再 `ucma_get_event` 假死，超时走既有 TCP 回退
+（黑洞 IP 实测 2s 内 ADDR_ERROR 干净失败）。默认行为零变化（RDMA 仍 opt-in）。
+
+**transport-bench 修复前后**（跨机 echo 往返吞吐；TCP 为同链路对照）：
+
+| 帧 | TCP | RDMA 修复前 | RDMA 修复后 |
+| --- | --- | --- | --- |
+| 64B | RTT 42-74µs | 13.6µs | 13.6µs |
+| 4KB | 48 MB/s | 264 MB/s | 219 MB/s |
+| 64KB | 625 MB/s | 1852 MB/s | 1462 MB/s |
+| 1MB | 1998 MB/s | 3921 MB/s | 3951 MB/s |
+| 4MB | 2869 MB/s | 5288 MB/s | 5214 MB/s |
+| 16MB | 2660 MB/s | **27.8 MB/s（p99 7.5s 停顿）** | **5488 MB/s（max 4.7ms，零 >100ms 停顿）** |
+
+修复后大帧 RDMA ≈2× TCP 且 64B-1MB 小帧行为不变（decode 无回归）。
+
+**GLM 双机实测（15 层 3-17，同会话 RDMA/TCP 反序，worker -t70 weighted）**：
+
+| 轮次 | TG512 | PP63 | PP254 | PP1020 |
+| --- | --- | --- | --- | --- |
+| RDMA rdmafix1 | 12.17/12.27 | 14.44 | 38.06 | **76.06** |
+| TCP（热） | 11.21/11.23 | 7.40 | （昨日同参数 18.65） | 33.44 |
+| RDMA rdmafix2 | 11.00/11.46 | 7.06 | — | 33.48 |
+
+PP 不再塌陷；RDMA ≥ TCP 全部档位（rdmafix1 状态 PP1020 2.3× TCP 并超 07-30
+晚历史最好 74.3-75）。两轮 RDMA 间的 PP 波动（76 vs 33.5）与 TCP 轮同幅，
+为并行 agent 调 RAPL 功耗墙导致的 master 本地 prefill 带宽波动（待 agent-14
+结论），与传输层无关。正确性：gen48（temp0/seed42）RDMA 修复后两轮 + TCP 轮
+与单机基线 md5 全部一致（47cfde37...，逐字 IDENTICAL）。
