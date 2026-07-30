@@ -497,7 +497,9 @@ static bool ep_moe_ffn(
         const int32_t   * ids,            // [n_tokens*n_ids]
         const float     * weights,        // [n_tokens*n_ids]
         const float     * hidden,         // [n_tokens*n_embd]
-        float           * out,            // [n_tokens*n_embd]
+        float           * out,            // [n_tokens*n_embd] (no_sum=false) or
+                                          // [n_embd*n_ids*n_tokens] (no_sum=true)
+        bool              no_sum,         // REQ2: return per-slot weighted vectors
         std::string     & err) {
 
     const int64_t n_embd = L.n_embd;
@@ -545,15 +547,21 @@ static bool ep_moe_ffn(
     ggml_tensor * experts = ggml_mul_mat_id(ctx, L.down, cur, ids_t); // [n_embd, n_ids, n_tokens]
     experts = ggml_mul(ctx, experts, w_t);
 
-    // sum over the n_ids (expert slot) dimension via views + adds (llama-graph.cpp:2165-2183)
-    ggml_tensor * sum = ggml_view_2d(ctx, experts, n_embd, n_tokens, experts->nb[2], 0);
-    for (int i = 1; i < n_ids; ++i) {
-        ggml_tensor * v = ggml_view_2d(ctx, experts, n_embd, n_tokens, experts->nb[2], i * experts->nb[1]);
-        sum = ggml_add(ctx, sum, v);
+    // REQ2 (no_sum): skip the sum chain and ship the per-slot weighted vectors;
+    // the master merges them in ascending global slot order (SCHEDULER-DESIGN §4.5)
+    ggml_tensor * result = experts;
+    if (!no_sum) {
+        // sum over the n_ids (expert slot) dimension via views + adds (llama-graph.cpp:2165-2183)
+        ggml_tensor * sum = ggml_view_2d(ctx, experts, n_embd, n_tokens, experts->nb[2], 0);
+        for (int i = 1; i < n_ids; ++i) {
+            ggml_tensor * v = ggml_view_2d(ctx, experts, n_embd, n_tokens, experts->nb[2], i * experts->nb[1]);
+            sum = ggml_add(ctx, sum, v);
+        }
+        result = sum;
     }
 
     ggml_cgraph * gf = ggml_new_graph(ctx);
-    ggml_build_forward_expand(gf, sum);
+    ggml_build_forward_expand(gf, result);
 
     // the gallocr keeps one grow-only buffer across requests: no per-REQ
     // alloc/free and no repeated first-touch page faults on the intermediates
@@ -573,7 +581,8 @@ static bool ep_moe_ffn(
         return false;
     }
 
-    ggml_backend_tensor_get(sum, out, 0, (size_t) n_tokens * n_embd * sizeof(float));
+    ggml_backend_tensor_get(result, out, 0,
+            (size_t) n_tokens * n_embd * (no_sum ? (size_t) n_ids : 1) * sizeof(float));
 
     ggml_free(ctx);
     return true;
@@ -715,7 +724,7 @@ static int ep_autotune_threads(ggml_backend_t backend, ggml_gallocr_t gallocr, c
                 std::vector<float> hidden((size_t) L->n_embd, 1e-3f);
                 std::vector<float> out((size_t) L->n_embd);
                 std::string err;
-                if (!ep_moe_ffn(backend, gallocr, *L, 1, k, ids.data(), weights.data(), hidden.data(), out.data(), err)) {
+                if (!ep_moe_ffn(backend, gallocr, *L, 1, k, ids.data(), weights.data(), hidden.data(), out.data(), false, err)) {
                     LOG("llama-epd: autotune: compute failed: %s\n", err.c_str());
                     return -1;
                 }
@@ -1127,7 +1136,7 @@ static bool ep_handle_req(
     std::vector<float> out((size_t) n_tokens * L.n_embd);
     std::string err;
     const int64_t t0 = ep_debug_enabled() ? ggml_time_us() : 0;
-    if (!ep_moe_ffn(backend, gallocr, L, (int) n_tokens, (int) n_ids, ids, weights, hidden, out.data(), err)) {
+    if (!ep_moe_ffn(backend, gallocr, L, (int) n_tokens, (int) n_ids, ids, weights, hidden, out.data(), false, err)) {
         return ep_send_err(t, LLAMA_EP_ERR_COMPUTE, err);
     }
     if (ep_debug_enabled()) {
@@ -1144,6 +1153,155 @@ static bool ep_handle_req(
     return llama_ep_send_framev(t, LLAMA_EP_MSG_RESP, parts, lens, 2);
 }
 
+// CAP handshake (protocol v2): answer with this worker's capabilities and owned
+// ranges; the payload (llama_ep_cap_master) is informational only — the reply
+// is the same whatever the master offers
+static bool ep_handle_cap(
+        llama_ep_transport * t,
+        const ep_model     & m,
+        const ep_config    & cfg) {
+    llama_ep_cap_worker cap;
+    cap.proto_ver = LLAMA_EP_PROTO_VER;
+    cap.caps      = LLAMA_EP_CAP_REQ2;
+    cap.layer_first = m.layers.empty() ? cfg.layer_first : m.layers.begin()->first;
+    cap.layer_last  = m.layers.empty() ? cfg.layer_first : m.layers.rbegin()->first;
+    cap.expert_first = cfg.expert_first;
+    int64_t e_last = cfg.expert_last;
+    for (const auto & kv : m.layers) {
+        e_last = std::min<int64_t>(e_last, kv.second.n_expert);
+    }
+    cap.expert_last = (int32_t) e_last;
+    cap.kernel_id = llama_ep_kernel_id();
+    return llama_ep_send_frame(t, LLAMA_EP_MSG_CAP, &cap, sizeof(cap));
+}
+
+// REQ2 (SCHEDULER-DESIGN §4.4): ragged per-slot dispatch. each assignment is a
+// (token, slot, expert, weight) tuple; the reply carries one weighted expert
+// vector per assignment (NOT summed) in REQ2 order, so the master can merge
+// them in ascending global slot order bit-identically to the local baseline.
+static bool ep_handle_req2(
+        llama_ep_transport * t,
+        ggml_backend_t       backend,
+        ggml_gallocr_t       gallocr,
+        const ep_model     & m,
+        const ep_config    & cfg,
+        const uint8_t      * payload,
+        size_t               payload_len) {
+
+    if (payload_len < sizeof(llama_ep_req2_header)) {
+        return ep_send_err(t, LLAMA_EP_ERR_BAD_SHAPE, "short REQ2");
+    }
+
+    llama_ep_req2_header hdr;
+    memcpy(&hdr, payload, sizeof(hdr));
+
+    const int64_t n_tokens = hdr.n_tokens;
+    const int64_t n_sel    = hdr.n_sel;
+
+    auto it = m.layers.find(hdr.layer);
+    if (it == m.layers.end()) {
+        return ep_send_err(t, LLAMA_EP_ERR_BAD_LAYER, "layer " + std::to_string(hdr.layer) + " not owned by this worker");
+    }
+    const ep_layer & L = it->second;
+
+    if (hdr.n_embd != (int32_t) L.n_embd) {
+        return ep_send_err(t, LLAMA_EP_ERR_BAD_SHAPE, "n_embd mismatch");
+    }
+    if (n_tokens < 1 || n_tokens > 65536 || n_sel < 0 || n_sel > (int64_t) 1 << 22) {
+        return ep_send_err(t, LLAMA_EP_ERR_BAD_SHAPE, "bad n_tokens/n_sel");
+    }
+
+    const size_t need = sizeof(hdr) + (size_t) n_sel * (3 * sizeof(int32_t) + sizeof(float))
+                      + (size_t) n_tokens * L.n_embd * sizeof(float);
+    if (payload_len != need) {
+        return ep_send_err(t, LLAMA_EP_ERR_BAD_SHAPE, "REQ2 payload length mismatch");
+    }
+
+    const int32_t * token_idx = (const int32_t *) (payload + sizeof(hdr));
+    const int32_t * slot_idx  = token_idx + n_sel;
+    const int32_t * expert_id = slot_idx  + n_sel;
+    const float   * weights   = (const float *) (expert_id + n_sel);
+    const float   * hidden    = weights + n_sel;
+
+    const int e_first = cfg.expert_first;
+    const int e_last  = std::min<int64_t>(cfg.expert_last, L.n_expert);
+    for (size_t i = 0; i < (size_t) n_sel; ++i) {
+        if (expert_id[i] < e_first || expert_id[i] >= e_last) {
+            return ep_send_err(t, LLAMA_EP_ERR_BAD_EXPERT,
+                "expert " + std::to_string(expert_id[i]) + " outside [" + std::to_string(e_first) +
+                ", " + std::to_string(e_last) + ")");
+        }
+        if (token_idx[i] < 0 || token_idx[i] >= n_tokens) {
+            return ep_send_err(t, LLAMA_EP_ERR_BAD_SHAPE, "token_idx out of range");
+        }
+    }
+    (void) slot_idx; // the worker answers in REQ2 order; slot order is the master's concern
+
+    llama_ep_resp2_header rhdr;
+    rhdr.n_tokens = hdr.n_tokens;
+    rhdr.n_sel    = hdr.n_sel;
+    rhdr.n_embd   = hdr.n_embd;
+
+    if (n_sel == 0) {
+        return llama_ep_send_frame(t, LLAMA_EP_MSG_RESP2, &rhdr, sizeof(rhdr));
+    }
+
+    // densify the ragged assignments per token: column t lists token t's
+    // assigned experts in REQ2 order, padded with a duplicate of its last
+    // expert at weight 0 (mul_mat_id computes each (slot,token) row
+    // independently, so padding never leaks into a real assignment's bits)
+    std::vector<int> count((size_t) n_tokens, 0);
+    for (size_t i = 0; i < (size_t) n_sel; ++i) {
+        ++count[(size_t) token_idx[i]];
+    }
+    int n_max = 1;
+    for (int c : count) {
+        n_max = std::max(n_max, c);
+    }
+
+    std::vector<int32_t> ids_dense((size_t) n_tokens * n_max, e_first);
+    std::vector<float>   w_dense((size_t) n_tokens * n_max, 0.0f);
+    std::vector<int>     pos((size_t) n_sel);
+    std::vector<int>     fill((size_t) n_tokens, 0);
+    for (size_t i = 0; i < (size_t) n_sel; ++i) {
+        const int t  = token_idx[i];
+        const int p  = fill[(size_t) t]++;
+        ids_dense[(size_t) t * n_max + p] = expert_id[i];
+        w_dense[(size_t) t * n_max + p]   = weights[i];
+        pos[i] = p;
+    }
+    // pad columns past their group end with a duplicate of the group's last expert
+    for (int t = 0; t < n_tokens; ++t) {
+        for (int p = count[(size_t) t]; p < n_max; ++p) {
+            ids_dense[(size_t) t * n_max + p] =
+                count[(size_t) t] > 0 ? ids_dense[(size_t) t * n_max + count[(size_t) t] - 1] : e_first;
+        }
+    }
+
+    std::vector<float> experts((size_t) n_tokens * n_max * L.n_embd);
+    std::string err;
+    const int64_t t0 = ep_debug_enabled() ? ggml_time_us() : 0;
+    if (!ep_moe_ffn(backend, gallocr, L, (int) n_tokens, n_max, ids_dense.data(), w_dense.data(),
+            hidden, experts.data(), true, err)) {
+        return ep_send_err(t, LLAMA_EP_ERR_COMPUTE, err);
+    }
+    if (ep_debug_enabled()) {
+        LOG("llama-epd: [ep-debug] layer %d n_tokens=%d n_sel=%d compute %.3f ms\n",
+            hdr.layer, (int) n_tokens, (int) n_sel, (ggml_time_us() - t0) / 1000.0);
+    }
+
+    // gather the per-assignment vectors back into REQ2 order
+    std::vector<float> out((size_t) n_sel * L.n_embd);
+    for (size_t i = 0; i < (size_t) n_sel; ++i) {
+        const int64_t src = ((int64_t) token_idx[i] * n_max + pos[i]) * L.n_embd;
+        memcpy(out.data() + i * L.n_embd, experts.data() + src, (size_t) L.n_embd * sizeof(float));
+    }
+
+    const void * parts[2] = {&rhdr, out.data()};
+    const size_t lens[2]  = {sizeof(rhdr), out.size() * sizeof(float)};
+    return llama_ep_send_framev(t, LLAMA_EP_MSG_RESP2, parts, lens, 2);
+}
+
 // serve frames on one connection until EOF
 static void ep_serve_connection(
         llama_ep_transport * t,
@@ -1156,6 +1314,20 @@ static void ep_serve_connection(
         uint32_t type = 0;
         if (!llama_ep_recv_frame(t, type, payload)) {
             break;
+        }
+        if (type == LLAMA_EP_MSG_CAP) {
+            if (!ep_handle_cap(t, m, cfg)) {
+                LOG("llama-epd: failed to answer CAP\n");
+                break;
+            }
+            continue;
+        }
+        if (type == LLAMA_EP_MSG_REQ2) {
+            if (!ep_handle_req2(t, backend, gallocr, m, cfg, payload.data(), payload.size())) {
+                LOG("llama-epd: failed to handle REQ2\n");
+                break;
+            }
+            continue;
         }
         if (type != LLAMA_EP_MSG_REQ) {
             ep_send_err(t, LLAMA_EP_ERR_GENERIC, "expected REQ");
@@ -1219,6 +1391,60 @@ static bool ep_client_moe_ffn(
         return false;
     }
     memcpy(out, payload.data() + sizeof(llama_ep_resp_header), (size_t) n_tokens * n_embd * sizeof(float));
+    return true;
+}
+
+// REQ2 variant: ragged per-slot dispatch, per-assignment weighted vectors back
+static bool ep_client_moe_ffn2(
+        llama_ep_transport * t,
+        int                  layer,
+        int                  n_tokens,
+        int                  n_sel,
+        int                  n_embd,
+        const int32_t      * token_idx,
+        const int32_t      * slot_idx,
+        const int32_t      * expert_id,
+        const float        * weights,
+        const float        * hidden,
+        float              * out, // [n_sel*n_embd]
+        std::string        & err) {
+
+    llama_ep_req2_header hdr = {layer, n_tokens, n_sel, n_embd};
+
+    const void * parts[6] = {&hdr, token_idx, slot_idx, expert_id, weights, hidden};
+    const size_t lens[6]  = {
+        sizeof(hdr),
+        (size_t) n_sel * sizeof(int32_t),
+        (size_t) n_sel * sizeof(int32_t),
+        (size_t) n_sel * sizeof(int32_t),
+        (size_t) n_sel * sizeof(float),
+        (size_t) n_tokens * n_embd * sizeof(float),
+    };
+    if (!llama_ep_send_framev(t, LLAMA_EP_MSG_REQ2, parts, lens, 6)) {
+        err = "send REQ2 failed";
+        return false;
+    }
+
+    std::vector<uint8_t> payload;
+    uint32_t type = 0;
+    if (!llama_ep_recv_frame(t, type, payload)) {
+        err = "recv RESP2 failed";
+        return false;
+    }
+    if (type == LLAMA_EP_MSG_ERR) {
+        int32_t code = 0;
+        if (payload.size() >= sizeof(code)) {
+            memcpy(&code, payload.data(), sizeof(code));
+        }
+        err = "worker ERR " + std::to_string(code) + ": " +
+              std::string((const char *) payload.data() + sizeof(code), payload.size() - sizeof(code));
+        return false;
+    }
+    if (type != LLAMA_EP_MSG_RESP2 || payload.size() != sizeof(llama_ep_resp2_header) + (size_t) n_sel * n_embd * sizeof(float)) {
+        err = "bad RESP2";
+        return false;
+    }
+    memcpy(out, payload.data() + sizeof(llama_ep_resp2_header), (size_t) n_sel * n_embd * sizeof(float));
     return true;
 }
 
@@ -1303,7 +1529,7 @@ static int ep_selftest(ep_model & m, const ep_config & cfg, int layer, int n_tok
     std::vector<float> out_a((size_t) n_tokens * n_embd);
     {
         std::string err;
-        if (!ep_moe_ffn(backend, gallocr, L, n_tokens, n_ids, ids.data(), weights.data(), hidden.data(), out_a.data(), err)) {
+        if (!ep_moe_ffn(backend, gallocr, L, n_tokens, n_ids, ids.data(), weights.data(), hidden.data(), out_a.data(), false, err)) {
             LOG("selftest: local compute failed: %s\n", err.c_str());
             return 1;
         }
@@ -1347,6 +1573,115 @@ static int ep_selftest(ep_model & m, const ep_config & cfg, int layer, int n_tok
         }
     }
     server_thread.join();
+
+    // (c) REQ2 loopback: CAP handshake + ragged per-slot dispatch. derive a
+    // ragged assignment set from the same inputs (token t keeps its first
+    // k_t slots, k_t in [1, n_ids]) and verify that the per-assignment
+    // vectors summed in ascending slot order reproduce the summed local
+    // compute bit-for-bit (max_abs_diff must be exactly 0)
+    double req2_max_abs = 0.0;
+    bool req2_ok = true;
+    std::string req2_err;
+    {
+        // build the ragged assignment list, (token, slot) ascending
+        std::vector<int32_t> a_tok, a_slot, a_exp;
+        std::vector<float>   a_w;
+        std::vector<int>     k_per((size_t) n_tokens);
+        for (int t = 0; t < n_tokens; ++t) {
+            const int k_t = 1 + (int) rng.next_below((uint32_t) n_ids);
+            k_per[(size_t) t] = k_t;
+            for (int j = 0; j < k_t; ++j) {
+                a_tok.push_back(t);
+                a_slot.push_back(j);
+                a_exp.push_back(ids[(size_t) t * n_ids + j]);
+                a_w.push_back(weights[(size_t) t * n_ids + j]);
+            }
+        }
+        const int n_sel = (int) a_tok.size();
+
+        std::string lerr2;
+        llama_ep_listener * listener2 = llama_ep_tcp_listen("127.0.0.1", 0, &lerr2);
+        if (!listener2) {
+            LOG("selftest-req2: listen failed: %s\n", lerr2.c_str());
+            return 1;
+        }
+        const int port2 = llama_ep_tcp_listener_port(listener2);
+        std::thread server_thread2([&]() {
+            llama_ep_transport conn;
+            if (listener2->ops.accept(listener2->ctx, &conn)) {
+                ep_serve_connection(&conn, backend, gallocr, m, cfg);
+                conn.ops.close(conn.ctx);
+            }
+            listener2->ops.close(listener2->ctx);
+        });
+
+        std::vector<float> out_c((size_t) n_sel * n_embd);
+        llama_ep_transport * cli2 = llama_ep_tcp_connect("127.0.0.1", port2, &req2_err);
+        if (cli2) {
+            // CAP handshake first, as the master would
+            llama_ep_cap_master mcap = {LLAMA_EP_PROTO_VER, 0};
+            uint32_t ctype = 0;
+            std::vector<uint8_t> cpayload;
+            llama_ep_cap_worker wcap;
+            memset(&wcap, 0, sizeof(wcap));
+            if (llama_ep_send_frame(cli2, LLAMA_EP_MSG_CAP, &mcap, sizeof(mcap)) &&
+                llama_ep_recv_frame(cli2, ctype, cpayload) &&
+                ctype == LLAMA_EP_MSG_CAP && cpayload.size() >= sizeof(wcap)) {
+                memcpy(&wcap, cpayload.data(), sizeof(wcap));
+                if (wcap.proto_ver < LLAMA_EP_PROTO_VER || !(wcap.caps & LLAMA_EP_CAP_REQ2)) {
+                    req2_ok = false;
+                    req2_err = "worker CAP lacks REQ2";
+                }
+            } else {
+                req2_ok = false;
+                req2_err = "CAP handshake failed";
+            }
+            if (req2_ok) {
+                req2_ok = ep_client_moe_ffn2(cli2, layer, n_tokens, n_sel, n_embd,
+                        a_tok.data(), a_slot.data(), a_exp.data(), a_w.data(),
+                        hidden.data(), out_c.data(), req2_err);
+            }
+            cli2->ops.close(cli2->ctx);
+            delete cli2;
+        }
+        server_thread2.join();
+
+        if (req2_ok) {
+            // per-token reference: summed local compute on token t's k_t slots
+            size_t off = 0;
+            for (int t = 0; t < n_tokens && req2_ok; ++t) {
+                const int k_t = k_per[(size_t) t];
+                std::vector<float> ref((size_t) n_embd);
+                std::string rerr;
+                if (!ep_moe_ffn(backend, gallocr, L, 1, k_t,
+                        ids.data() + (size_t) t * n_ids, weights.data() + (size_t) t * n_ids,
+                        hidden.data() + (size_t) t * n_embd, ref.data(), false, rerr)) {
+                    req2_ok = false;
+                    req2_err = "reference compute failed: " + rerr;
+                    break;
+                }
+                // ascending slot order, left-associated — the merge order of §4.5;
+                // float accumulation matches the ggml_add chain bit-for-bit
+                for (int e = 0; e < n_embd; ++e) {
+                    float acc = 0.0f;
+                    for (int j = 0; j < k_t; ++j) {
+                        acc += out_c[(off + (size_t) j) * n_embd + e];
+                    }
+                    req2_max_abs = std::max(req2_max_abs, (double) fabsf(acc - ref[(size_t) e]));
+                }
+                off += (size_t) k_t;
+            }
+        }
+    }
+    if (!req2_ok) {
+        LOG("selftest-req2: FAIL: %s\n", req2_err.c_str());
+        return 1;
+    }
+    LOG("selftest-req2: n_sel ragged OK, max_abs_diff=%.6g  %s\n",
+        req2_max_abs, req2_max_abs == 0.0 ? "PASS" : "FAIL");
+    if (req2_max_abs != 0.0) {
+        return 1;
+    }
 
     // compare
     double max_abs = 0.0, max_rel = 0.0, norm = 0.0;
