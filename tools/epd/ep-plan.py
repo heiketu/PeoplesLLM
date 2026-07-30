@@ -30,16 +30,36 @@ DSV4 = dict(
     experts=256,
     top_k=6,
     layer_weight_gb=2.0,                # ~16G/8层 ≈ 2.0G/层（Q3_K 实测 RSS 口径）
+    remote_from="tail",                 # slave 认领尾部 MoE 层（35-42）
 )
 
+# ---- GLM-5.2 结构参数（glm-dsa，79层/160专家/top-8，UD-Q2_K_MXFP4 7分卷 ≈236G） ----
+GLM = dict(
+    name="GLM-5.2",
+    total_layers=79,
+    moe_layers=list(range(3, 79)),      # 0-2 稠密，3-78 共 76 MoE 层
+    gpu_layers=[29, 30, 31, 32, 58, 59, 60, 61, 62],  # GPU 专家卸载 8 层
+    experts=160,
+    top_k=8,
+    layer_weight_gb=2.9,                # 43.5G/15层 ≈ 2.9G/层（实测 RSS 口径）
+    remote_from="head",                 # slave 认领前部 MoE 层（3 起）
+)
+
+MODELS = {"dsv4": DSV4, "glm": GLM}
+
 # ---- 实测每层耗时（GGML_REMOTE_EP_DEBUG，见 tools/epd/README.md） ----
-T_MASTER = 0.37   # ms/层，master 本地（双节点 mirror，341 GB/s 合计）
-T_SLAVE  = 0.73   # ms/层，slave（双节点，174 GB/s 合计）
+# DSV4：master 0.37 / slave 0.73 实测。GLM：由 TG512 三锚点（9.86/10.71/10.42）
+# 反解 t_m=1.33、t_s=2.60（β=0.71 两锚点自洽，误差 <0.1%）；均为 slave 旧带宽
+# （双节点合计 174 GB/s）口径，slave 换内存后按带宽比缩放 t_s 即可。
+T_MASTER = {"dsv4": 0.37, "glm": 1.33}   # ms/层，master 本地（双节点 mirror）
+T_SLAVE  = {"dsv4": 0.73, "glm": 2.60}   # ms/层，slave（旧带宽 174 GB/s 合计）
 T_NET    = 0.13   # ms/层，网络（EDR 100Gb，激活 8KB 量级 RTT + 结果回传）
 
 # ---- 节点带宽（membw 干净环境实测，用于非均衡分配比例） ----
-BW_MASTER = [167.5, 173.9]   # master node0 / node1 GB/s
-BW_SLAVE  = [93.8, 80.2]     # slave node0（快）/ node1（2DPC 慢 14%）
+# 2026-07-30 新硬件：master 重启后 t76 实测 156.9/153.8；slave 内存整改后
+# 双节点 IMC 对称各 ~157 GB/s（总 ~315，旧 174 的 1.8×），旧的 94/80 作废。
+BW_MASTER = [156.9, 153.8]   # master node0 / node1 GB/s
+BW_SLAVE  = [157.0, 157.0]   # slave node0 / node1 GB/s（对称）
 
 # ---- 线程模型（2026-07-30 实测标定） ----
 # TG 是内存带宽敏感型：最优线程数 ≈ min(物理核数, 带宽饱和所需线程数)，
@@ -49,15 +69,20 @@ SLAVE_PHYSICAL_CORES = 72    # slave 物理核（=2×36，HT 共 144）
 PER_CORE_BW = 2.5            # GB/s/核，标定使 slave 推荐 ≈ 实测最优 72
 SLAVE_PP_RESERVE = 4         # PP 保留给系统/后台的核数
 
-# ---- 校准锚点（TG512 t/s → ms/token；Ls=远端层数，Lm=26-Ls） ----
+# ---- 校准锚点（TG512 t/s → ms/token；Ls=远端层数，Lm=可分配-Ls） ----
 # 来源：tools/epd/README.md，同会话 A/B 反序复测
-ANCHORS = [
-    dict(ls=0,  tg=24.88, note="单机 mirror 基线（Lm=26）"),
-    dict(ls=12, tg=24.18, note="双机 31-42 远端 12 层（复测）"),
-    dict(ls=8,  tg=25.49, note="双机 35-42 远端 8 层（当前最优）"),
-]
-
-CPU_ALLOC_LAYERS = 26        # 40 MoE - 14 GPU = 26 层可分配（3-7 + 22-42）
+ANCHORS = {
+    "dsv4": [
+        dict(ls=0,  tg=24.88, note="单机 mirror 基线（Lm=26）"),
+        dict(ls=12, tg=24.18, note="双机 31-42 远端 12 层（复测）"),
+        dict(ls=8,  tg=25.49, note="双机 35-42 远端 8 层（当前最优）"),
+    ],
+    "glm": [
+        dict(ls=0,  tg=9.86,  note="单机基线（Lm=68，旧 mmap 口径）"),
+        dict(ls=15, tg=10.71, note="双机 3-17 远端 15 层（t70/no-mmap）"),
+        dict(ls=25, tg=10.42, note="双机 25 层（全面变差，已否定）"),
+    ],
+}
 
 
 def split_by_bw(n, bw):
@@ -73,17 +98,17 @@ def token_ms(lm, ls, beta, c, t_m=T_MASTER, t_s=T_SLAVE, t_net=T_NET):
     return max(tm, ts) + (1.0 - beta) * min(tm, ts) + c
 
 
-def calibrate(t_m, t_s, t_net):
+def calibrate(anchors, n_cpu, t_m, t_s, t_net):
     """C 由基线锚点精确确定，β 对其余锚点最小二乘（网格搜索）。"""
-    base = ANCHORS[0]
-    c = 1000.0 / base["tg"] - (CPU_ALLOC_LAYERS - base["ls"]) * t_m \
+    base = anchors[0]
+    c = 1000.0 / base["tg"] - (n_cpu - base["ls"]) * t_m \
         - base["ls"] * (t_s + t_net)
     best = None
     for i in range(0, 1001):
         beta = i / 1000.0
         err = 0.0
-        for a in ANCHORS[1:]:
-            lm = CPU_ALLOC_LAYERS - a["ls"]
+        for a in anchors[1:]:
+            lm = n_cpu - a["ls"]
             pred = token_ms(lm, a["ls"], beta, c, t_m, t_s, t_net)
             err += (1000.0 / pred - a["tg"]) ** 2
         if best is None or err < best[0]:
@@ -106,9 +131,10 @@ def plan(model, beta, c, t_m, t_s, t_net, max_remote, bw_master, bw_slave):
 
 def main():
     ap = argparse.ArgumentParser(description="NUMA 感知 EP 层分配规划器")
+    ap.add_argument("--model", choices=sorted(MODELS), default="dsv4", help="模型结构预设")
     ap.add_argument("--profile", default=None, help="ep-topo-profile.json 路径（展示网络实测）")
-    ap.add_argument("--t-master", type=float, default=T_MASTER, help="master ms/层")
-    ap.add_argument("--t-slave", type=float, default=T_SLAVE, help="slave ms/层")
+    ap.add_argument("--t-master", type=float, default=None, help="master ms/层（缺省=预设值）")
+    ap.add_argument("--t-slave", type=float, default=None, help="slave ms/层（缺省=预设值）")
     ap.add_argument("--t-net", type=float, default=T_NET, help="网络 ms/层")
     ap.add_argument("--beta", type=float, default=None, help="重叠度（缺省=锚点校准值）")
     ap.add_argument("--const", type=float, default=None, help="GPU段+barrier 常数 ms（缺省=校准值）")
@@ -125,8 +151,14 @@ def main():
     ap.add_argument("--json", action="store_true", help="输出机器可读 JSON 方案")
     args = ap.parse_args()
 
-    t_m, t_s, t_net = args.t_master, args.t_slave, args.t_net
-    c_fit, beta_fit = calibrate(t_m, t_s, t_net)
+    model = MODELS[args.model]
+    key = args.model
+    anchors = ANCHORS[key]
+    n_cpu = len(model["moe_layers"]) - len(model["gpu_layers"])
+    t_m = args.t_master if args.t_master is not None else T_MASTER[key]
+    t_s = args.t_slave if args.t_slave is not None else T_SLAVE[key]
+    t_net = args.t_net
+    c_fit, beta_fit = calibrate(anchors, n_cpu, t_m, t_s, t_net)
     beta = args.beta if args.beta is not None else beta_fit
     c = args.const if args.const is not None else c_fit
 
@@ -146,8 +178,8 @@ def main():
     print("== 校准（锚点：实测 TG512） ==")
     print(f"  拟合参数: C = {c_fit:.2f} ms（GPU段+barrier），β = {beta_fit:.3f}（重叠度）")
     print(f"  {'配置':<28}{'Lm':>4}{'Ls':>4}{'预测ms':>9}{'预测TG':>9}{'实测TG':>9}{'误差':>8}")
-    for a in ANCHORS:
-        lm = CPU_ALLOC_LAYERS - a["ls"]
+    for a in anchors:
+        lm = n_cpu - a["ls"]
         ms = token_ms(lm, a["ls"], beta_fit, c_fit, t_m, t_s, t_net)
         tg = 1000.0 / ms
         err = (tg - a["tg"]) / a["tg"] * 100
@@ -156,12 +188,14 @@ def main():
         return 0
 
     # ---- 规划 ----
-    model = dict(DSV4)
     rows, (ls, lm, ms, tg) = plan(model, beta, c, t_m, t_s, t_net,
                                   args.max_remote, args.bw_master, args.bw_slave)
     moe = model["moe_layers"]
     gpu = model["gpu_layers"]
-    remote_layers = moe[-ls:] if ls else []
+    if model.get("remote_from") == "head":
+        remote_layers = moe[:ls]
+    else:
+        remote_layers = moe[-ls:] if ls else []
     local_layers = [l for l in moe if l not in gpu and l not in remote_layers]
 
     m0, m1 = split_by_bw(lm, args.bw_master)
@@ -174,14 +208,15 @@ def main():
 
     print(f"\n== 扫描（t_m={t_m} t_s={t_s} t_net={t_net} β={beta:.3f} C={c:.2f}） ==")
     print(f"  {'Ls':>3}{'Lm':>4}{'Tm(ms)':>9}{'Ts(ms)':>9}{'T(ms)':>9}{'TG':>8}  标记")
+    anchor_ls = {a["ls"] for a in anchors}
     for r_ls, r_lm, r_ms, r_tg in rows:
         tm = r_lm * t_m
         ts = r_ls * (t_s + t_net)
-        mark = " <-- 最优" if r_ls == ls else (" (实测锚点)" if r_ls in (0, 8, 12) else "")
+        mark = " <-- 最优" if r_ls == ls else (" (实测锚点)" if r_ls in anchor_ls else "")
         print(f"  {r_ls:>3}{r_lm:>4}{tm:>9.2f}{ts:>9.2f}{r_ms:>9.2f}{r_tg:>8.2f}{mark}")
 
     print(f"\n== 推荐配置（{model['name']}） ==")
-    print(f"  GPU 固定卸载: {len(gpu)} 层 ({gpu[0]}-{gpu[-1]})")
+    print(f"  GPU 固定卸载: {len(gpu)} 层")
     print(f"  master 本地: {lm} 层 ", end="")
     if local_layers:
         # 压缩成区间表示
