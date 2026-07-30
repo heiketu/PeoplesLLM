@@ -277,52 +277,76 @@ void rdma_conn_close(void * vctx) {
 }
 
 // wait for one cm event of the expected type
-bool cm_wait(rdma_event_channel * ec, rdma_cm_event_type want, rdma_cm_id ** id_out, std::string * err) {
-    rdma_cm_event * ev = nullptr;
-    if (rdma_get_cm_event(ec, &ev) != 0) {
-        set_err(err, "rdma_get_cm_event");
-        return false;
-    }
-    const bool ok = ev->event == want;
-    if (!ok) {
-        set_err_msg(err, "rdma_cm event " + std::to_string((int) ev->event) +
-                " (" + rdma_event_str(ev->event) + "), wanted " + rdma_event_str(want));
-    }
-    if (id_out) {
-        *id_out = ev->id;
-    }
-    rdma_ack_cm_event(ev);
-    return ok;
+int64_t now_ms() {
+    timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-// Tighten retry timers on an established RC QP.  Defaults chosen by rdma_cm are
-// huge (min_rnr_timer can be ~80 ms): a single RNR NAK — inevitable once a bulk
-// frame overruns the 8-slot receive ring — then stalls the stream by ~80 ms per
-// chunk (measured ~77 ms/chunk on 6 MB GLM prefill frames, i.e. ~3 MB/s).
-// RTS->RTS only accepts a subset of attributes depending on the driver, so each
-// knob is tried independently and failure degrades to a warning.
-void tune_one(ibv_qp * qp, int which, uint32_t value, const char * name) {
+// wait for one cm event of the expected type; timeout_ms < 0 waits forever.
+// A stale peer previously made the master hang inside rdma_get_cm_event during
+// warmup with no recovery — bounded waits let the caller fall back to TCP.
+bool cm_wait(rdma_event_channel * ec, rdma_cm_event_type want, rdma_cm_id ** id_out, std::string * err,
+             int timeout_ms = 5000) {
+    const int64_t deadline = now_ms() + (timeout_ms < 0 ? 0 : timeout_ms);
+    for (;;) {
+        if (timeout_ms >= 0) {
+            const int64_t remain = deadline - now_ms();
+            if (remain <= 0) {
+                set_err_msg(err, std::string("rdma_cm event wait timed out (") +
+                        std::to_string(timeout_ms) + " ms), wanted " + rdma_event_str(want));
+                return false;
+            }
+            pollfd pfd = {ec->fd, POLLIN, 0};
+            const int pr = poll(&pfd, 1, (int) remain);
+            if (pr < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                set_err(err, "poll(cm channel)");
+                return false;
+            }
+            if (pr == 0) {
+                continue; // re-check deadline
+            }
+        }
+        rdma_cm_event * ev = nullptr;
+        if (rdma_get_cm_event(ec, &ev) != 0) {
+            if (errno == EINTR || errno == EAGAIN) {
+                continue;
+            }
+            set_err(err, "rdma_get_cm_event");
+            return false;
+        }
+        const bool ok = ev->event == want;
+        if (!ok) {
+            set_err_msg(err, "rdma_cm event " + std::to_string((int) ev->event) +
+                    " (" + rdma_event_str(ev->event) + "), wanted " + rdma_event_str(want));
+        }
+        if (id_out) {
+            *id_out = ev->id;
+        }
+        rdma_ack_cm_event(ev);
+        return ok;
+    }
+}
+
+// Tighten the RNR retry timer on an established RC QP.  The rdma_cm default
+// min_rnr_timer is huge (~80 ms scale): a single RNR NAK — inevitable once a
+// bulk frame overruns the 8-slot receive ring — stalled the stream by ~80 ms
+// per chunk (measured ~77 ms/chunk on 6 MB GLM prefill frames, i.e. ~3 MB/s,
+// with multi-second collapse cascades).  0.01 ms recovery keeps an occasional
+// RNR at line rate (measured 16 MB frames: 5.5 GB/s, zero >100 ms stalls).
+// RTS->RTS accepts only a driver-specific attribute subset (mlx5: just
+// min_rnr_timer), so failure degrades to a warning.
+void tune_qp(ibv_qp * qp) {
     ibv_qp_attr attr = {};
-    attr.qp_state = IBV_QPS_RTS;
-    switch (which) {
-    case IBV_QP_TIMEOUT:        attr.timeout       = value; break;
-    case IBV_QP_RETRY_CNT:      attr.retry_cnt     = value; break;
-    case IBV_QP_RNR_RETRY:      attr.rnr_retry     = value; break;
-    case IBV_QP_MIN_RNR_TIMER:  attr.min_rnr_timer = value; break;
+    attr.qp_state      = IBV_QPS_RTS;
+    attr.min_rnr_timer = 1; // 0.01 ms RNR retry delay
+    if (ibv_modify_qp(qp, &attr, IBV_QP_STATE | IBV_QP_MIN_RNR_TIMER) != 0) {
+        fprintf(stderr, "llama-ep-rdma: tune min_rnr_timer failed: %s (ignored)\n",
+                strerror(errno));
     }
-    if (ibv_modify_qp(qp, &attr, IBV_QP_STATE | which) != 0) {
-        fprintf(stderr, "llama-ep-rdma: tune_qp %s=%u failed: %s (ignored)\n",
-                name, value, strerror(errno));
-    }
-}
-
-bool tune_qp(ibv_qp * qp, std::string * err) {
-    (void) err;
-    tune_one(qp, IBV_QP_MIN_RNR_TIMER, 1, "min_rnr_timer"); // 0.01 ms
-    tune_one(qp, IBV_QP_TIMEOUT,       14, "timeout");      // ~67 ms
-    tune_one(qp, IBV_QP_RETRY_CNT,     7, "retry_cnt");     // infinite
-    tune_one(qp, IBV_QP_RNR_RETRY,     7, "rnr_retry");     // infinite
-    return true;
 }
 
 // create PD/CQ/QP and register the rings on an id that has addr/route resolved
@@ -442,7 +466,7 @@ llama_ep_transport * llama_ep_rdma_connect(const char * host, int port, std::str
         ok = false;
     }
     if (ok) ok = cm_wait(c->ec, RDMA_CM_EVENT_ESTABLISHED, nullptr, err);
-    if (ok) ok = tune_qp(c->id->qp, err);
+    if (ok) tune_qp(c->id->qp);
 
     if (!ok) {
         rdma_conn_close(c);
@@ -468,7 +492,7 @@ bool rdma_listener_accept(void * vctx, llama_ep_transport * out) {
 
     rdma_cm_id * conn_id = nullptr;
     std::string err;
-    if (!cm_wait(l->ec, RDMA_CM_EVENT_CONNECT_REQUEST, &conn_id, &err)) {
+    if (!cm_wait(l->ec, RDMA_CM_EVENT_CONNECT_REQUEST, &conn_id, &err, -1)) {
         return false;
     }
 
@@ -489,14 +513,11 @@ bool rdma_listener_accept(void * vctx, llama_ep_transport * out) {
         rdma_conn_close(c);
         return false;
     }
-    if (!cm_wait(l->ec, RDMA_CM_EVENT_ESTABLISHED, nullptr, &err)) {
+    if (!cm_wait(l->ec, RDMA_CM_EVENT_ESTABLISHED, nullptr, &err, -1)) {
         rdma_conn_close(c);
         return false;
     }
-    if (!tune_qp(conn_id->qp, &err)) {
-        rdma_conn_close(c);
-        return false;
-    }
+    tune_qp(conn_id->qp);
 
     out->ctx = c;
     out->ops = {rdma_send_all, rdma_recv_all, rdma_conn_close};
