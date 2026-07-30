@@ -80,6 +80,29 @@ NUMA-EP + mirror、72 线程、fa=1、batch 4096/ubatch 1024；`--no-repack` 为
 - GPU 卸载：差异 **<1%**——瓶颈移至 GPU 侧注意力与专家计算，CPU 矩阵乘占比缩小后 repack 收益被摊薄
 - 结论：纯 CPU / 长 prompt 场景开 repack（默认）；GPU 卸载下开不开均可；只追极限 TG 可 `--no-repack`
 
+### 双机 expert-parallel（GLM-5.2 745B UD-Q2_K_MXFP4，2026-07-31 全量测速）
+
+拓扑：master（双路 8360Y 级 / 251G / 2×3090）←RoCEv2 100G 直连→ slave（双路 36 核 Ice Lake ES / **188G，双节点对称各 ~157 GB/s，合计 ~315 GB/s**（2026-07-30 内存整改后，为旧 174 GB/s 的 1.8×））。slave 以 `llama-epd` worker 认领 MoE 层 3-17（15 层 ≈43.5G，`--no-mmap` 常驻），master 本地 52 层 + GPU 专家卸载 9 层。正确性：以下全部配置 gen48（temp 0 / seed 42）与单机基线**逐字 IDENTICAL**。
+
+| 配置 | TG96 | TG512 | PP5 | PP63 | PP254 | PP1020 |
+|---|---|---|---|---|---|---|
+| 单机（NUMA-EP + mirror） | — | **13.20-13.25** | ~20 | 5.94 | 13.9 | 34.9-35.1 |
+| 双机 15 层（TCP） | 11.64 | 11.58-11.85 | 18.2 | 7.17 | 18.7 | 34.1-34.5 |
+| 双机 15 层（RDMA） | 12.21 | **12.01-12.16** | 19.9 | ⚠塌陷 | ⚠塌陷 | ⚠塌陷 |
+| 双机 15 层 + `MIRROR=1`（TCP，ABBA） | 12.76 | **12.53-12.93（+9.4%）** | 19.9 | 4.31-5.33（-31%） | 15.1（-19%） | 31.1-33.1（-6%） |
+| 双机 32 层（3-34，TCP，规划器新最优点实测） | 9.24 | 9.46-10.26 | 16.4 | 8.30 | 19.2 | 31.7 |
+
+要点：
+
+- **slave 带宽 ×1.8 后 decode 全面提速**：worker 每层 compute 0.85-0.94ms（旧带宽估计 2.6ms），双机 TCP TG512 10.71→11.8（+10%）、RDMA →12.1；单机 TG512 ~10→13.2。RDMA 对 decode（KB 级帧）再 +3%。
+- **⚠ RDMA 大帧塌陷（新发现，待修）**：PP 的 MB 级 REQ 帧在 RDMA 环上仅 ~3MB/s（每 256KB chunk ~77ms），PP 全面不可用；TCP 同帧正常。RDMA 目前只建议 decode 场景；PP 用 TCP。
+- **MAX-EFFORT 层镜像（`GGML_REMOTE_EP_MIRROR=1`）**：decode 收益稳定（TG512 +9.4%，与旧带宽 +10.6% 相当）；但 PP 收益**反转**（PP1020 旧 +27% → 现 -6%，PP63 旧 -18.6% → 现 -31%）——master 本地 MoE prefill 有效带宽本次实测约减半（新旧二进制同现，与重启后环境相关，numa_balancing 已排除，待查），镜像把 prefill 计算搬回 master 由赚变亏。**decode 开镜像，PP 场景暂关**。
+- **分层点维持 slave 15 层**：EP 规划器（`tools/epd/ep-plan.py`，新增 `--model glm` 预设）按新带宽预测 Ls* 15→32，实测 32 层 TG -13% 否定——decode 远程段近串行，远程每层成本仍高于本地；DSV4 预测 8→11 层（未实测）。
+- worker 线程扫描：-t 70（12.16）> -t 36（11.66），维持物理核档位；worker `GGML_EPD_NUMA=weighted`（NUMA 加权交织）实测正常（slave 双节点对称，权重 1:1 等价 interleave）。
+- 已知遗留：master 本地 MoE prefill 有效带宽偏低仍是小档 PP 主瓶颈；RDMA 大帧与 rdma_cm 重连无超时（worker 陈旧状态下 master warmup 会无限等待）列入待修。
+
+双机快速上手与全部 env 见 [tools/epd/README.md](tools/epd/README.md)；测速脚本 `tools/epd/bench-glm-{master,worker}.sh` + `bench-glm-client.py`（TG96/TG512 + PP 摊销曲线 5/63/254/1020 + gen48 对拍采样）。
+
 ## 核心技术
 
 - **NUMA 镜像**：非专家权重 + KV 双节点复制，线程绑核，UPI 流量归零
@@ -87,11 +110,11 @@ NUMA-EP + mirror、72 线程、fa=1、batch 4096/ubatch 1024；`--no-repack` 为
 - **AVX512/VNNI 8×8 重排内核**：Q2_K~Q6_K、Q8_0、MXFP4、IQ1_S/IQ1_M 全格式覆盖，PP 批量（gemm nr≥16）加速最高 4.9×；其中 Q3_K/Q5_K/Q6_K/Q8_0 x86 内核与 IQ1_S/IQ1_M 全套（块布局+repack+内核）为本分支新增
 - **融合算子**：dsv4 超连接 CUDA 内核、融合 MoE 路由器、RMS_NORM 吸收、GLM-DSA 闪电索引器
 - **MTP 投机解码**（dsv4）
-- **跨机 EP（开发中）**：激活派发（KB 级流量）而非权重传输，InfiniBand EDR 互联可扩展 CPU MoE 节点，目标 2.8T 级模型
+- **跨机 EP（已上线）**：激活派发（KB 级流量）而非权重传输，slave `llama-epd` worker 认领 MoE 层，RoCEv2 100G 直连（TCP/RDMA 双传输后端，RDMA opt-in）；MAX-EFFORT 层镜像（`GGML_REMOTE_EP_MIRROR`）把远程段从 decode 关键路径上重叠掉（TG +9~11%）；worker 固定开销已消除（DSV4 PP +75%）；支持 NUMA 加权交织（`GGML_EPD_NUMA=weighted`）；EP 规划器 `tools/epd/ep-plan.py` 按带宽实测给分层点
 
 ## 当前状态
 
-早期开发阶段。`main` 分支 = 生产可用；跨机 EP 传输层（`tools/epd`）已就绪，主机侧集成进行中。
+早期开发阶段。`main` 分支 = 生产可用；双机 expert-parallel 已上线（DSV4 追平单机 + master 内存省 26%；GLM-5.2 见上方数据表），EPD worker / RDMA 后端 / 层镜像 / 规划器均在 `tools/epd`。
 
 **完整改动清单见 [docs/CHANGES.md](docs/CHANGES.md)**（NUMA 体系、CPU 内核格式支持、融合算子、环境变量速查）。
 

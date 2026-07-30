@@ -80,6 +80,29 @@ Identical config (NUMA-EP + mirror, 72 threads, fa=1, batch 4096/ubatch 1024); `
 - GPU offload: difference **<1%** — the bottleneck moves to GPU-side attention and expert compute, and the repack gain washes out as the CPU matmul share shrinks
 - Takeaway: keep repack on (default) for CPU-only / long-prompt workloads; either way is fine with GPU offload; use `--no-repack` only if chasing peak TG
 
+### Two-machine expert-parallel (GLM-5.2 745B UD-Q2_K_MXFP4, full sweep 2026-07-31)
+
+Topology: master (dual Xeon 8360Y-class / 251G / 2×3090) ←100G RoCEv2 direct link→ slave (dual 36-core Ice Lake ES / **188G, symmetric ~157 GB/s per node, ~315 GB/s total** — 1.8× the old 174 GB/s after the 2026-07-30 memory rework). The slave runs the `llama-epd` worker owning MoE layers 3-17 (15 layers ≈43.5G, `--no-mmap` resident); master keeps 52 local layers + 9 GPU-offloaded layers. Correctness: every configuration below produces gen48 output (temp 0 / seed 42) **byte-identical** to the single-machine baseline.
+
+| Config | TG96 | TG512 | PP5 | PP63 | PP254 | PP1020 |
+|---|---|---|---|---|---|---|
+| Single machine (NUMA-EP + mirror) | — | **13.20-13.25** | ~20 | 5.94 | 13.9 | 34.9-35.1 |
+| Two-machine 15L (TCP) | 11.64 | 11.58-11.85 | 18.2 | 7.17 | 18.7 | 34.1-34.5 |
+| Two-machine 15L (RDMA) | 12.21 | **12.01-12.16** | 19.9 | ⚠collapsed | ⚠collapsed | ⚠collapsed |
+| 15L + `MIRROR=1` (TCP, ABBA) | 12.76 | **12.53-12.93 (+9.4%)** | 19.9 | 4.31-5.33 (-31%) | 15.1 (-19%) | 31.1-33.1 (-6%) |
+| Two-machine 32L (3-34, TCP; planner's new optimum, measured) | 9.24 | 9.46-10.26 | 16.4 | 8.30 | 19.2 | 31.7 |
+
+Highlights:
+
+- **Decode sped up across the board with 1.8× slave bandwidth**: worker compute is now 0.85-0.94 ms/layer (2.6 ms estimated on the old memory); two-machine TCP TG512 10.71→11.8 (+10%), RDMA →12.1; single-machine TG512 ~10→13.2. RDMA adds another +3% for decode (KB-scale frames).
+- **⚠ RDMA large-frame collapse (newly found, fix pending)**: MB-scale PP request frames crawl at ~3 MB/s on the RDMA ring (~77 ms per 256 KB chunk), making PP unusable over RDMA; TCP handles the same frames fine. Use RDMA for decode only, TCP for PP.
+- **MAX-EFFORT layer mirroring (`GGML_REMOTE_EP_MIRROR=1`)**: decode gain holds (TG512 +9.4%, vs +10.6% on the old memory), but the PP gain has **inverted** (PP1020: +27% before → -6% now; PP63: -18.6% → -31%) — master-local MoE prefill bandwidth measured ~2× lower this session (reproduced on both old and new binaries; post-reboot environment suspected, numa_balancing ruled out), so moving prefill compute back to the master now loses. **Mirror on for decode, off for PP.**
+- **Layer split stays at 15 slave layers**: the EP planner (`tools/epd/ep-plan.py`, new `--model glm` preset) predicted Ls* shifting 15→32 with the new bandwidth, but measurement refutes it (32L TG -13%) — the remote segment is nearly serial in decode, so a remote layer still costs more than a local one; DSV4 prediction 8→11 layers (not measured).
+- Worker thread scan: -t 70 (12.16) beats -t 36 (11.66) — stay at physical cores; worker `GGML_EPD_NUMA=weighted` (NUMA weighted interleave) verified in production (symmetric slave nodes, 1:1 weights ≡ interleave).
+- Known issues: master-local MoE prefill effective bandwidth is still the small-prompt PP bottleneck; RDMA large frames and missing rdma_cm reconnect timeout (master warmup can hang forever against a stale worker) are on the fix list.
+
+Setup guide and full env reference: [tools/epd/README.md](tools/epd/README.md); bench scripts `tools/epd/bench-glm-{master,worker}.sh` + `bench-glm-client.py` (TG96/TG512 + PP amortization curve 5/63/254/1020 + gen48 comparison sampling).
+
 ## What's inside
 
 - **NUMA mirror**: duplicate non-expert weights + KV per socket, pin threads per node — zero UPI traffic
@@ -87,11 +110,11 @@ Identical config (NUMA-EP + mirror, 72 threads, fa=1, batch 4096/ubatch 1024); `
 - **AVX512/VNNI 8×8 repack kernels**: full coverage of Q2_K–Q6_K, Q8_0, MXFP4, IQ1_S/IQ1_M — up to 4.9× on PP batches (gemm nr≥16); the Q3_K/Q5_K/Q6_K/Q8_0 x86 kernels and the entire IQ1_S/IQ1_M stack (block layout + repack + kernels) are new in this fork
 - **Fused ops**: DeepSeek-V4 hyper-connection CUDA kernel, fused MoE router, RMS_NORM absorption, GLM-DSA Lightning Indexer
 - **MTP speculative decoding** (DeepSeek-V4)
-- **Cross-machine EP (WIP)**: activation dispatch (KB-scale traffic) instead of weight transfer, InfiniBand EDR interconnect, scalable CPU MoE nodes — targeting 2.8T-class models
+- **Cross-machine EP (live)**: activation dispatch (KB-scale traffic) instead of weight transfer; the slave `llama-epd` worker owns MoE layers over a 100G RoCEv2 direct link (TCP/RDMA dual transports, RDMA opt-in); MAX-EFFORT layer mirroring (`GGML_REMOTE_EP_MIRROR`) overlaps the remote segment off the decode critical path (TG +9~11%); worker per-request fixed overhead eliminated (DSV4 PP +75%); NUMA weighted interleave (`GGML_EPD_NUMA=weighted`); the EP planner `tools/epd/ep-plan.py` recommends layer splits from measured bandwidth
 
 ## Status
 
-Early development. `main` branch = production-ready; cross-machine EP transport layer (`tools/epd`) is ready, master-side integration in progress.
+Early development. `main` branch = production-ready; two-machine expert-parallel is live (DSV4 matches single-machine speed with 26% lower master RAM; GLM-5.2 numbers in the table above), with the EPD worker / RDMA transport / layer mirroring / planner in `tools/epd`.
 
 **Full changelog and feature documentation: [docs/CHANGES.md](docs/CHANGES.md)** (Chinese) — NUMA architecture, CPU kernel format matrix, fused ops, environment variable reference.
 

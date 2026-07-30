@@ -18,7 +18,7 @@
 | `GGML_REMOTE_EP_PORT` | 29200 | worker 端口 |
 | `GGML_REMOTE_EP_LAYERS` | 全部 | 远端层范围 `A-B`；范围外的层走本地 |
 | `GGML_REMOTE_EP_DEBUG` | 关 | 置 1 每次 RPC 打印 send/wait 耗时（master）；worker 端置 1 每 REQ 打印 compute 耗时 |
-| `GGML_REMOTE_EP_RDMA` | 关 | 置 1 传输层改用 RDMA（RoCEv2，rdma_cm 自动建连）。需编译时检测到 libibverbs+librdmacm（CMake 打印 `EP RDMA transport (RoCEv2): ON`）；无卡/建连失败时打 warning 并自动回退 TCP。master 与 worker 需同时置 1（协议不同，不互通） |
+| `GGML_REMOTE_EP_RDMA` | 关 | 置 1 传输层改用 RDMA（RoCEv2，rdma_cm 自动建连）。需编译时检测到 libibverbs+librdmacm（CMake 打印 `EP RDMA transport (RoCEv2): ON`）；无卡/建连失败时打 warning 并自动回退 TCP。master 与 worker 需同时置 1（协议不同，不互通）。**⚠ 2026-07-31：MB 级大帧（PP）在 RDMA 环上严重塌陷（~77ms/256KB chunk），修复前 RDMA 仅建议 decode 场景，PP 用 TCP** |
 | `GGML_REMOTE_EP_PIPELINE` | 关 | 置 1 启用流水线分块投递：多 token 层（PP）把 token 维切成块，W=1 滑动窗口发送（发块 i 后收块 i-1 的响应），worker 计算与 master 收发重叠。协议不变（每块是一个普通 REQ 帧），逐 token 数值不变；decode（1 token）不受影响自动走原路径。TCP/RDMA 均可用 |
 | `GGML_REMOTE_EP_PIPELINE_CHUNK` | 256 | 每块 token 数上限；再按隐藏层字节数封顶（TCP ≤3MiB、RDMA ≤1.5MiB，保证 W=1 窗口在 socket buffer / RDMA 接收环容量内，不会死锁） |
 | `GGML_REMOTE_EP_MIRROR` | 关 | 置 1 启用层镜像 + 专家 slot 拆分：master 同时加载远程层专家权重（这些层不再 TENSOR_SKIP），每层 MoE 沿 slot 维切两半——slot [0,k_r) 发 worker（只发不等的 send op），slot [k_r,k) 在 master 本地走与单机 MoE 完全相同的链路，wait op 收 partial_r 后按 slot 升序合并（与全远程基线结合顺序一致，逐字对拍 bit 一致）。decode 与 PP 均生效；详见下文实测节 |
@@ -252,8 +252,11 @@ decode 时每层每 token 专家字节 `E = top_k × 3 × n_embd × n_ff × bpw/
 
 实测 NUMA 本地 read 带宽（membw，干净环境）：master node0 167.5 / node1 173.9
 （合计 ~341 GB/s）；slave node0 93.8 / node1 80.2（合计 ~174 GB/s，
-node1 因 2DPC 内存慢 14%，硬件现状）→ 带宽比 ~1.96:1。GGML_REMOTE_EP_DEBUG 实测
-每层 decode 耗时：master 本地 ~0.37ms/层，slave ~0.73ms/层（旧 0.31/0.376 估计作废）。
+node1 因 2DPC 内存慢 14%）→ 带宽比 ~1.96:1。**【2026-07-31 更新：以下为新硬件口径——
+slave 内存整改后双节点 IMC 对称各 ~157 GB/s（合计 ~315，1.8×）；master 重启后
+t76 实测 156.9/153.8（合计 ~311）。ep-plan.py 默认带宽已更新为本组。】**
+GGML_REMOTE_EP_DEBUG 实测每层 decode 耗时：master 本地 ~0.37ms/层（DSV4），
+slave 旧带宽 0.73ms/层 → 新带宽 GLM 实测 0.85-0.94ms/层（旧带宽估计 2.6ms/层作废）。
 
 - DSV4（40 MoE 层，GPU 固定卸载 14 层 8-21，CPU 可分配 26 层 3-7+22-42）：
   0.37×(26-N) = 0.73×N → N ≈ 9；计入每层 ~0.13ms 网络开销后 **N ≈ 8（slave 35-42）
@@ -367,3 +370,63 @@ PP245 小回归与 GLM 小档同源（master 本地 MoE 小批次带宽问题，
 master 本地小批次带宽短板有回归——小档场景建议保持默认（MIRROR 关）或等
 master 本地带宽问题修复后再开。off 轮均复现历史基线锚点（GLM TG≈10.7-11.5 /
 PP1020≈74.5，DSV4 TG≈24.7 / PP985≈274.5），无顺序效应。
+
+## GLM-5.2 全量测速（2026-07-31，slave 新内存 188G/315GB/s 首轮，commit 4e51d4730+）
+
+硬件变化：slave 188G（7×16G+10×8G，双节点对称各 ~157 GB/s）；master 重启后
+156.9/153.8 GB/s（t76）。worker：build-cpu-rdma，`--no-mmap -t 70`，
+`GGML_EPD_NUMA=weighted`（首次实战：带宽探测 node0=node1=78.7 GB/s → 权重 1:1，
+对称节点等价 interleave，全程无异常；sysfs 权重写入需 root，缺权限打 warning 用
+当前值）。测速脚本：`bench-glm-{master,worker}.sh` + `bench-glm-client.py`
+（/tmp 模板丢失后的入库替代品）。
+
+**worker 线程扫描**（RDMA，TG512）：-t 70 → 12.16 t/s；-t 36 → 11.60/11.66 t/s。
+新现象"72 线程 membw -20%"在端到端 decode 上不成立，**维持 -t 70（=物理核）**。
+
+**全矩阵**（master build-epdev-rdma，t70/tb70，fa1，b1024/ub512，GLM 15 层 3-17）：
+
+| 配置 | TG96 | TG512 | PP5 | PP63 | PP254 | PP1020 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 单机（NUMA-EP+mirror，热） | — | 13.20/13.25 | ~20 | 5.94/6.18 | 13.87 | 34.87/35.12 |
+| 双机 TCP（off1/off2 ABBA） | 11.64 | 11.68/11.85、11.58/11.85 | 18.2 | 7.17/7.15 | 18.65 | 34.47/34.10 |
+| 双机 RDMA | 12.21 | 12.01/12.12/12.11 | 19.9 | 塌陷 | 塌陷 | 塌陷 |
+| 双机 RDMA+PIPELINE | 12.15 | 12.10/12.11 | 18.4 | 6.19 | 2.28 | 2.15 |
+| 双机 TCP + MIRROR=1（on1/on2 ABBA） | 12.76 | 12.80/12.93、12.53/12.87 | 19.9 | 4.31/5.33 | 15.12 | 31.10/33.05 |
+| 双机 32 层（3-34，TCP） | 9.24 | 9.46/10.26 | 16.4 | 8.30 | 19.22 | 31.70 |
+
+正确性：单机 / 双机 TCP / 双机 RDMA / RDMA+pipeline / MIRROR on×2 / off 共 8 份
+gen48（temp 0 / seed 42 / "The capital of France is"）md5 全部一致（逐字 IDENTICAL）。
+
+**发现 1：RDMA 大帧塌陷（待修）**。decode（KB 级帧）正常且比 TCP +3%
+（TG512 12.1 vs 11.8）；但 MB 级 PP REQ 帧在 RDMA 环上仅 ~3MB/s——master ep-debug
+实测 n_tokens=254（~6.2MB 帧）每层 send 1939ms（≈77ms/256KB chunk），PP254 90s、
+PP1020 219s；同帧 TCP 正常（13.6s/29.6s）。微基准 ≤1MB 一切正常（255µs），问题
+只在多 chunk 大帧。PIPELINE 不救（RDMA chunk 封顶 1.5MiB ≈63 tok/帧，帧内路径正常
+但 master 本地段才是大头，PP1020 反而 473s）。**临时结论：decode 开 RDMA，PP 用 TCP。**
+另发现 rdma_cm 建连无超时：worker 陈旧连接状态下 master warmup 线程在
+ucma_get_event 无限等待（server 假死，RSS 7.8G 不前进）；重启 worker 后恢复。
+
+**发现 2：master 本地 MoE prefill 带宽约减半（环境问题，非代码）**。本次 PP 全面
+低于 07-30 晚（PP1020 双机 66-74.5 → 34.5；单机 34.9）。旧二进制 build-epdev
+（0730-02:31）同机复测 PP1020 33.6/35.0 与新二进制一致 → 排除镜像/重构图改动
+回归；numa_balancing 关/开无差异（已恢复开）；decode 反而更快（单机 TG512
+13.2 vs 旧 ~10）。待查（重启后环境差异：governor/C-state/IRQ/页缓存策略等）。
+
+**发现 3：MAX-EFFORT 镜像 PP 收益反转**。ABBA 配对（同会话 off1→on1→on2→off2）：
+TG512 off 11.7 avg → on 12.8 avg（**+9.4%**，与旧带宽 +10.6% 一致，decode 镜像
+重叠机制稳定）；PP1020 旧 +27% → 现 **-6.4%**；PP63 旧 -18.6% → 现 **-31%**。
+根因即发现 2：镜像把 15 层 ×4 slot 的 prefill 计算搬回 master 本地，master 本地
+prefill 带宽塌陷后由赚变亏。**decode 开镜像、PP 关镜像**（env 切换即可）。
+
+**发现 4：规划器新带宽预测被实测否定，分层维持 15 层**。ep-plan.py 新增
+`--model glm` 预设（锚点 9.86/10.71/10.42 反解 t_m=1.33/t_s=2.60ms/层，β=0.719，
+锚点误差 ≤0.4%）；按新带宽（t_s×174/315=1.44）预测 Ls* 15→32（TG 12.90 vs 10.54）。
+实测 32 层（3-34，slave 93G/188G 内存无压力）TG512 9.46/10.26（**-13% vs 15 层**）、
+PP 持平 → 与 07-30 的 25 层否定一致：**decode 远程段近串行，远程每层成本
+（compute ~1.05ms + RPC）仍高于本地（~1.1ms），加层即减速**；规划器的重叠度假设
+对 decode 过于乐观（模型适用于粗筛，边界需实测）。DSV4 同法预测 8→11 层（未实测，
+仅结论）。worker 32 层分层 compute 分布：多数层 0.9-1.0ms，L3/L29/L30 异常
+1.2-1.7ms（待查）。
+
+**slave 内存核算**：32 层 --no-mmap RSS 98G/188G（available 89G）无压力；
+master 侧 32 层非镜像 ~114G/251G；**镜像在 Ls=32 不可行**（163+32×2.9≈256G > 251G）。
