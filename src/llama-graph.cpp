@@ -2039,6 +2039,67 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             selected_experts = ggml_cont(ctx0, selected_experts);
             weights          = ggml_cont(ctx0, weights);
 
+            // expert-level dynamic scheduling (GGML_REMOTE_EP_SCHED=1): the
+            // dealer assigns every slot to the master (m* local slots) or a
+            // slave endpoint (REQ2); the merge op accumulates all per-slot
+            // contributions in ascending global slot order — bit-identical to
+            // the local baseline (SCHEDULER-DESIGN §4.5). separate gate/up
+            // layout only; takes precedence over the mirror branch
+            const int m_star = gate_exps && up_exps && down_exps &&
+                    llama_remote_ep_sched_fits(n_tokens, n_expert_used, n_embd)
+                ? llama_remote_ep_sched_klocal(il, n_expert_used) : 0;
+
+            if (m_star > 0) {
+                // partition+send op: dst = local ids [m*, n_tokens] i32; the
+                // callback deals the slots, writes dst, and fires one REQ2 per
+                // endpoint (send only, no wait). the CPU backend runs nodes in
+                // creation order with barriers between them, so the local
+                // subgraph below overlaps the workers' compute
+                ggml_tensor * args_s[3] = {cur, selected_experts, weights};
+                ggml_tensor * local_ids = ggml_custom_4d(ctx0, GGML_TYPE_I32,
+                        m_star, n_tokens, 1, 1, args_s, 3,
+                        llama_remote_ep_sched_send_cb, 1, (void *) (intptr_t) il);
+                ggml_build_forward_expand(gf, local_ids);
+
+                // local slots: same chain as the local MoE path (separate
+                // gate/up, SILU) — WITHOUT the weight multiply: the merge op
+                // applies it (same scalar f32 multiply, same bits)
+                ggml_tensor * up_l   = build_lora_mm_id(up_exps,   cur, local_ids, nullptr); // [n_ff, m*, n_tokens]
+                ggml_tensor * gate_l = build_lora_mm_id(gate_exps, cur, local_ids, nullptr);
+
+                ggml_tensor * act = nullptr;
+                const float limit = il >= 0 ? hparams.swiglu_clamp_exp[il] : 0.0f;
+                constexpr float eps = 1e-6f;
+                if (limit > eps) {
+                    up_l = ggml_clamp(ctx0, up_l, -limit, limit);
+                    if (arch == LLM_ARCH_DEEPSEEK4) {
+                        gate_l = ggml_clamp(ctx0, gate_l, -INFINITY, limit);
+                        act = ggml_swiglu_split(ctx0, gate_l, up_l);
+                    } else {
+                        ggml_tensor * gate_act = ggml_silu(ctx0, gate_l);
+                        gate_act = ggml_clamp(ctx0, gate_act, -INFINITY, limit);
+                        act = ggml_mul(ctx0, gate_act, up_l);
+                    }
+                } else {
+                    act = ggml_swiglu_split(ctx0, gate_l, up_l);
+                }
+
+                ggml_tensor * experts_l = build_lora_mm_id(down_exps, act, local_ids, nullptr); // [n_embd, m*, n_tokens]
+                cb(experts_l, "ffn_moe_down", il);
+                ggml_build_forward_expand(gf, experts_l);
+
+                // wait+merge op: src = {local_ids (send op), experts_l, weights}
+                // force it to run after both; dst receives moe_out [n_embd,1,n_tokens]
+                ggml_tensor * args_w[3] = {local_ids, experts_l, weights};
+                ggml_tensor * moe_out = ggml_custom_4d(ctx0, GGML_TYPE_F32,
+                        n_embd, 1, n_tokens, 1, args_w, 3,
+                        llama_remote_ep_sched_merge_cb, 1, (void *) (intptr_t) il);
+                cb(moe_out, "ffn_moe_out", il);
+                ggml_build_forward_expand(gf, moe_out);
+
+                return ggml_reshape_2d(ctx0, moe_out, n_embd, n_tokens);
+            }
+
             // layer mirroring + expert-slot split (GGML_REMOTE_EP_MIRROR=1):
             // slots [0,k_r) go to the worker, slots [k_r,k) run locally.
             // separate gate/up layout only; mirror_fits keeps oversized RDMA

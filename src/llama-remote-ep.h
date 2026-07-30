@@ -33,6 +33,20 @@
 //   GGML_REMOTE_EP_MIRROR_KREMOTE=N
 //                               slots sent remotely (default n_expert_used/2,
 //                               clamped to [1, n_expert_used-1]).
+//   GGML_REMOTE_EP_SCHED=1      expert-level dynamic scheduling (SCHEDULER-
+//                               DESIGN.md): the router's top-k slots are dealt
+//                               per token between the master (m* local slots,
+//                               GGML_REMOTE_EP_SCHED_KLOCAL, default 2) and the
+//                               slave endpoints of GGML_REMOTE_EP_SCHED_ENDPOINTS
+//                               ("host:port,host:port"; default HOST:PORT) via
+//                               REQ2; a merge op accumulates all per-slot vectors
+//                               in ascending global slot order — bit-identical to
+//                               the local baseline. mutually exclusive with
+//                               MIRROR (SCHED wins); a LEP1-only worker fails the
+//                               CAP handshake and the layer falls back to the
+//                               classic path. decode-only unless
+//                               GGML_REMOTE_EP_SCHED_PP=1. in SCHED mode the
+//                               master never skips expert weights (full replica).
 //
 // Only the routed-expert FFN is remote; attention, router and the weighted
 // sum semantics are unchanged. Layers outside the range (and warmup graphs)
@@ -110,3 +124,31 @@ void llama_remote_ep_mirror_wait_cb(
 // must fit the pre-posted receive ring (8 x 256 KiB). TCP is unaffected
 // (blocking send just applies backpressure). false => use the classic path
 bool llama_remote_ep_mirror_fits(int64_t n_tokens, int64_t n_embd);
+
+// expert-level dynamic scheduling (GGML_REMOTE_EP_SCHED=1):
+//
+// number of expert slots computed locally per token for a scheduled layer; 0
+// when scheduling does not apply to layer il (disabled, out of range, or the
+// CAP negotiation failed — the layer then falls back to mirror/classic).
+// the first call negotiates protocol v2 with every endpoint (CAP handshake)
+// and caches the outcome.
+int llama_remote_ep_sched_klocal(int il, int n_expert_used);
+
+// gate on the batch shape: scheduling is decode-only unless
+// GGML_REMOTE_EP_SCHED_PP=1; over RDMA the RESP2 (one vector per slot) must
+// fit the pre-posted receive ring (same reasoning as llama_remote_ep_mirror_fits)
+bool llama_remote_ep_sched_fits(int64_t n_tokens, int64_t n_ids, int64_t n_embd);
+
+// scheduled custom-op pair used by build_moe_ffn (ggml_custom_4d, srcs in
+// dst->src); userdata = (void *)(intptr_t) il.
+// send: dst = local ids [m*, n_tokens] i32 (written by the dealer), srcs =
+// {hidden, ids, weights}; fires one REQ2 per endpoint (send only, no wait)
+// and stashes the plan + request bytes in the pending slot for the merge op.
+// merge: dst = moe_out [n_embd,1,n_tokens] f32, srcs = {send out, experts_l,
+// weights}; receives the RESP2s in fixed endpoint order, then accumulates all
+// contributions in ascending global slot order (local slots are multiplied by
+// their router weight here — the same scalar multiply the baseline does in
+// ggml_mul, keeping the merge bit-identical). on transport failure the
+// request is resent once from the pending slot, then GGML_ABORT.
+void llama_remote_ep_sched_send_cb(ggml_tensor * dst, int ith, int nth, void * userdata);
+void llama_remote_ep_sched_merge_cb(ggml_tensor * dst, int ith, int nth, void * userdata);

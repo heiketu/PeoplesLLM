@@ -2,6 +2,7 @@
 
 #include "llama-impl.h"
 
+#include "../tools/epd/llama-ep-dealer.h"
 #include "../tools/epd/llama-ep-transport.h"
 
 #include <cstdio>
@@ -61,12 +62,53 @@ struct remote_ep_state {
     int         port        = 29200;
     int         layer_first = 0;
     int         layer_last  = 1 << 30;
+    // comma-separated range list ("3-7,22-42"); empty = use [layer_first, layer_last]
+    std::vector<std::pair<int, int>> layer_ranges;
 
     // layer mirroring + expert-slot split (GGML_REMOTE_EP_MIRROR=1)
     bool        mirror            = false;
     int         mirror_layer_first = 0;
     int         mirror_layer_last  = 1 << 30;
     int         mirror_kremote_cfg = 0; // 0 = default n_expert_used/2
+
+    // expert-level dynamic scheduling (GGML_REMOTE_EP_SCHED=1)
+    bool        sched           = false;
+    int         sched_klocal    = 2;    // m*: local slots per token
+    bool        sched_pp        = false; // allow n_tokens > 1 (P4; default decode-only)
+    int         sched_negotiated = 0;   // 0 = not yet, 1 = ready, -1 = failed (fallback)
+    struct sched_ep {
+        std::string        host;
+        int                port     = 29200;
+        llama_ep_transport * conn    = nullptr;
+        bool               is_rdma = false;
+        int32_t            expert_first = 0; // from CAP
+        int32_t            expert_last  = 0;
+        uint32_t           kernel_id  = 0;
+    };
+    std::vector<sched_ep> sched_eps;
+
+    // in-flight scheduled layer (partition+send op -> wait+merge op). the
+    // compute thread is serial between the two ops of a layer, one slot suffices
+    struct sched_pend_ep {
+        bool                 send_failed = false;
+        std::vector<int32_t> token_idx; // REQ2 staging, kept for one resend
+        std::vector<int32_t> slot_idx;
+        std::vector<int32_t> expert_id;
+        std::vector<float>   weight;
+        std::vector<float>   resp;      // [n_sel*n_embd], filled by the merge op
+    };
+    struct sched_pend {
+        bool                 active   = false;
+        int                  il       = -1;
+        int64_t              n_tokens = 0;
+        int64_t              n_embd   = 0;
+        int                  k        = 0;
+        int                  m_local  = 0;
+        const float        * hidden  = nullptr;  // graph buffers, valid until the merge op
+        const float        * weights = nullptr;
+        std::vector<uint8_t> owner;   // [n_tokens*k]: 0 = local, 1+i = endpoint i
+        std::vector<sched_pend_ep> eps;
+    } spend;
 
     std::mutex           mtx;
     llama_ep_transport * conn = nullptr; // lazy, persistent across decode steps
@@ -91,6 +133,47 @@ struct remote_ep_state {
             conn->ops.close(conn->ctx);
             delete conn;
         }
+        for (auto & ep : sched_eps) {
+            if (ep.conn) {
+                ep.conn->ops.close(ep.conn->ctx);
+                delete ep.conn;
+            }
+        }
+    }
+
+    // "A-B" or "A" or a comma-separated list of those ("3-7,22-42")
+    static bool parse_ranges(const char * s, std::vector<std::pair<int, int>> & out) {
+        out.clear();
+        size_t i = 0;
+        while (s[i] != '\0') {
+            int a = 0, b = 0, n = 0;
+            if (sscanf(s + i, "%d-%d%n", &a, &b, &n) == 2 && a <= b) {
+                out.emplace_back(a, b);
+            } else if (sscanf(s + i, "%d%n", &a, &n) == 1) {
+                out.emplace_back(a, a);
+            } else {
+                return false;
+            }
+            i += (size_t) n;
+            if (s[i] == ',') {
+                ++i;
+            } else if (s[i] != '\0') {
+                return false;
+            }
+        }
+        return !out.empty();
+    }
+
+    bool in_ranges(int il) const {
+        if (layer_ranges.empty()) {
+            return il >= layer_first && il <= layer_last;
+        }
+        for (const auto & r : layer_ranges) {
+            if (il >= r.first && il <= r.second) {
+                return true;
+            }
+        }
+        return false;
     }
 
     void parse_env() {
@@ -107,11 +190,11 @@ struct remote_ep_state {
             port = atoi(p);
         }
         if (const char * l = getenv("GGML_REMOTE_EP_LAYERS")) {
-            int a = 0, b = 0;
-            if (sscanf(l, "%d-%d", &a, &b) == 2 && a <= b) {
-                layer_first = a; layer_last = b;
-            } else if (sscanf(l, "%d", &a) == 1) {
-                layer_first = a; layer_last = a;
+            std::vector<std::pair<int, int>> rs;
+            if (parse_ranges(l, rs)) {
+                layer_ranges = rs;
+                layer_first = rs.front().first;
+                layer_last  = rs.back().second;
             } else {
                 LLAMA_LOG_WARN("%s: ignoring malformed GGML_REMOTE_EP_LAYERS='%s'\n", __func__, l);
             }
@@ -147,6 +230,61 @@ struct remote_ep_state {
             LLAMA_LOG_INFO("%s: GGML_REMOTE_EP_MIRROR=1: mirror layers %d-%d, k_remote=%s\n", __func__,
                     mirror_layer_first, mirror_layer_last == (1 << 30) ? -1 : mirror_layer_last,
                     mirror_kremote_cfg > 0 ? std::to_string(mirror_kremote_cfg).c_str() : "n_expert_used/2");
+        }
+
+        // expert-level dynamic scheduling (GGML_REMOTE_EP_SCHED=1): mutually
+        // exclusive with MIRROR (SCHED wins); master keeps a full replica
+        if (const char * s = getenv("GGML_REMOTE_EP_SCHED")) {
+            sched = s[0] != '\0' && strcmp(s, "0") != 0;
+        }
+        if (sched) {
+            if (const char * e = getenv("GGML_REMOTE_EP_SCHED_ENDPOINTS")) {
+                std::string v = e;
+                size_t off = 0;
+                while (off <= v.size()) {
+                    const size_t comma = v.find(',', off);
+                    const std::string item = v.substr(off, comma == std::string::npos ? comma : comma - off);
+                    const size_t colon = item.rfind(':');
+                    if (colon == std::string::npos || colon == 0) {
+                        LLAMA_LOG_WARN("%s: ignoring malformed endpoint '%s' (want host:port)\n", __func__, item.c_str());
+                    } else {
+                        sched_ep ep;
+                        ep.host = item.substr(0, colon);
+                        ep.port = atoi(item.substr(colon + 1).c_str());
+                        sched_eps.push_back(ep);
+                    }
+                    if (comma == std::string::npos) {
+                        break;
+                    }
+                    off = comma + 1;
+                }
+            }
+            if (sched_eps.empty()) {
+                sched_ep ep;
+                ep.host = host;
+                ep.port = port;
+                sched_eps.push_back(ep);
+            }
+            if (const char * k = getenv("GGML_REMOTE_EP_SCHED_KLOCAL")) {
+                sched_klocal = atoi(k);
+                if (sched_klocal < 1) {
+                    sched_klocal = 1;
+                }
+            }
+            if (const char * p = getenv("GGML_REMOTE_EP_SCHED_PP")) {
+                sched_pp = p[0] != '\0' && strcmp(p, "0") != 0;
+            }
+            if (const char * d = getenv("GGML_REMOTE_EP_SCHED_DEAL")) {
+                if (strcmp(d, "static") != 0 && strcmp(d, "balance") != 0) {
+                    LLAMA_LOG_WARN("%s: ignoring unknown GGML_REMOTE_EP_SCHED_DEAL='%s'\n", __func__, d);
+                }
+                // P0: both modes use the same deterministic pure-function dealer
+            }
+            if (mirror) {
+                LLAMA_LOG_WARN("%s: GGML_REMOTE_EP_SCHED=1 takes precedence over MIRROR; mirror disabled\n", __func__);
+            }
+            LLAMA_LOG_INFO("%s: GGML_REMOTE_EP_SCHED=1: %zu endpoint(s), k_local=%d, pp=%d\n",
+                    __func__, sched_eps.size(), sched_klocal, (int) sched_pp);
         }
     }
 
@@ -396,13 +534,15 @@ static bool remote_ep_mirror_send_req(remote_ep_state & st, std::string & err) {
 
 static bool llama_remote_ep_mirror_layer(int il) {
     remote_ep_state & st = remote_ep_get();
-    return st.enabled && st.mirror &&
-           il >= st.layer_first        && il <= st.layer_last &&
+    return st.enabled && st.mirror && !st.sched &&
+           st.in_ranges(il) &&
            il >= st.mirror_layer_first && il <= st.mirror_layer_last;
 }
 
 bool llama_remote_ep_skip_weights_for_layer(int il) {
-    return llama_remote_ep_enabled_for_layer(il) && !llama_remote_ep_mirror_layer(il);
+    // SCHED mode: the master keeps a full expert replica (never skip)
+    return llama_remote_ep_enabled_for_layer(il) && !llama_remote_ep_mirror_layer(il) &&
+           !remote_ep_get().sched;
 }
 
 int llama_remote_ep_mirror_kremote(int il, int n_expert_used) {
@@ -416,7 +556,7 @@ int llama_remote_ep_mirror_kremote(int il, int n_expert_used) {
 
 bool llama_remote_ep_enabled_for_layer(int il) {
     remote_ep_state & st = remote_ep_get();
-    return st.enabled && il >= st.layer_first && il <= st.layer_last;
+    return st.enabled && st.in_ranges(il);
 }
 
 bool llama_remote_ep_moe_ffn(
@@ -652,4 +792,444 @@ bool llama_remote_ep_mirror_fits(int64_t n_tokens, int64_t n_embd) {
     (void) n_tokens;
     (void) n_embd;
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// expert-level dynamic scheduling (GGML_REMOTE_EP_SCHED=1, SCHEDULER-DESIGN.md)
+// ---------------------------------------------------------------------------
+
+static bool remote_ep_sched_ep_connect(remote_ep_state::sched_ep & ep, std::string & err) {
+    if (ep.conn) {
+        return true;
+    }
+    ep.is_rdma = false;
+#ifdef LLAMA_EP_HAVE_RDMA
+    if (llama_ep_rdma_requested()) {
+        ep.conn = llama_ep_rdma_connect(ep.host.c_str(), ep.port, &err);
+        if (ep.conn) {
+            ep.is_rdma = true;
+        } else {
+            LLAMA_LOG_WARN("%s: RDMA connect to %s:%d failed (%s), falling back to TCP\n",
+                    __func__, ep.host.c_str(), ep.port, err.c_str());
+            err.clear();
+        }
+    }
+#endif
+    if (!ep.conn) {
+        ep.conn = llama_ep_tcp_connect(ep.host.c_str(), ep.port, &err);
+    }
+    return ep.conn != nullptr;
+}
+
+static void remote_ep_sched_ep_drop(remote_ep_state::sched_ep & ep) {
+    if (ep.conn) {
+        ep.conn->ops.close(ep.conn->ctx);
+        delete ep.conn;
+        ep.conn = nullptr;
+    }
+}
+
+// CAP handshake with one endpoint (protocol v2). an old LEP1-only worker
+// answers ERR to the unknown CAP type — treat any non-CAP reply as unsupported
+static bool remote_ep_sched_ep_cap(remote_ep_state::sched_ep & ep, std::string & err) {
+    llama_ep_cap_master mcap = {LLAMA_EP_PROTO_VER, 0};
+    if (!llama_ep_send_frame(ep.conn, LLAMA_EP_MSG_CAP, &mcap, sizeof(mcap))) {
+        err = "send CAP failed";
+        return false;
+    }
+    uint32_t type = 0;
+    std::vector<uint8_t> payload;
+    if (!llama_ep_recv_frame(ep.conn, type, payload)) {
+        err = "recv CAP failed";
+        return false;
+    }
+    if (type != LLAMA_EP_MSG_CAP || payload.size() < sizeof(llama_ep_cap_worker)) {
+        err = "worker does not speak protocol v2 (old LEP1 worker?)";
+        return false;
+    }
+    llama_ep_cap_worker wcap;
+    memcpy(&wcap, payload.data(), sizeof(wcap));
+    if (wcap.proto_ver < LLAMA_EP_PROTO_VER || !(wcap.caps & LLAMA_EP_CAP_REQ2)) {
+        err = "worker CAP lacks REQ2";
+        return false;
+    }
+    if (wcap.kernel_id != llama_ep_kernel_id()) {
+        err = "kernel_id mismatch (heterogeneous ggml build — SCHEDULER-DESIGN §7.3)";
+        return false;
+    }
+    ep.expert_first = wcap.expert_first;
+    ep.expert_last  = wcap.expert_last;
+    ep.kernel_id    = wcap.kernel_id;
+    return true;
+}
+
+// one-time negotiation with every endpoint; caches the outcome in
+// st.sched_negotiated. caller holds st.mtx.
+static bool remote_ep_sched_negotiate(remote_ep_state & st) {
+    if (st.sched_negotiated != 0) {
+        return st.sched_negotiated > 0;
+    }
+    bool ok = true;
+    std::string err;
+    for (auto & ep : st.sched_eps) {
+        if (!remote_ep_sched_ep_connect(ep, err) || !remote_ep_sched_ep_cap(ep, err)) {
+            LLAMA_LOG_WARN("%s: sched endpoint %s:%d: %s — scheduling disabled, layers fall back to classic/mirror\n",
+                    __func__, ep.host.c_str(), ep.port, err.c_str());
+            ok = false;
+            break;
+        }
+        LLAMA_LOG_INFO("%s: sched endpoint %s:%d: protocol v2, experts [%d, %d), kernel_id %08x%s\n",
+                __func__, ep.host.c_str(), ep.port, ep.expert_first, ep.expert_last, ep.kernel_id,
+                ep.is_rdma ? " [rdma]" : "");
+    }
+    if (!ok) {
+        for (auto & ep : st.sched_eps) {
+            remote_ep_sched_ep_drop(ep);
+        }
+        st.sched_negotiated = -1;
+        return false;
+    }
+    st.sched_negotiated = 1;
+    return true;
+}
+
+int llama_remote_ep_sched_klocal(int il, int n_expert_used) {
+    remote_ep_state & st = remote_ep_get();
+    if (!st.enabled || !st.sched || !st.in_ranges(il) || st.sched_eps.empty() || n_expert_used < 1) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(st.mtx);
+    if (!remote_ep_sched_negotiate(st)) {
+        return 0;
+    }
+    return std::min(st.sched_klocal, n_expert_used);
+}
+
+bool llama_remote_ep_sched_fits(int64_t n_tokens, int64_t n_ids, int64_t n_embd) {
+    remote_ep_state & st = remote_ep_get();
+    if (!st.sched_pp && n_tokens != 1) {
+        return false; // decode-only by default (P4 lifts this)
+    }
+#ifdef LLAMA_EP_HAVE_RDMA
+    // worst-case RESP2 (every slot remote) must fit the pre-posted receive ring
+    if (llama_ep_rdma_requested()) {
+        return (uint64_t) n_tokens * (uint64_t) n_ids * (uint64_t) n_embd * sizeof(float) <= (uint64_t) (3 << 20) / 2;
+    }
+#endif
+    (void) n_ids;
+    (void) n_embd;
+    return true;
+}
+
+// fire the staged REQ2 of one endpoint (send only, no wait)
+static bool remote_ep_sched_send_req2(remote_ep_state & st, int iep, std::string & err) {
+    const auto & p  = st.spend;
+    const auto & pe = p.eps[(size_t) iep];
+    auto & ep = st.sched_eps[(size_t) iep];
+
+    llama_ep_req2_header hdr = {p.il, (int32_t) p.n_tokens, (int32_t) pe.token_idx.size(), (int32_t) p.n_embd};
+
+    const void * parts[6] = {&hdr, pe.token_idx.data(), pe.slot_idx.data(), pe.expert_id.data(), pe.weight.data(), p.hidden};
+    const size_t lens[6]  = {
+        sizeof(hdr),
+        pe.token_idx.size() * sizeof(int32_t),
+        pe.slot_idx.size()  * sizeof(int32_t),
+        pe.expert_id.size() * sizeof(int32_t),
+        pe.weight.size()    * sizeof(float),
+        (size_t) p.n_tokens * p.n_embd * sizeof(float),
+    };
+    if (!llama_ep_send_framev(ep.conn, LLAMA_EP_MSG_REQ2, parts, lens, 6)) {
+        err = "send REQ2 failed";
+        return false;
+    }
+    return true;
+}
+
+// receive one RESP2 into the endpoint's resp staging
+static bool remote_ep_sched_recv_resp2(remote_ep_state & st, int iep, std::string & err) {
+    auto & p  = st.spend;
+    auto & pe = p.eps[(size_t) iep];
+    auto & ep = st.sched_eps[(size_t) iep];
+
+    const size_t n_sel  = pe.token_idx.size();
+    const size_t out_bytes = n_sel * (size_t) p.n_embd * sizeof(float);
+
+    llama_ep_frame_header fh;
+    if (!ep.conn->ops.recv_all(ep.conn->ctx, &fh, sizeof(fh)) ||
+        fh.magic != LLAMA_EP_MAGIC || fh.payload_len > (uint64_t) 1 << 30) {
+        err = "recv RESP2 failed";
+        return false;
+    }
+    if (fh.type == LLAMA_EP_MSG_ERR) {
+        std::vector<uint8_t> payload((size_t) fh.payload_len);
+        if (fh.payload_len > 0 && !ep.conn->ops.recv_all(ep.conn->ctx, payload.data(), payload.size())) {
+            err = "recv ERR payload failed";
+            return false;
+        }
+        int32_t code = 0;
+        if (payload.size() >= sizeof(code)) {
+            memcpy(&code, payload.data(), sizeof(code));
+        }
+        err = "worker ERR " + std::to_string(code) + ": " +
+              std::string((const char *) payload.data() + sizeof(code),
+                          payload.size() > sizeof(code) ? payload.size() - sizeof(code) : 0);
+        return false;
+    }
+    if (fh.type != LLAMA_EP_MSG_RESP2 || fh.payload_len != sizeof(llama_ep_resp2_header) + out_bytes) {
+        err = "bad RESP2";
+        return false;
+    }
+    llama_ep_resp2_header rhdr;
+    pe.resp.resize(n_sel * (size_t) p.n_embd);
+    if (!ep.conn->ops.recv_all(ep.conn->ctx, &rhdr, sizeof(rhdr)) ||
+        rhdr.n_sel != (int32_t) n_sel || rhdr.n_embd != (int32_t) p.n_embd ||
+        (out_bytes > 0 && !ep.conn->ops.recv_all(ep.conn->ctx, pe.resp.data(), out_bytes))) {
+        err = "recv RESP2 payload failed";
+        return false;
+    }
+    return true;
+}
+
+void llama_remote_ep_sched_send_cb(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    if (ith != 0) {
+        return;
+    }
+    (void) nth;
+
+    const int il = (int) (intptr_t) userdata;
+
+    const ggml_tensor * a = dst->src[0]; // hidden  [n_embd, 1, n_tokens] f32 (contiguous)
+    const ggml_tensor * b = dst->src[1]; // ids     [k, n_tokens] i32 (contiguous)
+    const ggml_tensor * c = dst->src[2]; // weights [1, k, n_tokens] f32 (contiguous)
+
+    const int64_t n_embd   = a->ne[0];
+    const int64_t n_tokens = a->ne[2];
+    const int64_t k        = b->ne[0];
+
+    const bool ok_shapes =
+        a->type == GGML_TYPE_F32 && ggml_is_contiguous(a) &&
+        b->type == GGML_TYPE_I32 && ggml_is_contiguous(b) && b->ne[1] == n_tokens &&
+        c->type == GGML_TYPE_F32 && ggml_is_contiguous(c) && c->ne[0] == 1 && c->ne[1] == k && c->ne[2] == n_tokens &&
+        dst->type == GGML_TYPE_I32 && ggml_is_contiguous(dst) && dst->ne[1] == n_tokens;
+
+    if (!ok_shapes) {
+        GGML_ABORT("%s: unexpected tensor shapes/types for layer %d", __func__, il);
+    }
+
+    remote_ep_state & st = remote_ep_get();
+
+    const bool dbg = remote_ep_debug_enabled();
+    const int64_t t0 = dbg ? ggml_time_us() : 0;
+
+    std::lock_guard<std::mutex> lock(st.mtx);
+
+    if (st.sched_negotiated != 1) {
+        GGML_ABORT("%s: layer %d: sched endpoints were not negotiated at graph build", __func__, il);
+    }
+
+    auto & p = st.spend;
+    if (p.active) {
+        GGML_ABORT("%s: layer %d: previous sched request (layer %d) was never consumed", __func__, il, p.il);
+    }
+
+    const int m_local = (int) dst->ne[0];
+    const int32_t * ids = (const int32_t *) b->data;
+    const float   * w   = (const float   *) c->data;
+
+    // holder bitmask: bit0 = master (full replica), bit(1+i) = endpoint i (CAP range)
+    int32_t e_max = 0;
+    for (int64_t i = 0; i < n_tokens * k; ++i) {
+        e_max = std::max(e_max, ids[i]);
+    }
+    std::vector<uint64_t> holders((size_t) e_max + 1, 1u);
+    for (size_t i = 0; i < st.sched_eps.size(); ++i) {
+        const int64_t lo = st.sched_eps[i].expert_first;
+        const int64_t hi = std::min<int64_t>(st.sched_eps[i].expert_last, (int64_t) e_max + 1);
+        for (int64_t e = lo; e < hi; ++e) {
+            holders[(size_t) e] |= 2ull << i;
+        }
+    }
+
+    llama_ep_dealer_input din;
+    din.n_tokens    = (int) n_tokens;
+    din.k           = (int) k;
+    din.n_endpoints = (int) st.sched_eps.size();
+    din.m_star      = m_local;
+    din.ids         = ids;
+    din.holders     = holders.data();
+
+    llama_ep_dealer_plan plan;
+    if (!llama_ep_dealer_plan_build(din, plan) || plan.m_local != m_local) {
+        GGML_ABORT("%s: layer %d: dealer failed (infeasible holder table)", __func__, il);
+    }
+
+    // local ids -> dst ([m*, n_tokens], ascending global slot order per token)
+    memcpy(dst->data, plan.local_ids.data(), (size_t) n_tokens * m_local * sizeof(int32_t));
+
+    // stage the plan + per-endpoint REQ2 bytes (kept for one resend in the merge op)
+    p.il       = il;
+    p.n_tokens = n_tokens;
+    p.n_embd   = n_embd;
+    p.k        = (int) k;
+    p.m_local  = m_local;
+    p.hidden   = (const float *) a->data;
+    p.weights  = w;
+    p.owner    = std::move(plan.owner);
+    p.eps.clear();
+    p.eps.resize(st.sched_eps.size());
+    for (size_t i = 0; i < st.sched_eps.size(); ++i) {
+        const auto & src = plan.eps[i];
+        auto & pe = p.eps[i];
+        pe.token_idx = src.token;
+        pe.slot_idx  = src.slot;
+        pe.expert_id = src.expert;
+        pe.weight.resize(src.token.size());
+        for (size_t j = 0; j < src.token.size(); ++j) {
+            pe.weight[j] = w[(size_t) src.token[j] * k + src.slot[j]];
+        }
+        pe.resp.clear();
+        pe.send_failed = false;
+    }
+    p.active = true;
+
+    // fire one REQ2 per endpoint (send only, no wait); the local chain that
+    // follows overlaps the workers' compute (same mechanism as the mirror op pair)
+    for (size_t i = 0; i < st.sched_eps.size(); ++i) {
+        auto & pe = p.eps[i];
+        if (pe.token_idx.empty()) {
+            continue;
+        }
+        std::string err;
+        if (!remote_ep_sched_ep_connect(st.sched_eps[i], err) || !remote_ep_sched_send_req2(st, (int) i, err)) {
+            // leave the staging in place: the merge op reconnects and resends once
+            LLAMA_LOG_WARN("%s: layer %d: endpoint %zu: %s (will retry in merge op)\n", __func__, il, i, err.c_str());
+            pe.send_failed = true;
+            remote_ep_sched_ep_drop(st.sched_eps[i]);
+        }
+    }
+
+    if (dbg) {
+        fprintf(stderr, "GGML_REMOTE_EP: [ep-debug] layer %d sched k=%lld m*=%d n_tokens=%lld remote=[",
+                il, (long long) k, m_local, (long long) n_tokens);
+        for (size_t i = 0; i < p.eps.size(); ++i) {
+            fprintf(stderr, "%s%zu", i ? "," : "", p.eps[i].token_idx.size());
+        }
+        fprintf(stderr, "] deal+send %.3f ms (t=%lld us)\n", (ggml_time_us() - t0) / 1000.0, (long long) t0);
+    }
+}
+
+void llama_remote_ep_sched_merge_cb(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    if (ith != 0) {
+        return;
+    }
+    (void) nth;
+
+    const int il = (int) (intptr_t) userdata;
+
+    const ggml_tensor * experts_l_t = dst->src[1]; // [n_embd, m*, n_tokens] f32 (NOT weighted)
+    const ggml_tensor * weights_t   = dst->src[2]; // [1, k, n_tokens] f32
+
+    remote_ep_state & st = remote_ep_get();
+
+    const bool dbg = remote_ep_debug_enabled();
+    const int64_t t0 = dbg ? ggml_time_us() : 0;
+
+    std::lock_guard<std::mutex> lock(st.mtx);
+
+    auto & p = st.spend;
+    if (!p.active || p.il != il) {
+        GGML_ABORT("%s: layer %d: no pending sched request (active=%d, pending layer %d)",
+                __func__, il, (int) p.active, p.il);
+    }
+
+    if (dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) ||
+        dst->ne[0] != p.n_embd || dst->ne[1] != 1 || dst->ne[2] != p.n_tokens ||
+        experts_l_t->type != GGML_TYPE_F32 || !ggml_is_contiguous(experts_l_t) ||
+        experts_l_t->ne[0] != p.n_embd || experts_l_t->ne[1] != (int64_t) p.m_local ||
+        weights_t->type != GGML_TYPE_F32 || !ggml_is_contiguous(weights_t)) {
+        GGML_ABORT("%s: unexpected dst/src shapes for layer %d", __func__, il);
+    }
+
+    // receive the RESP2s in fixed endpoint order; one reconnect+resend each
+    for (size_t i = 0; i < st.sched_eps.size(); ++i) {
+        auto & pe = p.eps[i];
+        if (pe.token_idx.empty()) {
+            continue;
+        }
+        std::string err;
+        bool ok = !pe.send_failed && st.sched_eps[i].conn != nullptr &&
+                  remote_ep_sched_recv_resp2(st, (int) i, err);
+        if (!ok) {
+            LLAMA_LOG_WARN("%s: layer %d: endpoint %zu: %s — reconnecting and resending once\n",
+                    __func__, il, i, err.c_str());
+            remote_ep_sched_ep_drop(st.sched_eps[i]);
+            err.clear();
+            ok = remote_ep_sched_ep_connect(st.sched_eps[i], err) &&
+                 remote_ep_sched_ep_cap(st.sched_eps[i], err) &&
+                 remote_ep_sched_send_req2(st, (int) i, err) &&
+                 remote_ep_sched_recv_resp2(st, (int) i, err);
+        }
+        if (!ok) {
+            GGML_ABORT("%s: layer %d: endpoint %zu: %s", __func__, il, i, err.c_str());
+        }
+    }
+
+    const int64_t t_resp = dbg ? ggml_time_us() : 0;
+
+    // merge in ascending global slot order, left-associated — the same scalar
+    // operation sequence as the baseline ggml_mul + ggml_add chain (§4.5):
+    // local contributions are multiplied by their router weight here (ggml_mul
+    // is an elementwise f32 multiply; doing it scalar in the merge is the same
+    // rounding), remote contributions arrive already weighted in the RESP2.
+    const float * experts_l = (const float *) experts_l_t->data;
+    const float * w         = (const float *) weights_t->data;
+    float       * out       = (float       *) dst->data;
+
+    const int64_t k       = p.k;
+    const int64_t m_local = p.m_local;
+    const int64_t n_embd  = p.n_embd;
+
+    std::vector<size_t> cur_ep(p.eps.size(), 0);
+    for (int64_t t = 0; t < p.n_tokens; ++t) {
+        float * acc = out + t * n_embd;
+        int64_t lp = 0; // local slots are ascending per token
+        for (int64_t j = 0; j < k; ++j) {
+            const uint8_t o = p.owner[(size_t) t * k + j];
+            if (o == 0) {
+                const float * v = experts_l + ((size_t) t * m_local + lp) * n_embd;
+                const float wj = w[(size_t) t * k + j];
+                ++lp;
+                if (j == 0) {
+                    for (int64_t e = 0; e < n_embd; ++e) {
+                        acc[e] = v[e] * wj;
+                    }
+                } else {
+                    for (int64_t e = 0; e < n_embd; ++e) {
+                        acc[e] += v[e] * wj;
+                    }
+                }
+            } else {
+                auto & pe = p.eps[(size_t) o - 1];
+                const size_t idx = cur_ep[(size_t) o - 1]++;
+                const float * v = pe.resp.data() + idx * (size_t) n_embd;
+                if (j == 0) {
+                    memcpy(acc, v, (size_t) n_embd * sizeof(float));
+                } else {
+                    for (int64_t e = 0; e < n_embd; ++e) {
+                        acc[e] += v[e];
+                    }
+                }
+            }
+        }
+    }
+
+    p.active  = false;
+    p.hidden  = nullptr;
+    p.weights = nullptr;
+
+    if (dbg) {
+        fprintf(stderr, "GGML_REMOTE_EP: [ep-debug] layer %d sched n_tokens=%lld wait %.3f ms merge %.3f ms (t=%lld us)\n",
+                il, (long long) p.n_tokens, (t_resp - t0) / 1000.0,
+                (ggml_time_us() - t_resp) / 1000.0, (long long) t0);
+    }
 }
