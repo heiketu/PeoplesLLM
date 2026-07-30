@@ -27,6 +27,7 @@
 #include "llama.h"
 
 #include "ggml.h"
+#include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "gguf.h"
@@ -485,6 +486,7 @@ static void ep_prefault_weights(const ep_model & m) {
 
 static bool ep_moe_ffn(
         ggml_backend_t    backend,
+        ggml_gallocr_t    gallocr,
         const ep_layer  & L,
         int               n_tokens,
         int               n_ids,          // experts per token
@@ -549,8 +551,9 @@ static bool ep_moe_ffn(
     ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, sum);
 
-    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
-    if (!buf) {
+    // the gallocr keeps one grow-only buffer across requests: no per-REQ
+    // alloc/free and no repeated first-touch page faults on the intermediates
+    if (!ggml_gallocr_alloc_graph(gallocr, gf)) {
         err = "failed to allocate compute tensors";
         ggml_free(ctx);
         return false;
@@ -562,14 +565,12 @@ static bool ep_moe_ffn(
 
     if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
         err = "graph compute failed";
-        ggml_backend_buffer_free(buf);
         ggml_free(ctx);
         return false;
     }
 
     ggml_backend_tensor_get(sum, out, 0, (size_t) n_tokens * n_embd * sizeof(float));
 
-    ggml_backend_buffer_free(buf);
     ggml_free(ctx);
     return true;
 }
@@ -646,7 +647,7 @@ static double ep_median_ms(std::vector<double> & v) {
 }
 
 // returns the tuned thread count, or -1 on failure (caller keeps its default)
-static int ep_autotune_threads(ggml_backend_t backend, const ep_model & m, const ep_config & cfg) {
+static int ep_autotune_threads(ggml_backend_t backend, ggml_gallocr_t gallocr, const ep_model & m, const ep_config & cfg) {
     const int n_phys = ep_physical_cores();
 
     // candidate ladder + physical core count, clamped to [1, n_phys]
@@ -710,7 +711,7 @@ static int ep_autotune_threads(ggml_backend_t backend, const ep_model & m, const
                 std::vector<float> hidden((size_t) L->n_embd, 1e-3f);
                 std::vector<float> out((size_t) L->n_embd);
                 std::string err;
-                if (!ep_moe_ffn(backend, *L, 1, k, ids.data(), weights.data(), hidden.data(), out.data(), err)) {
+                if (!ep_moe_ffn(backend, gallocr, *L, 1, k, ids.data(), weights.data(), hidden.data(), out.data(), err)) {
                     LOG("llama-epd: autotune: compute failed: %s\n", err.c_str());
                     return -1;
                 }
@@ -748,6 +749,7 @@ static bool ep_send_err(llama_ep_transport * t, int32_t code, const std::string 
 static bool ep_handle_req(
         llama_ep_transport * t,
         ggml_backend_t       backend,
+        ggml_gallocr_t       gallocr,
         const ep_model     & m,
         const ep_config    & cfg,
         const uint8_t      * payload,
@@ -800,7 +802,7 @@ static bool ep_handle_req(
     std::vector<float> out((size_t) n_tokens * L.n_embd);
     std::string err;
     const int64_t t0 = ep_debug_enabled() ? ggml_time_us() : 0;
-    if (!ep_moe_ffn(backend, L, (int) n_tokens, (int) n_ids, ids, weights, hidden, out.data(), err)) {
+    if (!ep_moe_ffn(backend, gallocr, L, (int) n_tokens, (int) n_ids, ids, weights, hidden, out.data(), err)) {
         return ep_send_err(t, LLAMA_EP_ERR_COMPUTE, err);
     }
     if (ep_debug_enabled()) {
@@ -821,6 +823,7 @@ static bool ep_handle_req(
 static void ep_serve_connection(
         llama_ep_transport * t,
         ggml_backend_t       backend,
+        ggml_gallocr_t       gallocr,
         const ep_model     & m,
         const ep_config    & cfg) {
     std::vector<uint8_t> payload;
@@ -833,7 +836,7 @@ static void ep_serve_connection(
             ep_send_err(t, LLAMA_EP_ERR_GENERIC, "expected REQ");
             continue;
         }
-        if (!ep_handle_req(t, backend, m, cfg, payload.data(), payload.size())) {
+        if (!ep_handle_req(t, backend, gallocr, m, cfg, payload.data(), payload.size())) {
             LOG("llama-epd: failed to handle REQ\n");
             break;
         }
@@ -936,6 +939,8 @@ static int ep_selftest(ep_model & m, const ep_config & cfg, int layer, int n_tok
     }
     ggml_backend_cpu_set_n_threads(backend, cfg.n_threads);
 
+    ggml_gallocr_t gallocr = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
+
     // fixed-seed inputs
     ep_rng rng(0xC0FFEE);
     std::vector<int32_t> ids((size_t) n_tokens * n_ids);
@@ -973,7 +978,7 @@ static int ep_selftest(ep_model & m, const ep_config & cfg, int layer, int n_tok
     std::vector<float> out_a((size_t) n_tokens * n_embd);
     {
         std::string err;
-        if (!ep_moe_ffn(backend, L, n_tokens, n_ids, ids.data(), weights.data(), hidden.data(), out_a.data(), err)) {
+        if (!ep_moe_ffn(backend, gallocr, L, n_tokens, n_ids, ids.data(), weights.data(), hidden.data(), out_a.data(), err)) {
             LOG("selftest: local compute failed: %s\n", err.c_str());
             return 1;
         }
@@ -991,7 +996,7 @@ static int ep_selftest(ep_model & m, const ep_config & cfg, int layer, int n_tok
     std::thread server_thread([&]() {
         llama_ep_transport conn;
         if (listener->ops.accept(listener->ctx, &conn)) {
-            ep_serve_connection(&conn, backend, m, cfg);
+            ep_serve_connection(&conn, backend, gallocr, m, cfg);
             conn.ops.close(conn.ctx);
         }
         listener->ops.close(listener->ctx);
@@ -1173,8 +1178,9 @@ int main(int argc, char ** argv) {
         LOG("llama-epd: failed to init CPU backend\n");
         return 1;
     }
+    ggml_gallocr_t gallocr = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
     if (!threads_set && autotune) {
-        const int tuned = ep_autotune_threads(backend, m, cfg);
+        const int tuned = ep_autotune_threads(backend, gallocr, m, cfg);
         if (tuned > 0) {
             cfg.n_threads = tuned;
         }
@@ -1182,6 +1188,17 @@ int main(int argc, char ** argv) {
         LOG("llama-epd: autotune disabled, using %d threads\n", cfg.n_threads);
     }
     ggml_backend_cpu_set_n_threads(backend, cfg.n_threads);
+
+    // persistent threadpool: without it every ggml_graph_compute spawns and joins a
+    // disposable pool (measured: ~7 ms of the per-REQ fixed cost at 70 threads).
+    // attached after autotune so the ladder still probes with disposable pools
+    struct ggml_threadpool_params tpp = ggml_threadpool_params_default(cfg.n_threads);
+    ggml_threadpool_t threadpool = ggml_threadpool_new(&tpp);
+    if (threadpool) {
+        ggml_backend_cpu_set_threadpool(backend, threadpool);
+    } else {
+        LOG("llama-epd: WARNING: threadpool creation failed, falling back to per-compute pools\n");
+    }
 
     std::string err;
     llama_ep_listener * listener = nullptr;
@@ -1222,7 +1239,7 @@ int main(int argc, char ** argv) {
             continue;
         }
         LOG("llama-epd: client connected\n");
-        ep_serve_connection(&conn, backend, m, cfg);
+        ep_serve_connection(&conn, backend, gallocr, m, cfg);
         conn.ops.close(conn.ctx);
         LOG("llama-epd: client disconnected\n");
     }
