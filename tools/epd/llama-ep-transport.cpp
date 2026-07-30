@@ -233,6 +233,53 @@ bool llama_ep_rdma_requested() {
     return v;
 }
 
+uint32_t llama_ep_kernel_id() {
+    // fnv1a over compile-time ggml/ISA feature macros: any build difference
+    // that could change vec_dot bit behavior (ISA level, fp16 path, compiler)
+    // flips the id. both cluster nodes build from the same tree with the same
+    // toolchain, so identical ids are the expected case.
+    uint32_t h = 2166136261u;
+    auto mix = [&h](uint32_t v) { h ^= v; h *= 16777619u; };
+#if defined(__x86_64__) || defined(_M_X64)
+    mix(0x78);
+#elif defined(__aarch64__)
+    mix(0xa8);
+#endif
+#ifdef __AVX2__
+    mix(1);
+#endif
+#ifdef __AVX512F__
+    mix(2);
+#endif
+#ifdef __AVX512_VNNI__
+    mix(3);
+#endif
+#ifdef __AVX512_BF16__
+    mix(4);
+#endif
+#ifdef __F16C__
+    mix(5);
+#endif
+#ifdef __FMA__
+    mix(6);
+#endif
+#ifdef __AMX_INT8__
+    mix(7);
+#endif
+#ifdef __ARM_NEON
+    mix(8);
+#endif
+#ifdef __ARM_FEATURE_SVE
+    mix(9);
+#endif
+#if defined(__clang__)
+    mix(0xc10000u | (__clang_major__ << 8));
+#elif defined(__GNUC__)
+    mix(0x6e0000u | (__GNUC__ << 8));
+#endif
+    return h;
+}
+
 bool llama_ep_send_frame(llama_ep_transport * t, uint32_t type, const void * payload, size_t payload_len) {
     const void * parts[1] = {payload};
     const size_t lens[1] = {payload_len};

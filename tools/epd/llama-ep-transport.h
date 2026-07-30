@@ -14,6 +14,25 @@
 //                  + fp32 out[n_tokens*n_embd]         (sum_k w[t,k] * expert_{ids[t,k]}(hidden[t]))
 //   ERR  (type 3): { i32 code } + char msg[payload_len - 4]
 //
+// protocol v2 (expert-level dynamic scheduling, SCHEDULER-DESIGN.md §4.4):
+//   CAP   (type 4): first frame after connect, master->worker:
+//                   { u32 proto_ver=2, u32 flags }
+//                   worker->master reply:
+//                   { u32 proto_ver, u32 caps, i32 layer_first, i32 layer_last,
+//                     i32 expert_first, i32 expert_last, u32 kernel_id }
+//                   (kernel_id: ggml build + ISA fingerprint, for the §7.3
+//                   homogeneity check). an old LEP1-only worker answers ERR to
+//                   CAP — the master then falls back to the classic/mirror path.
+//   REQ2  (type 5): { i32 layer, i32 n_tokens, i32 n_sel, i32 n_embd }
+//                   + i32 token_idx[n_sel]   (which token this assignment belongs to)
+//                   + i32 slot_idx[n_sel]    (global slot index; master merges by it)
+//                   + i32 expert_id[n_sel]
+//                   + fp32 weight[n_sel]
+//                   + fp32 hidden[n_tokens*n_embd]
+//   RESP2 (type 6): { i32 n_tokens, i32 n_sel, i32 n_embd }
+//                   + fp32 out[n_sel*n_embd] (one vector per assignment, already
+//                   multiplied by the router weight, NOT summed; same order as REQ2)
+//
 // The transport itself is message-agnostic: a function table (send_all/recv_all/close)
 // isolates the framing from the byte mover, so the TCP backend below can be swapped
 // for an RDMA verbs backend without touching protocol code.
@@ -25,10 +44,21 @@
 
 #define LLAMA_EP_MAGIC 0x4C455031u // "LEP1"
 
+// protocol version offered in the CAP handshake; LEP1 peers never send CAP
+#define LLAMA_EP_PROTO_VER 2u
+
 enum llama_ep_msg_type : uint32_t {
     LLAMA_EP_MSG_REQ  = 1,
     LLAMA_EP_MSG_RESP = 2,
     LLAMA_EP_MSG_ERR  = 3,
+    LLAMA_EP_MSG_CAP  = 4,
+    LLAMA_EP_MSG_REQ2 = 5,
+    LLAMA_EP_MSG_RESP2 = 6,
+};
+
+// worker CAP caps bits
+enum llama_ep_cap_bits : uint32_t {
+    LLAMA_EP_CAP_REQ2 = 1u << 0, // ragged per-slot dispatch (REQ2/RESP2)
 };
 
 enum llama_ep_err_code : int32_t {
@@ -57,7 +87,41 @@ struct llama_ep_resp_header {
     int32_t n_tokens;
     int32_t n_embd;
 };
+
+struct llama_ep_cap_master {
+    uint32_t proto_ver;
+    uint32_t flags;
+};
+
+struct llama_ep_cap_worker {
+    uint32_t proto_ver;
+    uint32_t caps;
+    int32_t  layer_first;
+    int32_t  layer_last;
+    int32_t  expert_first; // half-open [first, last), clamped to actual n_expert
+    int32_t  expert_last;
+    uint32_t kernel_id;
+};
+
+struct llama_ep_req2_header {
+    int32_t layer;
+    int32_t n_tokens;
+    int32_t n_sel;  // ragged assignment count (not n_tokens*k)
+    int32_t n_embd;
+};
+
+struct llama_ep_resp2_header {
+    int32_t n_tokens;
+    int32_t n_sel;
+    int32_t n_embd;
+};
 #pragma pack(pop)
+
+// ggml build + ISA fingerprint (fnv1a over compile-time feature macros); two
+// nodes with identical builds produce identical ids. used by the CAP handshake
+// for the SCHEDULER-DESIGN §7.3 homogeneity check (bit-exact merge only holds
+// between same-kernel nodes).
+uint32_t llama_ep_kernel_id();
 
 // transport function table: swap the TCP implementation for RDMA later
 struct llama_ep_transport_ops {
