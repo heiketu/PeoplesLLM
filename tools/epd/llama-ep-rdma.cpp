@@ -295,6 +295,27 @@ bool cm_wait(rdma_event_channel * ec, rdma_cm_event_type want, rdma_cm_id ** id_
     return ok;
 }
 
+// Tighten retry timers on an established RC QP.  Defaults chosen by rdma_cm are
+// huge (min_rnr_timer can be ~80 ms): a single RNR NAK — inevitable once a bulk
+// frame overruns the 8-slot receive ring — then stalls the stream by ~80 ms per
+// chunk (measured ~77 ms/chunk on 6 MB GLM prefill frames, i.e. ~3 MB/s).
+// Setting fast recovery keeps an occasional RNR/ACK-timeout at sub-ms cost.
+bool tune_qp(ibv_qp * qp, std::string * err) {
+    ibv_qp_attr attr = {};
+    attr.qp_state        = IBV_QPS_RTS;
+    attr.timeout         = 14;  // local ACK timeout 4.096us * 2^14 ~= 67 ms
+    attr.retry_cnt       = 7;   // infinite
+    attr.rnr_retry       = 7;   // infinite
+    attr.min_rnr_timer   = 1;   // 0.01 ms RNR retry delay
+    if (ibv_modify_qp(qp, &attr,
+                      IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
+                      IBV_QP_RNR_RETRY | IBV_QP_MIN_RNR_TIMER) != 0) {
+        set_err(err, "ibv_modify_qp(tune retry timers)");
+        return false;
+    }
+    return true;
+}
+
 // create PD/CQ/QP and register the rings on an id that has addr/route resolved
 bool setup_conn(rdma_conn * c, std::string * err) {
     c->pd = ibv_alloc_pd(c->id->verbs);
@@ -412,6 +433,7 @@ llama_ep_transport * llama_ep_rdma_connect(const char * host, int port, std::str
         ok = false;
     }
     if (ok) ok = cm_wait(c->ec, RDMA_CM_EVENT_ESTABLISHED, nullptr, err);
+    if (ok) ok = tune_qp(c->id->qp, err);
 
     if (!ok) {
         rdma_conn_close(c);
@@ -459,6 +481,10 @@ bool rdma_listener_accept(void * vctx, llama_ep_transport * out) {
         return false;
     }
     if (!cm_wait(l->ec, RDMA_CM_EVENT_ESTABLISHED, nullptr, &err)) {
+        rdma_conn_close(c);
+        return false;
+    }
+    if (!tune_qp(conn_id->qp, &err)) {
         rdma_conn_close(c);
         return false;
     }
