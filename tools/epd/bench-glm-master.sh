@@ -25,5 +25,5 @@ exec flock -x /tmp/xllama-bench.lock numactl --interleave=all \
   -ngl 99 -ncmoe 99 -t 70 --threads-batch 70 -fa 1 -b 1024 -ub 512 \
   -ot "blk\.(29|3[0-2])\.ffn_(up|gate|down)_exps\.weight=CUDA0,blk\.(5[89]|6[0-2])\.ffn_(up|gate|down)_exps\.weight=CUDA1" \
   -c 8192 -np 1 --host 127.0.0.1 --port 18121 \
-  --numa mirror --numa-mirror kv \
+  --no-mmap --numa mirror --numa-mirror kv \
   --jinja --reasoning-format deepseek
