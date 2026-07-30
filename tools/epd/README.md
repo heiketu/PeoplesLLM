@@ -21,6 +21,9 @@
 | `GGML_REMOTE_EP_RDMA` | 关 | 置 1 传输层改用 RDMA（RoCEv2，rdma_cm 自动建连）。需编译时检测到 libibverbs+librdmacm（CMake 打印 `EP RDMA transport (RoCEv2): ON`）；无卡/建连失败时打 warning 并自动回退 TCP。master 与 worker 需同时置 1（协议不同，不互通） |
 | `GGML_REMOTE_EP_PIPELINE` | 关 | 置 1 启用流水线分块投递：多 token 层（PP）把 token 维切成块，W=1 滑动窗口发送（发块 i 后收块 i-1 的响应），worker 计算与 master 收发重叠。协议不变（每块是一个普通 REQ 帧），逐 token 数值不变；decode（1 token）不受影响自动走原路径。TCP/RDMA 均可用 |
 | `GGML_REMOTE_EP_PIPELINE_CHUNK` | 256 | 每块 token 数上限；再按隐藏层字节数封顶（TCP ≤3MiB、RDMA ≤1.5MiB，保证 W=1 窗口在 socket buffer / RDMA 接收环容量内，不会死锁） |
+| `GGML_REMOTE_EP_MIRROR` | 关 | 置 1 启用层镜像 + 专家 slot 拆分：master 同时加载远程层专家权重（这些层不再 TENSOR_SKIP），每层 MoE 沿 slot 维切两半——slot [0,k_r) 发 worker（只发不等的 send op），slot [k_r,k) 在 master 本地走与单机 MoE 完全相同的链路，wait op 收 partial_r 后按 slot 升序合并（与全远程基线结合顺序一致，逐字对拍 bit 一致）。decode 与 PP 均生效；详见下文实测节 |
+| `GGML_REMOTE_EP_MIRROR_LAYERS` | =远程层范围 | 镜像层子集 `A-B`（须落在 `GGML_REMOTE_EP_LAYERS` 内） |
+| `GGML_REMOTE_EP_MIRROR_KREMOTE` | n_expert_used/2 | 发远程的 slot 数 k_r，clamp 到 [1, n_expert_used-1] |
 
 worker 侧另有：
 
@@ -301,3 +304,66 @@ CPU 层 ≈3.4s，小档无法摊薄（63档本地 54ms/tok vs 1020档 7.6ms/tok
 worker 固定开销（修复后 63档 11.5→15.6 t/s）。遗留：master 本地小批次有效带宽偏低
 （numa_balancing 未关/线程划分待查）；远程层在模型前部时跨 ubatch 流水上限仅层 0-2，
 远程层若放尾部可与下一 ubatch 本地段大幅重叠（MAX-EFFORT 方向）。
+
+## 层镜像 + 专家 slot 拆分（GGML_REMOTE_EP_MIRROR=1）实测（2026-07-30，commit 115622070）
+
+机制：镜像层专家权重 master 也加载（加载器改用 `llama_remote_ep_skip_weights_for_layer`，
+镜像层不再 TENSOR_SKIP）。`build_moe_ffn` 在该层用两个 custom op 夹住本地子图实现重叠
+（ggml CPU 后端按节点创建顺序串行、节点间 barrier）：op1（`ggml_map_custom3`）线程 0 把
+slot [0,k_r) 的 REQ 只发不等（ids/weights 先按 `ids[t*k_r+j]` gather 到 staging 再发）；
+随后本地子图对 slot [k_r,k) 走与单机本地 MoE 完全相同的链路（separate gate/up→
+swiglu→down→×weights，clamp 分支含 DEEPSEEK4 特例），产出 experts_l 不接求和链；
+op2（`ggml_map_custom2`，b=experts_l 制造依赖）阻塞收 RESP（partial_r）写 dst，
+失败重连重发一次（复用 pending 槽里的请求字节）再失败 GGML_ABORT；
+合并 = partial_r 先、本地 slot 升序逐个 `ggml_add`——与全远程基线（worker 内 slot
+0..k-1 顺序累加）结合顺序完全一致。worker 零改动。镜像路径不走 pipelined roundtrip。
+
+正确性（temp 0 / seed 42，"The capital of France is" gen48）：GLM 与 DSV4 的
+off1 vs on1/on2/off2 全部逐字 **IDENTICAL**；GLM 另验 prefill 边界 prompt_n=64
+对拍 IDENTICAL（prompt_n=32 未能构造：所用重复文本在 N∈[2,200] 内没有任何长度
+恰好 tokenize 成 32，该档未覆盖）。双机同型号 Xeon，vec_dot 同 kernel，未出现 DIFF。
+
+GLM-5.2（slave 3-17 共 15 层，top-8，默认 k_r=4；同会话 off→on→on→off + k_r 扫描）：
+
+| 档 | off1/off2 | on1/on2（k_r=4） | Δ |
+| --- | --- | --- | --- |
+| TG512 | 11.12 / 11.47 | **12.41 / 12.57** | **+10.6%** |
+| PP 5 tok | 18.73 / 18.84 | 20.70 / 20.93 | +10.8% |
+| PP 63 tok | 16.72 / 16.73 | **13.61 / 13.62** | **-18.6%（回归，见下）** |
+| PP 254 tok | 35.27 / 35.45 | 34.87 / 34.90 | -1.4%（噪声级） |
+| PP 1020 tok | 74.28 / 75.08 | **94.99 / 94.70** | **+27.4%** |
+
+k_r 扫描（TG512 / PP254）：k_r=2 → 12.71 / 33.66；k_r=3 → **12.82** / 33.94；
+k_r=4 → 12.64 / **34.34**（on 轮 k_r=4 复测 TG 12.41/12.57、PP254 34.87/34.90）。
+差异 ~1.5% 在轮间噪声边缘，默认 n_used/2 已是合理选择；调优依据 = 两端带宽比
+（master ~341 GB/s vs slave ~174 GB/s ≈ 2:1，理论上 k_r 偏小更优，实测 TG 确以
+k_r=3 略优，但幅度不值得偏离默认值）。
+
+ep-debug 远程段分解（每层均值）：decode wait 1.573/1.277ms → **0.249/0.215ms**
+（-84%，重叠生效）；prefill wait 37.4/36.0ms → **0.88/0.81ms**（本地子图算完时
+远端半层早已返回，远程段从关键路径上消失）。send 两侧均 <0.5ms。
+
+PP 63 档回归根因：即上文"GLM PP 63-token 档异常根因"的同一问题——master 本地
+CPU MoE 小批次固定权重读取有效带宽仅 ~25GB/s；镜像把 15 层×4 slot 的 prefill
+计算搬回 master 本地路径，小档无法摊薄（wait 已降到 0.88ms，瓶颈转移到 master
+本地段）。大档（1020）摊薄后转为 +27% 净胜。
+
+内存代价：GLM 镜像开 master used 209G vs off 163G（**+46G**，15 层 ≈43.5G），
+available 42G 全程无 OOM；比预估的 +20G 多，预算请按全量层权重计。
+
+DSV4（slave 35-42 共 8 层，top-6，默认 k_r=3；同会话 off→on→on→off）：
+
+| 档 | off1/off2 | on1/on2 | Δ |
+| --- | --- | --- | --- |
+| TG512 | 24.78 / 24.93 | **27.15 / 27.16** | **+9.3%** |
+| PP 245 tok | 119.08 / 122.05 | 113.64 / 114.06 | -5.6%（小回归） |
+| PP 985 tok | 266.84 / 274.28 | **300.64 / 299.45** | **+10.9%** |
+
+ep-debug：decode wait 0.908/0.885ms → **0.187/0.179ms**（-80%）；prefill wait
+20.3/17.8ms → **0.92/0.84ms**。内存：on used 69G vs off 52G（+17G = 8 层 16G）。
+PP245 小回归与 GLM 小档同源（master 本地 MoE 小批次带宽问题，DSV4 幅度小得多）。
+
+结论：decode（TG）与大档 PP 全面净胜（远程段重叠掉，-80% wait），小档 PP 因
+master 本地小批次带宽短板有回归——小档场景建议保持默认（MIRROR 关）或等
+master 本地带宽问题修复后再开。off 轮均复现历史基线锚点（GLM TG≈10.7-11.5 /
+PP1020≈74.5，DSV4 TG≈24.7 / PP985≈274.5），无顺序效应。

@@ -1,6 +1,8 @@
 # MAX-EFFORT：空闲内存换均衡——EP 层的感知式额外镜像设计
 
-状态：设计草案（P0 工具已落地：ep-topo-probe / ep-topo-run.sh / ep-plan.py / ep-topo-profile.json）
+状态：P0 工具已落地（ep-topo-probe / ep-topo-run.sh / ep-plan.py / ep-topo-profile.json）；
+**P3 路线 A（层内专家级静态比例拆分）已实现并双机实测**（2026-07-30，commit 115622070，
+`GGML_REMOTE_EP_MIRROR=1`，见 README "层镜像 + 专家 slot 拆分" 节）
 
 ## 1. 动机
 
@@ -59,9 +61,19 @@
 
 分担要改变均衡点，需要运行时调度语义。两条路线对比：
 
-**A. 层内专家级静态比例拆分（推荐）**
+**A. 层内专家级静态比例拆分（推荐）—— ✅ 已实现（2026-07-30，commit 115622070）**
 
-- DSV4 每层 top-6 专家互相独立，输出是 router 权重加权和
+- 落地形态：`GGML_REMOTE_EP_MIRROR=1`（+`_MIRROR_LAYERS`/`_MIRROR_KREMOTE`）。
+  master 镜像远程层权重，每层 top-k 按 slot 维静态拆 [0,k_r) 远程 / [k_r,k) 本地，
+  默认 k_r=n_expert_used/2（clamp [1,k-1]），离线可调，运行时无调度器——与本节
+  原设计一致。同步语义用两个 custom op 夹住本地子图（send 只发不等 / wait 收
+  partial_r），合并顺序固定（partial_r 先、本地 slot 升序），与全远程基线结合
+  顺序一致，GLM+DSV4 gen48 逐字 IDENTICAL，worker 零改动。
+- 实测（同会话 ABBA 反序，详见 README 实测节）：TG GLM +10.6% / DSV4 +9.3%；
+  大档 PP GLM(1020) +27.4% / DSV4(985) +10.9%；每层 decode wait -80~84%。
+  小档 PP 回归（GLM 63 -18.6%、DSV4 245 -5.6%），根因是 master 本地 CPU MoE
+  小批次固定权重读取带宽短板（README 63-token 档已有记载），非拆分本身。
+- 原设计细节（保留备查）：DSV4 每层 top-6 专家互相独立，输出是 router 权重加权和
   `y = Σ_{i∈top6} w_i·expert_i(x)`。天然可把 6 个专家拆成两组（如 4+2、3+3），
   并发送主副本与镜像副本，**两组结果到齐后按固定顺序加权合并**。
 - 拆分比例来自 profile 带宽比（如 snode0:snode1 = 93.8:80.2 → 4:2 取整），
@@ -89,7 +101,7 @@
 | P0 ✅ | 拓扑探测 + profile + 规划器 + 校准（本目录已交付） | — | 锚点误差 ≤1.5%，复现 Ls=8 |
 | P1 | slave 双 worker 按节点非均衡拆分（snode0:snode1 按 93.8:80.2），`GGML_REMOTE_EP_LAYERS` 扩展为多段范围 + 多端点 | 现有 llama-epd，传输层支持 2 端点 | TG512 ≥ 单 worker 8 层配置；snode1 不再是短板 |
 | P2 | 热备对冲（M2）：master 镜像 slave 尾部 2-4 层，传输层加 p90 超时对冲请求 | P1；master 空闲 >100G | RPC >2ms 尖峰比例从 62% 降到 <10%；TG512 不降 |
-| P3 | 专家级静态拆分（M1+M3）：远端层 top-6 按带宽比分组并发，固定顺序合并 | P1 的多端点；图挂点支持双 RESP 合并 | 逐 token 一致性（temp0/seed42）；N* 右移实测 |
+| P3 ✅ | 专家级静态拆分（路线 A 已落地：`GGML_REMOTE_EP_MIRROR=1`，层镜像 + slot 维静态比例拆分，固定顺序合并；M1/M3 的双端共有载体以"master 镜像远程层"形态实现） | 现有图挂点（双 custom op 夹本地子图） | 逐字 IDENTICAL ✅；TG +9~11%、大档 PP +11~27% ✅；N* 右移未测（拆分在层内，不改层数分配） |
 | P4 | 同机跨 socket work-stealing 探索 + 规划器闭环（profile→plan→部署→实测回写校准） | P3 | TG 与 p90 双指标回归报告 |
 
 每阶段完成后更新 ep-plan.py 的校准锚点（新增实测点进 ANCHORS），保持模型误差 <3%。
