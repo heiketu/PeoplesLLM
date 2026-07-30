@@ -7,6 +7,10 @@ set(TARGET llama-ep-transport-bench)
 add_executable(${TARGET} ep-transport-bench.cpp llama-ep-transport.cpp llama-ep-transport.h)
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 
+set(TARGET llama-ep-dealer-test)
+add_executable(${TARGET} ep-dealer-test.cpp llama-ep-dealer.h)
+target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
 if (LLAMA_EP_RDMA_ENABLED)
     foreach (T llama-epd llama-ep-transport-bench)
         target_sources(${T} PRIVATE llama-ep-rdma.cpp)
