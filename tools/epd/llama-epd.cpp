@@ -884,12 +884,12 @@ static double ep_numa_probe_bw_gbps(int node, const std::vector<int> & cpus) {
     usleep(150000);
     const int64_t t1 = ggml_time_us();
     halt.store(true, std::memory_order_relaxed);
+    for (auto & t : ths) {
+        t.join(); // threads store their byte counts after seeing halt; join before reading
+    }
     uint64_t total = 0;
     for (auto & b : bytes) {
         total += b.load(std::memory_order_relaxed);
-    }
-    for (auto & t : ths) {
-        t.join();
     }
     munmap(buf, len);
     const double sec = (t1 - t0) / 1e6;
