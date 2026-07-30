@@ -143,6 +143,9 @@ static int cmd_ping(const char * kind, const char * host, int port) {
         const double med = us[n / 2];
         const double p90 = us[(int) (0.90 * (n - 1))];
         const double p99 = us[(int) (0.99 * (n - 1))];
+        const double mx  = us[n - 1];
+        int nstall = 0;
+        for (int i = 0; i < n; ++i) if (us[i] > 100000.0) ++nstall;
         printf("  {\"name\":\"%s\",\"bytes\":%zu,\"samples\":%d,"
                "\"rtt_us_median\":%.1f,\"rtt_us_p90\":%.1f,\"rtt_us_p99\":%.1f,"
                "\"cpu_us_per_op\":%.1f,\"cpu_frac\":%.3f,\"mb_per_s\":%.1f}%s\n",
@@ -150,8 +153,8 @@ static int cmd_ping(const char * kind, const char * host, int port) {
                cpu * 1e6 / n, wall > 0 ? cpu / wall : 0.0,
                wall > 0 ? (double) len * n / wall / 1e6 : 0.0,
                s == n_sizes - 1 ? "" : ",");
-        fprintf(stderr, "  %-7s %8zu B x%-5d rtt med %7.1f us  p90 %7.1f us  p99 %8.1f us  cpu %6.1f us/op (%4.1f%%)  %8.1f MB/s\n",
-                names[s], len, n, med, p90, p99, cpu * 1e6 / n, 100.0 * cpu / wall,
+        fprintf(stderr, "  %-7s %8zu B x%-5d rtt med %7.1f us  p90 %7.1f us  p99 %8.1f us  max %9.1f us  stalls>100ms %d  cpu %6.1f us/op (%4.1f%%)  %8.1f MB/s\n",
+                names[s], len, n, med, p90, p99, mx, nstall, cpu * 1e6 / n, 100.0 * cpu / wall,
                 wall > 0 ? (double) len * n / wall / 1e6 : 0.0);
     }
     printf("]}\n");
