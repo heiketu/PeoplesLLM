@@ -62,9 +62,29 @@ struct remote_ep_state {
     int         layer_first = 0;
     int         layer_last  = 1 << 30;
 
+    // layer mirroring + expert-slot split (GGML_REMOTE_EP_MIRROR=1)
+    bool        mirror            = false;
+    int         mirror_layer_first = 0;
+    int         mirror_layer_last  = 1 << 30;
+    int         mirror_kremote_cfg = 0; // 0 = default n_expert_used/2
+
     std::mutex           mtx;
     llama_ep_transport * conn = nullptr; // lazy, persistent across decode steps
     bool                 is_rdma = false;
+
+    // in-flight mirror request (send op -> wait op). the compute thread is
+    // serial between the two ops of a layer, so a single slot suffices
+    struct mirror_pending {
+        bool                 active      = false;
+        bool                 send_failed = false;
+        int                  il          = -1;
+        int64_t              n_tokens    = 0;
+        int64_t              n_embd      = 0;
+        int64_t              k_r         = 0;
+        std::vector<int32_t> ids;     // staging, ids[t*k_r + j]
+        std::vector<float>   weights; // staging, same layout
+        const float        * hidden = nullptr; // graph buffer, valid until the wait op
+    } pend;
 
     ~remote_ep_state() {
         if (conn) {
@@ -97,8 +117,37 @@ struct remote_ep_state {
             }
         }
 
+        // layer mirroring: master keeps the expert weights of the mirrored layers
+        // and splits each MoE along the expert-slot dimension (see llama-remote-ep.h)
+        if (const char * m = getenv("GGML_REMOTE_EP_MIRROR")) {
+            mirror = m[0] != '\0' && strcmp(m, "0") != 0;
+        }
+        mirror_layer_first = layer_first;
+        mirror_layer_last  = layer_last;
+        if (const char * l = getenv("GGML_REMOTE_EP_MIRROR_LAYERS")) {
+            int a = 0, b = 0;
+            if (sscanf(l, "%d-%d", &a, &b) == 2 && a <= b) {
+                mirror_layer_first = a; mirror_layer_last = b;
+            } else if (sscanf(l, "%d", &a) == 1) {
+                mirror_layer_first = a; mirror_layer_last = a;
+            } else {
+                LLAMA_LOG_WARN("%s: ignoring malformed GGML_REMOTE_EP_MIRROR_LAYERS='%s'\n", __func__, l);
+            }
+        }
+        if (const char * k = getenv("GGML_REMOTE_EP_MIRROR_KREMOTE")) {
+            mirror_kremote_cfg = atoi(k);
+            if (mirror_kremote_cfg < 0) {
+                mirror_kremote_cfg = 0;
+            }
+        }
+
         LLAMA_LOG_INFO("%s: GGML_REMOTE_EP=1: layers %d-%d -> %s:%d\n", __func__,
                 layer_first, layer_last == (1 << 30) ? -1 : layer_last, host.c_str(), port);
+        if (mirror) {
+            LLAMA_LOG_INFO("%s: GGML_REMOTE_EP_MIRROR=1: mirror layers %d-%d, k_remote=%s\n", __func__,
+                    mirror_layer_first, mirror_layer_last == (1 << 30) ? -1 : mirror_layer_last,
+                    mirror_kremote_cfg > 0 ? std::to_string(mirror_kremote_cfg).c_str() : "n_expert_used/2");
+        }
     }
 
     bool ensure_conn(std::string & err) {
@@ -325,6 +374,46 @@ bool remote_ep_roundtrip_pipelined(
 
 } // namespace
 
+// send the pending mirror REQ (slots [0,k_r)) without waiting for the RESP
+static bool remote_ep_mirror_send_req(remote_ep_state & st, std::string & err) {
+    const auto & p = st.pend;
+
+    llama_ep_req_header hdr = {p.il, (int32_t) p.n_tokens, (int32_t) p.k_r, (int32_t) p.n_embd};
+
+    const void * parts[4] = {&hdr, p.ids.data(), p.weights.data(), p.hidden};
+    const size_t lens[4]  = {
+        sizeof(hdr),
+        (size_t) p.n_tokens * p.k_r * sizeof(int32_t),
+        (size_t) p.n_tokens * p.k_r * sizeof(float),
+        (size_t) p.n_tokens * p.n_embd * sizeof(float),
+    };
+    if (!llama_ep_send_framev(st.conn, LLAMA_EP_MSG_REQ, parts, lens, 4)) {
+        err = "send REQ failed";
+        return false;
+    }
+    return true;
+}
+
+static bool llama_remote_ep_mirror_layer(int il) {
+    remote_ep_state & st = remote_ep_get();
+    return st.enabled && st.mirror &&
+           il >= st.layer_first        && il <= st.layer_last &&
+           il >= st.mirror_layer_first && il <= st.mirror_layer_last;
+}
+
+bool llama_remote_ep_skip_weights_for_layer(int il) {
+    return llama_remote_ep_enabled_for_layer(il) && !llama_remote_ep_mirror_layer(il);
+}
+
+int llama_remote_ep_mirror_kremote(int il, int n_expert_used) {
+    remote_ep_state & st = remote_ep_get();
+    if (!llama_remote_ep_mirror_layer(il) || n_expert_used < 2) {
+        return 0;
+    }
+    const int k_r = st.mirror_kremote_cfg > 0 ? st.mirror_kremote_cfg : n_expert_used / 2;
+    return std::max(1, std::min(k_r, n_expert_used - 1));
+}
+
 bool llama_remote_ep_enabled_for_layer(int il) {
     remote_ep_state & st = remote_ep_get();
     return st.enabled && il >= st.layer_first && il <= st.layer_last;
@@ -412,4 +501,155 @@ void llama_remote_ep_graph_cb(
             (float *) dst->data, err)) {
         GGML_ABORT("%s: layer %d: %s", __func__, il, err.c_str());
     }
+}
+
+void llama_remote_ep_mirror_send_cb(
+        ggml_tensor       * dst,
+        const ggml_tensor * a,
+        const ggml_tensor * b,
+        const ggml_tensor * c,
+        int ith, int nth, void * userdata) {
+    if (ith != 0) {
+        return;
+    }
+    (void) nth;
+    (void) dst; // unused; the op only fires the REQ
+
+    const int il = (int) (intptr_t) userdata;
+
+    const int64_t n_embd   = a->ne[0];
+    const int64_t n_tokens = a->ne[2];
+    const int64_t n_ids    = b->ne[0];
+
+    const bool ok_shapes =
+        a->type == GGML_TYPE_F32 && ggml_is_contiguous(a) &&
+        b->type == GGML_TYPE_I32 && ggml_is_contiguous(b) && b->ne[1] == n_tokens &&
+        c->type == GGML_TYPE_F32 && ggml_is_contiguous(c) && c->ne[0] == 1 && c->ne[1] == n_ids && c->ne[2] == n_tokens;
+
+    if (!ok_shapes) {
+        GGML_ABORT("%s: unexpected tensor shapes/types for layer %d", __func__, il);
+    }
+
+    remote_ep_state & st = remote_ep_get();
+
+    const int64_t k_r = llama_remote_ep_mirror_kremote(il, n_ids);
+    if (k_r <= 0 || k_r >= n_ids) {
+        GGML_ABORT("%s: layer %d is not mirrored (k_r=%lld of %lld)", __func__, il, (long long) k_r, (long long) n_ids);
+    }
+
+    const bool dbg = remote_ep_debug_enabled();
+    const int64_t t0 = dbg ? ggml_time_us() : 0;
+
+    std::lock_guard<std::mutex> lock(st.mtx);
+
+    auto & p = st.pend;
+    if (p.active) {
+        GGML_ABORT("%s: layer %d: previous mirror request (layer %d) was never consumed", __func__, il, p.il);
+    }
+
+    // gather slots [0,k_r) per token into contiguous staging (wire layout
+    // ids[t*k_r + j]); the source is strided (k slots per token)
+    const int32_t * ids = (const int32_t *) b->data;
+    const float   * w   = (const float   *) c->data;
+    p.ids.resize((size_t) n_tokens * k_r);
+    p.weights.resize((size_t) n_tokens * k_r);
+    for (int64_t t = 0; t < n_tokens; ++t) {
+        memcpy(p.ids.data()     + t * k_r, ids + t * n_ids, (size_t) k_r * sizeof(int32_t));
+        memcpy(p.weights.data() + t * k_r, w   + t * n_ids, (size_t) k_r * sizeof(float));
+    }
+
+    p.il          = il;
+    p.n_tokens    = n_tokens;
+    p.n_embd      = n_embd;
+    p.k_r         = k_r;
+    p.hidden      = (const float *) a->data;
+    p.send_failed = false;
+    p.active      = true;
+
+    std::string err;
+    if (!st.ensure_conn(err) || !remote_ep_mirror_send_req(st, err)) {
+        // leave the pending slot in place: the wait op reconnects and resends once
+        LLAMA_LOG_WARN("%s: layer %d: %s (will retry in wait op)\n", __func__, il, err.c_str());
+        p.send_failed = true;
+        st.drop_conn();
+    }
+
+    if (dbg) {
+        fprintf(stderr, "GGML_REMOTE_EP: [ep-debug] layer %d mirror k_r=%lld/%lld n_tokens=%lld send %.3f ms (t=%lld us)\n",
+                il, (long long) k_r, (long long) n_ids, (long long) n_tokens,
+                (ggml_time_us() - t0) / 1000.0, (long long) t0);
+    }
+}
+
+void llama_remote_ep_mirror_wait_cb(
+        ggml_tensor       * dst,
+        const ggml_tensor * a,
+        const ggml_tensor * b,
+        int ith, int nth, void * userdata) {
+    if (ith != 0) {
+        return;
+    }
+    (void) nth;
+    (void) a;
+    (void) b; // experts_l: ordering dependency only
+
+    const int il = (int) (intptr_t) userdata;
+
+    remote_ep_state & st = remote_ep_get();
+
+    const bool dbg = remote_ep_debug_enabled();
+    const int64_t t0 = dbg ? ggml_time_us() : 0;
+
+    std::lock_guard<std::mutex> lock(st.mtx);
+
+    auto & p = st.pend;
+    if (!p.active || p.il != il) {
+        GGML_ABORT("%s: layer %d: no pending mirror request (active=%d, pending layer %d)",
+                __func__, il, (int) p.active, p.il);
+    }
+
+    if (dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) ||
+        dst->ne[0] != p.n_embd || dst->ne[1] != 1 || dst->ne[2] != p.n_tokens) {
+        GGML_ABORT("%s: unexpected dst shape for layer %d", __func__, il);
+    }
+
+    std::string err;
+    bool ok = !p.send_failed && st.conn != nullptr &&
+              remote_ep_recv_resp_chunk(st, 0, p.n_tokens, p.n_embd, (float *) dst->data, err);
+
+    if (!ok) {
+        // one reconnect + resend (from the pending request bytes) + receive
+        LLAMA_LOG_WARN("%s: layer %d: %s — reconnecting and resending once\n", __func__, il, err.c_str());
+        st.drop_conn();
+        err.clear();
+        ok = st.ensure_conn(err) &&
+             remote_ep_mirror_send_req(st, err) &&
+             remote_ep_recv_resp_chunk(st, 0, p.n_tokens, p.n_embd, (float *) dst->data, err);
+    }
+    if (!ok) {
+        GGML_ABORT("%s: layer %d: %s", __func__, il, err.c_str());
+    }
+
+    p.active = false;
+    p.hidden = nullptr;
+
+    if (dbg) {
+        fprintf(stderr, "GGML_REMOTE_EP: [ep-debug] layer %d mirror n_tokens=%lld wait %.3f ms (t=%lld us)\n",
+                il, (long long) p.n_tokens, (ggml_time_us() - t0) / 1000.0, (long long) t0);
+    }
+}
+
+bool llama_remote_ep_mirror_fits(int64_t n_tokens, int64_t n_embd) {
+#ifdef LLAMA_EP_HAVE_RDMA
+    // over RDMA the worker's RESP send lands in the master's pre-posted receive
+    // ring (8 x 256 KiB); the master only drains it in the wait op, after the
+    // local chain. keep the RESP inside the ring so the worker never stalls
+    // (or worse) on a send nobody is receiving yet.
+    if (llama_ep_rdma_requested()) {
+        return (uint64_t) n_tokens * (uint64_t) n_embd * sizeof(float) <= (uint64_t) (3 << 20) / 2;
+    }
+#endif
+    (void) n_tokens;
+    (void) n_embd;
+    return true;
 }
