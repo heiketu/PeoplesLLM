@@ -80,8 +80,18 @@ void set_nodelay(int fd) {
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 }
 
+// large fixed buffers let one full pipelined chunk (GGML_REMOTE_EP_PIPELINE, ~1 MiB)
+// sit in the kernel while the peer is busy, so a W=1 sliding window never deadlocks;
+// harmless for the plain blocking round-trip
+void set_buffers(int fd) {
+    int sz = 4 * 1024 * 1024; // clamped to rmem_max/wmem_max
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &sz, sizeof(sz));
+    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sz, sizeof(sz));
+}
+
 llama_ep_transport * wrap_conn(int fd) {
     set_nodelay(fd);
+    set_buffers(fd);
     auto * c = new tcp_conn{fd};
     auto * t = new llama_ep_transport;
     t->ctx = c;

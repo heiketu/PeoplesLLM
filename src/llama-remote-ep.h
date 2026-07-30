@@ -12,6 +12,13 @@
 //   GGML_REMOTE_EP_HOST=ADDR    worker host (default 127.0.0.1)
 //   GGML_REMOTE_EP_PORT=N       worker port (default 29200)
 //   GGML_REMOTE_EP_LAYERS=A-B   layer range to dispatch remotely (default: all)
+//   GGML_REMOTE_EP_PIPELINE=1   pipelined chunk dispatch for multi-token batches:
+//                               split a layer's tokens into chunks (default 256
+//                               tokens, capped to ~3 MiB of hidden over TCP / 1.5 MiB
+//                               over RDMA, tunable via GGML_REMOTE_EP_PIPELINE_CHUNK)
+//                               and send them with a W=1 sliding window so the
+//                               worker's compute overlaps the master's transfers.
+//                               Off by default; decode (1 token) is unaffected.
 //
 // Only the routed-expert FFN is remote; attention, router and the weighted
 // sum semantics are unchanged. Layers outside the range (and warmup graphs)
