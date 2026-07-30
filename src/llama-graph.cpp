@@ -2039,6 +2039,79 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             selected_experts = ggml_cont(ctx0, selected_experts);
             weights          = ggml_cont(ctx0, weights);
 
+            // layer mirroring + expert-slot split (GGML_REMOTE_EP_MIRROR=1):
+            // slots [0,k_r) go to the worker, slots [k_r,k) run locally.
+            // separate gate/up layout only; mirror_fits keeps oversized RDMA
+            // batches on the classic path (see llama-remote-ep.h)
+            const int k_r = gate_exps && up_exps && down_exps &&
+                    llama_remote_ep_mirror_fits(n_tokens, n_embd)
+                ? llama_remote_ep_mirror_kremote(il, n_expert_used) : 0;
+
+            if (k_r > 0) {
+                const int64_t k_l = n_expert_used - k_r;
+
+                // send-only op: fires the REQ for slots [0,k_r) and returns; the CPU
+                // backend runs nodes in creation order with barriers between them, so
+                // the local subgraph below overlaps the worker's compute
+                ggml_tensor * op_send = ggml_map_custom3(ctx0, cur, selected_experts, weights,
+                        llama_remote_ep_mirror_send_cb, 1, (void *) (intptr_t) il);
+                ggml_build_forward_expand(gf, op_send);
+
+                // local slots [k_r,k): strided row views, cont before use
+                ggml_tensor * ids_l = ggml_cont(ctx0, ggml_view_2d(ctx0, selected_experts,
+                        k_l, n_tokens, selected_experts->nb[1], k_r*selected_experts->nb[0]));
+                ggml_tensor * weights_l = ggml_cont(ctx0, ggml_view_3d(ctx0, weights,
+                        1, k_l, n_tokens, weights->nb[1], weights->nb[2], k_r*weights->nb[1]));
+
+                // same chain as the local MoE path (separate gate/up, SILU)
+                ggml_tensor * up_l   = build_lora_mm_id(up_exps,   cur, ids_l, nullptr); // [n_ff, k_l, n_tokens]
+                ggml_tensor * gate_l = build_lora_mm_id(gate_exps, cur, ids_l, nullptr);
+
+                ggml_tensor * act = nullptr;
+                const float limit = il >= 0 ? hparams.swiglu_clamp_exp[il] : 0.0f;
+                constexpr float eps = 1e-6f;
+                if (limit > eps) {
+                    up_l = ggml_clamp(ctx0, up_l, -limit, limit);
+                    if (arch == LLM_ARCH_DEEPSEEK4) {
+                        gate_l = ggml_clamp(ctx0, gate_l, -INFINITY, limit);
+                        act = ggml_swiglu_split(ctx0, gate_l, up_l);
+                    } else {
+                        ggml_tensor * gate_act = ggml_silu(ctx0, gate_l);
+                        gate_act = ggml_clamp(ctx0, gate_act, -INFINITY, limit);
+                        act = ggml_mul(ctx0, gate_act, up_l);
+                    }
+                } else {
+                    act = ggml_swiglu_split(ctx0, gate_l, up_l);
+                }
+
+                ggml_tensor * experts_l = build_lora_mm_id(down_exps, act, ids_l, nullptr); // [n_embd, k_l, n_tokens]
+                experts_l = ggml_mul(ctx0, experts_l, weights_l);
+                cb(experts_l, "ffn_moe_down", il);
+                ggml_build_forward_expand(gf, experts_l);
+
+                // wait op: src[0]=op_send and src[1]=experts_l force it to run after
+                // both the send op and the local subgraph; dst receives partial_r
+                // [n_embd,1,n_tokens]
+                ggml_tensor * partial_r = ggml_map_custom2(ctx0, op_send, experts_l,
+                        llama_remote_ep_mirror_wait_cb, 1, (void *) (intptr_t) il);
+                ggml_build_forward_expand(gf, partial_r);
+
+                // merge in fixed ascending slot order: partial_r (= remote slots
+                // 0..k_r-1, accumulated in order by the worker) first, then the local
+                // slots k_r..k-1 one by one — the same association order as the
+                // all-remote baseline, keeping the result bit-identical
+                ggml_tensor * moe_out = ggml_reshape_2d(ctx0, partial_r, n_embd, n_tokens);
+                for (int64_t i = 0; i < k_l; ++i) {
+                    ggml_tensor * v = ggml_view_2d(ctx0, experts_l, n_embd, n_tokens,
+                            experts_l->nb[2], i*experts_l->nb[1]);
+                    moe_out = ggml_add(ctx0, moe_out, v);
+                    ggml_build_forward_expand(gf, moe_out);
+                }
+                cb(moe_out, "ffn_moe_out", il);
+
+                return moe_out;
+            }
+
             ggml_tensor * moe_out = ggml_map_custom3(ctx0, cur, selected_experts, weights,
                     llama_remote_ep_graph_cb, 1, (void *) (intptr_t) il);
             cb(moe_out, "ffn_moe_out", il);
