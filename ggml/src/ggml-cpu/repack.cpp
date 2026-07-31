@@ -5736,8 +5736,17 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
         // rows are claimed in blocks of ep_chunk (a multiple of NB_COLS); the per-node
         // window size must match llama_model::numa_ep_place_experts. Smaller blocks
-        // shrink the per-thread tail quantum at batch=1 (one block ≈ one tail unit).
-        const int64_t ep_chunk = 16;
+        // shrink the per-thread tail quantum at batch=1 (one block ≈ one tail unit);
+        // larger blocks amortize per-gemv-call and src1 re-read cost at large batches.
+        // env GGML_NUMA_EP_CHUNK overrides the block size (default 16); it must be a
+        // multiple of NB_COLS and divide 128 to keep the compute windows identical to
+        // the placement windows for every ne01 (a mismatch only costs locality, never
+        // correctness — the compute windows tile [0, ne01) regardless).
+        static const int64_t ep_chunk = []() {
+            const char * e = getenv("GGML_NUMA_EP_CHUNK");
+            const int v = e ? atoi(e) : 16;
+            return (int64_t) (v >= NB_COLS && v % NB_COLS == 0 && 128 % v == 0 ? v : 16);
+        }();
         const int64_t ep_win = ep ? (((ne01 + ep_nodes - 1) / ep_nodes + ep_chunk - 1) / ep_chunk) * ep_chunk : 0;
 
         if (ep) {

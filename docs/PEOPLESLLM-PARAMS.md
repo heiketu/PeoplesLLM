@@ -31,7 +31,8 @@
 | `GGML_NUMA_EP` | 关 | 单机 NUMA 专家并行（行窗口）：每个 routed-expert 张量（`*_exps`）的**每个专家平面内**按行窗划分，节点 n 拥有 `[n*win, (n+1)*win)` 行（128 行对齐 mbind 单份放置）；repack mul_mat_id 计算侧按 per-(专家,节点) 计数器认领本节点窗口的行（`ggml/src/ggml-cpu/repack.cpp` + `src/llama-model.cpp: numa_ep_place_experts`）。需要 `--no-mmap` 加载（匿名内存才可迁移页）；**必须配合 80fe44321 起的亲和修复**（EP 下 DISTRIBUTE 钉核改块划分，否则半数线程全远程读） | 多 NUMA 节点纯 CPU / CPU-MoE 场景；与 `--numa mirror` 是两条不同路线（EP=划分不复制，mirror=全复制） |
 | `GGML_NUMA_EP_MMAP` | 关 | 允许在 mmap 加载的模型上做 **policy-only** 专家放置（`mbind(MPOL_BIND, flags=0)`，只设 VMA 策略、不迁移已缓存页） | **已知坑**：冷 page cache 下首次缺页按 interleave 落两节点后被钉死在错位节点，PP 减半。不要用，改用 `--no-mmap` |
 | `GGML_NUMA_EP_STEAL_MIN_TOKENS` | `32` | NUMA EP 工作窃取的 token 阈值：批内 token 数 > 此值才跑「本地 + 窃取」两阶段协议，否则只做本地相位（静态按节点划分） | 一般不用调；与分层 barrier 的 TG 判据一致 |
-| `GGML_NUMA_EP_STATIC` | 关 | 单相位（小批）时用**静态连续行窗划分**替代动态 claim：选中专家的本节点窗口拉平后按线程等分连续切片（NB_COLS 对齐），零原子、每线程长顺序流 | 实验开关；数值不变（每 dst 行仍恰算一次） |
+| `GGML_NUMA_EP_STATIC` | 关 | 单相位（小批）时用**静态连续行窗划分**替代动态 claim：选中专家的本节点窗口拉平后按线程等分连续切片（NB_COLS 对齐），零原子、每线程长顺序流 | 实验开关；数值不变（每 dst 行仍恰算一次）。实测 op wall 更低但 barrier 等待更高，端到端不优于 claim，保持默认关 |
+| `GGML_NUMA_EP_CHUNK` | `16` | 行窗 claim 的块行数（须为 NB_COLS 倍数且整除 128，否则回落 16）。小块缩小 batch=1 尾部量子；大块摊薄大批下 per-gemv-call 与 src1 重读开销 | TG 已扫参 16 最优；PP 扫参见 HANDOVER（agent-32） |
 | `GGML_NUMA_EP_CLAIM` | 开 | `=0` 时保留行窗页放置但旁路 EP 计算路径（落回专家优先/默认路径） | **仅诊断**：归因 claim 路径 vs 页放置用，生产勿设 |
 | `GGML_NUMA_EP_DEBUG` | 关 | 行窗 EP claim 诊断：每 256 次调用打印 wall/spread/busy/两节点认领行数/窃取统计到 stderr | **海森堡效应明显**（共享调试计数器热行，TG 约 -18%），只看相对结构别看绝对值 |
 | `GGML_NUMA_HIER_BARRIER` | 关 | 纯自旋两级 NUMA 分级 barrier（先节点内、再跨节点），仅在 `--numa mirror` 且 ≥2 节点、多线程时生效 | 实测 OpenMP 构建下与 GOMP 树形 barrier 无差异，保持默认关 |
