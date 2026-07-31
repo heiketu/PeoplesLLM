@@ -3269,28 +3269,23 @@ void ggml_gemv_iq2_xs_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const 
 
     // One 64-bit lane per column. The 64-byte qs chunk of sub block g holds 4 uint16
     // entries per column: entry e of column j is 16-bit word 4*j + e of the chunk.
-    // word_sel[e] spreads word 4*j + e into the low word of 64-bit lane j; the remaining
-    // words of each lane are masked away with mlow16.
-    static const uint16_t k_word_sel[4][32] = {
-        { 0,0,0,0,  4,0,0,0,  8,0,0,0, 12,0,0,0, 16,0,0,0, 20,0,0,0, 24,0,0,0, 28,0,0,0 },
-        { 1,0,0,0,  5,0,0,0,  9,0,0,0, 13,0,0,0, 17,0,0,0, 21,0,0,0, 25,0,0,0, 29,0,0,0 },
-        { 2,0,0,0,  6,0,0,0, 10,0,0,0, 14,0,0,0, 18,0,0,0, 22,0,0,0, 26,0,0,0, 30,0,0,0 },
-        { 3,0,0,0,  7,0,0,0, 11,0,0,0, 15,0,0,0, 19,0,0,0, 23,0,0,0, 27,0,0,0, 31,0,0,0 },
-    };
-    const __m512i word_sel[4] = {
-        _mm512_loadu_si512((const void *) k_word_sel[0]),
-        _mm512_loadu_si512((const void *) k_word_sel[1]),
-        _mm512_loadu_si512((const void *) k_word_sel[2]),
-        _mm512_loadu_si512((const void *) k_word_sel[3]),
-    };
-
-    const __m512i mlow16       = _mm512_set1_epi64(0xFFFF);
+    // A 64-bit shift by 16*e moves word e into the low word of each lane (the gather
+    // index), and a shift by 9 puts the four 7-bit sign fields of the lane in bytes
+    // 0/2/4/6, so all four sign lookups of the group share one permutex2var.
     const __m512i m511         = _mm512_set1_epi64(511);
+    const __m512i m7f00        = _mm512_set1_epi64(0x7F007F007F007F);
     const __m512i bit_selector = _mm512_set1_epi64(0x8040201008040201);
-    // splat byte 0 of each 64-bit lane over the whole lane
+    // splat byte 0 of each 64-bit lane over the whole lane; splat_sel_e picks byte 2*e
+    // (the sign byte of entry e after the per-group field extraction below)
     const __m512i splat_sel = _mm512_set_epi8(
         56,56,56,56,56,56,56,56, 48,48,48,48,48,48,48,48, 40,40,40,40,40,40,40,40, 32,32,32,32,32,32,32,32,
         24,24,24,24,24,24,24,24, 16,16,16,16,16,16,16,16, 8,8,8,8,8,8,8,8, 0,0,0,0,0,0,0,0);
+    const __m512i splat_sel_e[4] = {
+        splat_sel,
+        _mm512_add_epi8(splat_sel, _mm512_set1_epi8(2)),
+        _mm512_add_epi8(splat_sel, _mm512_set1_epi8(4)),
+        _mm512_add_epi8(splat_sel, _mm512_set1_epi8(6)),
+    };
     // ksigns_iq2xs sign byte lookup (128 entries across two 64-byte sources)
     const __m512i ktab_lo = _mm512_loadu_si512((const void *) ksigns_iq2xs);
     const __m512i ktab_hi = _mm512_loadu_si512((const void *) (ksigns_iq2xs + 64));
@@ -3323,6 +3318,11 @@ void ggml_gemv_iq2_xs_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const 
                 // words 4*j..4*j+3 of the 64-byte chunk at qs + g*64
                 const __m512i chunk = _mm512_loadu_si512((const void *) ((const uint8_t *) b_ptr[b].qs + g * 64));
 
+                // per-group sign extraction: byte 2*e of each lane of sb is the ksigns
+                // byte of entry e of that lane's column
+                const __m512i t  = _mm512_and_si512(_mm512_srli_epi64(chunk, 9), m7f00);
+                const __m512i sb = _mm512_permutex2var_epi8(ktab_lo, t, ktab_hi);
+
                 // sub block scales: ls1 = 2*(sc & 0xf) + 1 (entries 0,1), ls2 = 2*(sc >> 4) + 1 (entries 2,3)
                 memcpy(&aux64, b_ptr[b].scales + g * 8, 8);
                 const __m128i sc   = _mm_set1_epi64x(aux64);
@@ -3333,12 +3333,9 @@ void ggml_gemv_iq2_xs_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const 
 
                 for (int e = 0; e < 4; e++) {
                     // col j's uint16 for entry e: 9-bit grid index + 7-bit sign field
-                    const __m512i word  = _mm512_and_si512(_mm512_permutexvar_epi16(word_sel[e], chunk), mlow16);
-                    const __m512i q2b   = _mm512_i64gather_epi64(_mm512_and_si512(word, m511), (const long long *)iq2xs_grid, 8);
-                    // sign byte per column via the ksigns table (bit 7 of each byte is unused)
-                    const __m512i field = _mm512_srli_epi64(word, 9);
-                    const __m512i sb    = _mm512_permutex2var_epi8(ktab_lo, field, ktab_hi);
-                    const __mmask64 neg = _mm512_test_epi8_mask(_mm512_permutexvar_epi8(splat_sel, sb), bit_selector);
+                    const __m512i word = _mm512_and_si512(_mm512_srli_epi64(chunk, 16 * e), m511);
+                    const __m512i q2b  = _mm512_i64gather_epi64(word, (const long long *)iq2xs_grid, 8);
+                    const __mmask64 neg = _mm512_test_epi8_mask(_mm512_permutexvar_epi8(splat_sel_e[e], sb), bit_selector);
 
                     const __m512i q8b = _mm512_set1_epi64(*(const long long *)(a_ptr[b].qs + 32 * g + 8 * e));
                     const __m512i q8s = _mm512_mask_sub_epi8(q8b, neg, _mm512_setzero_si512(), q8b);
@@ -9175,25 +9172,18 @@ void ggml_gemm_iq2_xs_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const 
 
     // Same one-lane-per-column scheme as the iq2_xs gemv above; the gathers, sign masks
     // and scale pairs are shared across the 4 activation rows of the tile
-    static const uint16_t k_word_sel[4][32] = {
-        { 0,0,0,0,  4,0,0,0,  8,0,0,0, 12,0,0,0, 16,0,0,0, 20,0,0,0, 24,0,0,0, 28,0,0,0 },
-        { 1,0,0,0,  5,0,0,0,  9,0,0,0, 13,0,0,0, 17,0,0,0, 21,0,0,0, 25,0,0,0, 29,0,0,0 },
-        { 2,0,0,0,  6,0,0,0, 10,0,0,0, 14,0,0,0, 18,0,0,0, 22,0,0,0, 26,0,0,0, 30,0,0,0 },
-        { 3,0,0,0,  7,0,0,0, 11,0,0,0, 15,0,0,0, 19,0,0,0, 23,0,0,0, 27,0,0,0, 31,0,0,0 },
-    };
-    const __m512i word_sel[4] = {
-        _mm512_loadu_si512((const void *) k_word_sel[0]),
-        _mm512_loadu_si512((const void *) k_word_sel[1]),
-        _mm512_loadu_si512((const void *) k_word_sel[2]),
-        _mm512_loadu_si512((const void *) k_word_sel[3]),
-    };
-
-    const __m512i mlow16       = _mm512_set1_epi64(0xFFFF);
     const __m512i m511         = _mm512_set1_epi64(511);
+    const __m512i m7f00        = _mm512_set1_epi64(0x7F007F007F007F);
     const __m512i bit_selector = _mm512_set1_epi64(0x8040201008040201);
     const __m512i splat_sel = _mm512_set_epi8(
         56,56,56,56,56,56,56,56, 48,48,48,48,48,48,48,48, 40,40,40,40,40,40,40,40, 32,32,32,32,32,32,32,32,
         24,24,24,24,24,24,24,24, 16,16,16,16,16,16,16,16, 8,8,8,8,8,8,8,8, 0,0,0,0,0,0,0,0);
+    const __m512i splat_sel_e[4] = {
+        splat_sel,
+        _mm512_add_epi8(splat_sel, _mm512_set1_epi8(2)),
+        _mm512_add_epi8(splat_sel, _mm512_set1_epi8(4)),
+        _mm512_add_epi8(splat_sel, _mm512_set1_epi8(6)),
+    };
     const __m512i ktab_lo = _mm512_loadu_si512((const void *) ksigns_iq2xs);
     const __m512i ktab_hi = _mm512_loadu_si512((const void *) (ksigns_iq2xs + 64));
 
@@ -9231,6 +9221,10 @@ void ggml_gemm_iq2_xs_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const 
                     // sub block g (shared across rows): see the iq2_xs gemv for the layout
                     const __m512i chunk = _mm512_loadu_si512((const void *) ((const uint8_t *) b_ptr[b].qs + g * 64));
 
+                    // per-group sign extraction (shared across the 4 entries)
+                    const __m512i t  = _mm512_and_si512(_mm512_srli_epi64(chunk, 9), m7f00);
+                    const __m512i sb = _mm512_permutex2var_epi8(ktab_lo, t, ktab_hi);
+
                     memcpy(&aux64, b_ptr[b].scales + g * 8, 8);
                     const __m128i sc   = _mm_set1_epi64x(aux64);
                     const __m128i ls1  = _mm_add_epi8(_mm_slli_epi16(_mm_and_si128(sc, m4), 1), m1);
@@ -9241,10 +9235,9 @@ void ggml_gemm_iq2_xs_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const 
                     __m512i   q2b[4];
                     __mmask64 neg[4];
                     for (int e = 0; e < 4; e++) {
-                        const __m512i word = _mm512_and_si512(_mm512_permutexvar_epi16(word_sel[e], chunk), mlow16);
-                        q2b[e] = _mm512_i64gather_epi64(_mm512_and_si512(word, m511), (const long long *)iq2xs_grid, 8);
-                        const __m512i sb = _mm512_permutex2var_epi8(ktab_lo, _mm512_srli_epi64(word, 9), ktab_hi);
-                        neg[e] = _mm512_test_epi8_mask(_mm512_permutexvar_epi8(splat_sel, sb), bit_selector);
+                        const __m512i word = _mm512_and_si512(_mm512_srli_epi64(chunk, 16 * e), m511);
+                        q2b[e] = _mm512_i64gather_epi64(word, (const long long *)iq2xs_grid, 8);
+                        neg[e] = _mm512_test_epi8_mask(_mm512_permutexvar_epi8(splat_sel_e[e], sb), bit_selector);
                     }
 
                     for (int m = 0; m < 4; m++) {
