@@ -54,6 +54,8 @@
 #define ggml_gemv_iq4_nl_8x8_q8_0_generic ggml_gemv_iq4_nl_8x8_q8_0
 #define ggml_gemv_iq1_s_8x8_q8_K_generic ggml_gemv_iq1_s_8x8_q8_K
 #define ggml_gemv_iq1_m_8x8_q8_K_generic ggml_gemv_iq1_m_8x8_q8_K
+#define ggml_gemv_iq2_xs_8x8_q8_K_generic ggml_gemv_iq2_xs_8x8_q8_K
+#define ggml_gemv_iq3_xxs_8x8_q8_K_generic ggml_gemv_iq3_xxs_8x8_q8_K
 #define ggml_gemv_mxfp4_4x4_q8_0_generic ggml_gemv_mxfp4_4x4_q8_0
 #define ggml_gemv_mxfp4_8x8_q8_0_generic ggml_gemv_mxfp4_8x8_q8_0
 #define ggml_gemv_q8_0_4x4_q8_0_generic ggml_gemv_q8_0_4x4_q8_0
@@ -73,6 +75,8 @@
 #define ggml_gemm_iq4_nl_8x8_q8_0_generic ggml_gemm_iq4_nl_8x8_q8_0
 #define ggml_gemm_iq1_s_8x8_q8_K_generic ggml_gemm_iq1_s_8x8_q8_K
 #define ggml_gemm_iq1_m_8x8_q8_K_generic ggml_gemm_iq1_m_8x8_q8_K
+#define ggml_gemm_iq2_xs_8x8_q8_K_generic ggml_gemm_iq2_xs_8x8_q8_K
+#define ggml_gemm_iq3_xxs_8x8_q8_K_generic ggml_gemm_iq3_xxs_8x8_q8_K
 #define ggml_gemm_mxfp4_4x4_q8_0_generic ggml_gemm_mxfp4_4x4_q8_0
 #define ggml_gemm_mxfp4_8x8_q8_0_generic ggml_gemm_mxfp4_8x8_q8_0
 #define ggml_gemm_q8_0_4x4_q8_0_generic ggml_gemm_q8_0_4x4_q8_0
@@ -84,12 +88,16 @@
 #define ggml_gemv_iq4_nl_8x8_q8_0_generic ggml_gemv_iq4_nl_8x8_q8_0
 #define ggml_gemv_iq1_s_8x8_q8_K_generic ggml_gemv_iq1_s_8x8_q8_K
 #define ggml_gemv_iq1_m_8x8_q8_K_generic ggml_gemv_iq1_m_8x8_q8_K
+#define ggml_gemv_iq2_xs_8x8_q8_K_generic ggml_gemv_iq2_xs_8x8_q8_K
+#define ggml_gemv_iq3_xxs_8x8_q8_K_generic ggml_gemv_iq3_xxs_8x8_q8_K
 #define ggml_gemv_mxfp4_8x8_q8_0_generic ggml_gemv_mxfp4_8x8_q8_0
 #define ggml_gemv_q2_K_8x8_q8_K_generic ggml_gemv_q2_K_8x8_q8_K
 #define ggml_gemv_q3_K_8x8_q8_K_generic ggml_gemv_q3_K_8x8_q8_K
 #define ggml_gemm_iq4_nl_8x8_q8_0_generic ggml_gemm_iq4_nl_8x8_q8_0
 #define ggml_gemm_iq1_s_8x8_q8_K_generic ggml_gemm_iq1_s_8x8_q8_K
 #define ggml_gemm_iq1_m_8x8_q8_K_generic ggml_gemm_iq1_m_8x8_q8_K
+#define ggml_gemm_iq2_xs_8x8_q8_K_generic ggml_gemm_iq2_xs_8x8_q8_K
+#define ggml_gemm_iq3_xxs_8x8_q8_K_generic ggml_gemm_iq3_xxs_8x8_q8_K
 #define ggml_gemm_mxfp4_8x8_q8_0_generic ggml_gemm_mxfp4_8x8_q8_0
 #define ggml_gemm_q2_K_8x8_q8_K_generic ggml_gemm_q2_K_8x8_q8_K
 #define ggml_gemm_q3_K_8x8_q8_K_generic ggml_gemm_q3_K_8x8_q8_K
@@ -108,6 +116,8 @@
 // ggml_gemv_q6_K_8x8_q8_K has a native x86 AVX512 implementation (arch/x86/repack.cpp)
 // ggml_gemv_iq1_s_8x8_q8_K has a native x86 AVX512 implementation (arch/x86/repack.cpp)
 // ggml_gemv_iq1_m_8x8_q8_K has a native x86 AVX512 implementation (arch/x86/repack.cpp)
+// ggml_gemv_iq2_xs_8x8_q8_K has a native x86 AVX512 implementation (arch/x86/repack.cpp)
+// ggml_gemv_iq3_xxs_8x8_q8_K has a native x86 AVX512 implementation (arch/x86/repack.cpp)
 #define ggml_gemv_iq4_nl_4x4_q8_0_generic ggml_gemv_iq4_nl_4x4_q8_0
 #define ggml_gemv_mxfp4_4x4_q8_0_generic ggml_gemv_mxfp4_4x4_q8_0
 #define ggml_gemv_q8_0_4x4_q8_0_generic ggml_gemv_q8_0_4x4_q8_0
@@ -121,6 +131,8 @@
 // ggml_gemm_q6_K_8x8_q8_K has a native x86 AVX512 implementation (arch/x86/repack.cpp)
 // ggml_gemm_iq1_s_8x8_q8_K has a native x86 AVX512 implementation (arch/x86/repack.cpp)
 // ggml_gemm_iq1_m_8x8_q8_K has a native x86 AVX512 implementation (arch/x86/repack.cpp)
+// ggml_gemm_iq2_xs_8x8_q8_K has a native x86 AVX512 implementation (arch/x86/repack.cpp)
+// ggml_gemm_iq3_xxs_8x8_q8_K has a native x86 AVX512 implementation (arch/x86/repack.cpp)
 #define ggml_gemm_iq4_nl_4x4_q8_0_generic ggml_gemm_iq4_nl_4x4_q8_0
 #define ggml_gemm_mxfp4_4x4_q8_0_generic ggml_gemm_mxfp4_4x4_q8_0
 #define ggml_gemm_q8_0_4x4_q8_0_generic ggml_gemm_q8_0_4x4_q8_0
@@ -155,6 +167,8 @@
 #define ggml_gemv_iq4_nl_8x8_q8_0_generic ggml_gemv_iq4_nl_8x8_q8_0
 #define ggml_gemv_iq1_s_8x8_q8_K_generic ggml_gemv_iq1_s_8x8_q8_K
 #define ggml_gemv_iq1_m_8x8_q8_K_generic ggml_gemv_iq1_m_8x8_q8_K
+#define ggml_gemv_iq2_xs_8x8_q8_K_generic ggml_gemv_iq2_xs_8x8_q8_K
+#define ggml_gemv_iq3_xxs_8x8_q8_K_generic ggml_gemv_iq3_xxs_8x8_q8_K
 #define ggml_gemv_mxfp4_4x4_q8_0_generic ggml_gemv_mxfp4_4x4_q8_0
 #define ggml_gemv_mxfp4_8x8_q8_0_generic ggml_gemv_mxfp4_8x8_q8_0
 #define ggml_gemv_q8_0_4x4_q8_0_generic ggml_gemv_q8_0_4x4_q8_0
@@ -174,6 +188,8 @@
 #define ggml_gemm_iq4_nl_8x8_q8_0_generic ggml_gemm_iq4_nl_8x8_q8_0
 #define ggml_gemm_iq1_s_8x8_q8_K_generic ggml_gemm_iq1_s_8x8_q8_K
 #define ggml_gemm_iq1_m_8x8_q8_K_generic ggml_gemm_iq1_m_8x8_q8_K
+#define ggml_gemm_iq2_xs_8x8_q8_K_generic ggml_gemm_iq2_xs_8x8_q8_K
+#define ggml_gemm_iq3_xxs_8x8_q8_K_generic ggml_gemm_iq3_xxs_8x8_q8_K
 #define ggml_gemm_mxfp4_4x4_q8_0_generic ggml_gemm_mxfp4_4x4_q8_0
 #define ggml_gemm_mxfp4_8x8_q8_0_generic ggml_gemm_mxfp4_8x8_q8_0
 #define ggml_gemm_q8_0_4x4_q8_0_generic ggml_gemm_q8_0_4x4_q8_0
@@ -208,6 +224,8 @@
 #define ggml_gemv_iq4_nl_8x8_q8_0_generic ggml_gemv_iq4_nl_8x8_q8_0
 #define ggml_gemv_iq1_s_8x8_q8_K_generic ggml_gemv_iq1_s_8x8_q8_K
 #define ggml_gemv_iq1_m_8x8_q8_K_generic ggml_gemv_iq1_m_8x8_q8_K
+#define ggml_gemv_iq2_xs_8x8_q8_K_generic ggml_gemv_iq2_xs_8x8_q8_K
+#define ggml_gemv_iq3_xxs_8x8_q8_K_generic ggml_gemv_iq3_xxs_8x8_q8_K
 #define ggml_gemv_mxfp4_4x4_q8_0_generic ggml_gemv_mxfp4_4x4_q8_0
 #define ggml_gemv_mxfp4_8x8_q8_0_generic ggml_gemv_mxfp4_8x8_q8_0
 #define ggml_gemv_q8_0_4x4_q8_0_generic ggml_gemv_q8_0_4x4_q8_0
@@ -227,6 +245,8 @@
 #define ggml_gemm_iq4_nl_8x8_q8_0_generic ggml_gemm_iq4_nl_8x8_q8_0
 #define ggml_gemm_iq1_s_8x8_q8_K_generic ggml_gemm_iq1_s_8x8_q8_K
 #define ggml_gemm_iq1_m_8x8_q8_K_generic ggml_gemm_iq1_m_8x8_q8_K
+#define ggml_gemm_iq2_xs_8x8_q8_K_generic ggml_gemm_iq2_xs_8x8_q8_K
+#define ggml_gemm_iq3_xxs_8x8_q8_K_generic ggml_gemm_iq3_xxs_8x8_q8_K
 #define ggml_gemm_mxfp4_4x4_q8_0_generic ggml_gemm_mxfp4_4x4_q8_0
 #define ggml_gemm_mxfp4_8x8_q8_0_generic ggml_gemm_mxfp4_8x8_q8_0
 #define ggml_gemm_q8_0_4x4_q8_0_generic ggml_gemm_q8_0_4x4_q8_0
@@ -255,6 +275,8 @@
 #define ggml_gemv_iq4_nl_8x8_q8_0_generic ggml_gemv_iq4_nl_8x8_q8_0
 #define ggml_gemv_iq1_s_8x8_q8_K_generic ggml_gemv_iq1_s_8x8_q8_K
 #define ggml_gemv_iq1_m_8x8_q8_K_generic ggml_gemv_iq1_m_8x8_q8_K
+#define ggml_gemv_iq2_xs_8x8_q8_K_generic ggml_gemv_iq2_xs_8x8_q8_K
+#define ggml_gemv_iq3_xxs_8x8_q8_K_generic ggml_gemv_iq3_xxs_8x8_q8_K
 #define ggml_gemv_mxfp4_4x4_q8_0_generic ggml_gemv_mxfp4_4x4_q8_0
 #define ggml_gemv_mxfp4_8x8_q8_0_generic ggml_gemv_mxfp4_8x8_q8_0
 #define ggml_gemv_q8_0_4x4_q8_0_generic ggml_gemv_q8_0_4x4_q8_0
@@ -273,6 +295,8 @@
 #define ggml_gemm_iq4_nl_8x8_q8_0_generic ggml_gemm_iq4_nl_8x8_q8_0
 #define ggml_gemm_iq1_s_8x8_q8_K_generic ggml_gemm_iq1_s_8x8_q8_K
 #define ggml_gemm_iq1_m_8x8_q8_K_generic ggml_gemm_iq1_m_8x8_q8_K
+#define ggml_gemm_iq2_xs_8x8_q8_K_generic ggml_gemm_iq2_xs_8x8_q8_K
+#define ggml_gemm_iq3_xxs_8x8_q8_K_generic ggml_gemm_iq3_xxs_8x8_q8_K
 #define ggml_gemm_mxfp4_4x4_q8_0_generic ggml_gemm_mxfp4_4x4_q8_0
 #define ggml_gemm_mxfp4_8x8_q8_0_generic ggml_gemm_mxfp4_8x8_q8_0
 #define ggml_gemm_q8_0_4x4_q8_0_generic ggml_gemm_q8_0_4x4_q8_0
@@ -313,6 +337,8 @@
 #define ggml_gemv_iq4_nl_8x8_q8_0_generic ggml_gemv_iq4_nl_8x8_q8_0
 #define ggml_gemv_iq1_s_8x8_q8_K_generic ggml_gemv_iq1_s_8x8_q8_K
 #define ggml_gemv_iq1_m_8x8_q8_K_generic ggml_gemv_iq1_m_8x8_q8_K
+#define ggml_gemv_iq2_xs_8x8_q8_K_generic ggml_gemv_iq2_xs_8x8_q8_K
+#define ggml_gemv_iq3_xxs_8x8_q8_K_generic ggml_gemv_iq3_xxs_8x8_q8_K
 #define ggml_gemv_mxfp4_4x4_q8_0_generic ggml_gemv_mxfp4_4x4_q8_0
 #define ggml_gemv_mxfp4_8x8_q8_0_generic ggml_gemv_mxfp4_8x8_q8_0
 #define ggml_gemv_q8_0_4x4_q8_0_generic ggml_gemv_q8_0_4x4_q8_0
@@ -332,6 +358,8 @@
 #define ggml_gemm_iq4_nl_8x8_q8_0_generic ggml_gemm_iq4_nl_8x8_q8_0
 #define ggml_gemm_iq1_s_8x8_q8_K_generic ggml_gemm_iq1_s_8x8_q8_K
 #define ggml_gemm_iq1_m_8x8_q8_K_generic ggml_gemm_iq1_m_8x8_q8_K
+#define ggml_gemm_iq2_xs_8x8_q8_K_generic ggml_gemm_iq2_xs_8x8_q8_K
+#define ggml_gemm_iq3_xxs_8x8_q8_K_generic ggml_gemm_iq3_xxs_8x8_q8_K
 #define ggml_gemm_mxfp4_4x4_q8_0_generic ggml_gemm_mxfp4_4x4_q8_0
 #define ggml_gemm_mxfp4_8x8_q8_0_generic ggml_gemm_mxfp4_8x8_q8_0
 #define ggml_gemm_q8_0_4x4_q8_0_generic ggml_gemm_q8_0_4x4_q8_0
@@ -373,6 +401,8 @@
 #define ggml_gemv_iq4_nl_8x8_q8_0_generic ggml_gemv_iq4_nl_8x8_q8_0
 #define ggml_gemv_iq1_s_8x8_q8_K_generic ggml_gemv_iq1_s_8x8_q8_K
 #define ggml_gemv_iq1_m_8x8_q8_K_generic ggml_gemv_iq1_m_8x8_q8_K
+#define ggml_gemv_iq2_xs_8x8_q8_K_generic ggml_gemv_iq2_xs_8x8_q8_K
+#define ggml_gemv_iq3_xxs_8x8_q8_K_generic ggml_gemv_iq3_xxs_8x8_q8_K
 #define ggml_gemv_mxfp4_4x4_q8_0_generic ggml_gemv_mxfp4_4x4_q8_0
 #define ggml_gemv_mxfp4_8x8_q8_0_generic ggml_gemv_mxfp4_8x8_q8_0
 #define ggml_gemv_q8_0_4x4_q8_0_generic ggml_gemv_q8_0_4x4_q8_0
@@ -392,6 +422,8 @@
 #define ggml_gemm_iq4_nl_8x8_q8_0_generic ggml_gemm_iq4_nl_8x8_q8_0
 #define ggml_gemm_iq1_s_8x8_q8_K_generic ggml_gemm_iq1_s_8x8_q8_K
 #define ggml_gemm_iq1_m_8x8_q8_K_generic ggml_gemm_iq1_m_8x8_q8_K
+#define ggml_gemm_iq2_xs_8x8_q8_K_generic ggml_gemm_iq2_xs_8x8_q8_K
+#define ggml_gemm_iq3_xxs_8x8_q8_K_generic ggml_gemm_iq3_xxs_8x8_q8_K
 #define ggml_gemm_mxfp4_4x4_q8_0_generic ggml_gemm_mxfp4_4x4_q8_0
 #define ggml_gemm_mxfp4_8x8_q8_0_generic ggml_gemm_mxfp4_8x8_q8_0
 #define ggml_gemm_q8_0_4x4_q8_0_generic ggml_gemm_q8_0_4x4_q8_0
