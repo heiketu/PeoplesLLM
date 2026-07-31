@@ -24,13 +24,16 @@
 
 ## 2. 环境变量详解
 
-### 2.1 NUMA 系（11 个）
+### 2.1 NUMA 系（14 个）
 
 | 变量 | 默认 | 作用 | 何时用 / 注意 |
 |---|---|---|---|
-| `GGML_NUMA_EP` | 关 | 单机 NUMA 专家并行：把每个 routed-expert 张量（`*_exps`）的页按 `e * n_nodes / n_expert` 映射绑到对应节点，计算侧每个线程只算本节点的专家（`ggml/src/ggml-cpu/ggml-cpu.c` + `src/llama-model.cpp: numa_ep_place_experts`）。需要 `--no-mmap` 加载（匿名内存才可迁移页） | 多 NUMA 节点纯 CPU / CPU-MoE 场景；与 `--numa mirror` 是两条不同路线（EP=划分不复制，mirror=全复制） |
+| `GGML_NUMA_EP` | 关 | 单机 NUMA 专家并行（行窗口）：每个 routed-expert 张量（`*_exps`）的**每个专家平面内**按行窗划分，节点 n 拥有 `[n*win, (n+1)*win)` 行（128 行对齐 mbind 单份放置）；repack mul_mat_id 计算侧按 per-(专家,节点) 计数器认领本节点窗口的行（`ggml/src/ggml-cpu/repack.cpp` + `src/llama-model.cpp: numa_ep_place_experts`）。需要 `--no-mmap` 加载（匿名内存才可迁移页）；**必须配合 80fe44321 起的亲和修复**（EP 下 DISTRIBUTE 钉核改块划分，否则半数线程全远程读） | 多 NUMA 节点纯 CPU / CPU-MoE 场景；与 `--numa mirror` 是两条不同路线（EP=划分不复制，mirror=全复制） |
 | `GGML_NUMA_EP_MMAP` | 关 | 允许在 mmap 加载的模型上做 **policy-only** 专家放置（`mbind(MPOL_BIND, flags=0)`，只设 VMA 策略、不迁移已缓存页） | **已知坑**：冷 page cache 下首次缺页按 interleave 落两节点后被钉死在错位节点，PP 减半。不要用，改用 `--no-mmap` |
-| `GGML_NUMA_EP_STEAL_MIN_TOKENS` | `32` | NUMA EP 工作窃取的 token 阈值：批内 token 数 > 此值才跑「本地 + 窃取」两阶段协议，否则只做静态按节点划分 | 一般不用调；与分层 barrier 的 TG 判据一致 |
+| `GGML_NUMA_EP_STEAL_MIN_TOKENS` | `32` | NUMA EP 工作窃取的 token 阈值：批内 token 数 > 此值才跑「本地 + 窃取」两阶段协议，否则只做本地相位（静态按节点划分） | 一般不用调；与分层 barrier 的 TG 判据一致 |
+| `GGML_NUMA_EP_STATIC` | 关 | 单相位（小批）时用**静态连续行窗划分**替代动态 claim：选中专家的本节点窗口拉平后按线程等分连续切片（NB_COLS 对齐），零原子、每线程长顺序流 | 实验开关；数值不变（每 dst 行仍恰算一次） |
+| `GGML_NUMA_EP_CLAIM` | 开 | `=0` 时保留行窗页放置但旁路 EP 计算路径（落回专家优先/默认路径） | **仅诊断**：归因 claim 路径 vs 页放置用，生产勿设 |
+| `GGML_NUMA_EP_DEBUG` | 关 | 行窗 EP claim 诊断：每 256 次调用打印 wall/spread/busy/两节点认领行数/窃取统计到 stderr | **海森堡效应明显**（共享调试计数器热行，TG 约 -18%），只看相对结构别看绝对值 |
 | `GGML_NUMA_HIER_BARRIER` | 关 | 纯自旋两级 NUMA 分级 barrier（先节点内、再跨节点），仅在 `--numa mirror` 且 ≥2 节点、多线程时生效 | 实测 OpenMP 构建下与 GOMP 树形 barrier 无差异，保持默认关 |
 | `GGML_NUMA_MIRROR_THREADS` | `hardware_concurrency()` | `--numa mirror` 加载期做节点间权重复制的线程数 | 加载太慢时调大；一般默认即可 |
 | `GGML_NUMA_MIRROR_BUDGET_GB` | `12` | PARTIAL 镜像（见下）每节点的镜像预算硬上限（GiB）；实际预算还受「最紧节点空闲内存 − 6GiB 保留」约束，防 MPOL_BIND 迁移触发 OOM-kill | 仅实验调参 |
@@ -206,7 +209,7 @@ llama-epd -m model.gguf --selftest [--selftest-layer N] [--selftest-tokens N]
 
 | 组 | 数量 | 参数 |
 |---|---|---|
-| NUMA 系 env | 11 | `GGML_NUMA_EP`、`GGML_NUMA_EP_MMAP`、`GGML_NUMA_EP_STEAL_MIN_TOKENS`、`GGML_NUMA_HIER_BARRIER`、`GGML_NUMA_MIRROR_THREADS`、`GGML_NUMA_MIRROR_BUDGET_GB`、`GGML_NUMA_MIRROR_PARTIAL`、`GGML_NUMA_MIRROR_MOE`、`GGML_NUMA_FAKE_NODES`、`GGML_NUMA_THP`、`GGML_KV_THP` |
+| NUMA 系 env | 14 | `GGML_NUMA_EP`、`GGML_NUMA_EP_MMAP`、`GGML_NUMA_EP_STEAL_MIN_TOKENS`、`GGML_NUMA_EP_STATIC`、`GGML_NUMA_EP_CLAIM`、`GGML_NUMA_EP_DEBUG`、`GGML_NUMA_HIER_BARRIER`、`GGML_NUMA_MIRROR_THREADS`、`GGML_NUMA_MIRROR_BUDGET_GB`、`GGML_NUMA_MIRROR_PARTIAL`、`GGML_NUMA_MIRROR_MOE`、`GGML_NUMA_FAKE_NODES`、`GGML_NUMA_THP`、`GGML_KV_THP` |
 | 远程 EP 系 env | 15 | `GGML_REMOTE_EP`、`..._HOST`、`..._PORT`、`..._LAYERS`、`..._MIRROR`、`..._MIRROR_LAYERS`、`..._MIRROR_KREMOTE`、`..._SCHED`、`..._SCHED_ENDPOINTS`、`..._SCHED_KLOCAL`、`..._SCHED_PP`、`..._SCHED_DEAL`、`..._PIPELINE`、`..._PIPELINE_CHUNK`、`..._DEBUG` |
 | RDMA 系 env | 2 | `GGML_REMOTE_EP_RDMA`、`GGML_EP_RDMA_SPIN` |
 | EPD worker 系 env | 6 | `GGML_EPD_AUTOTUNE`、`GGML_EPD_NUMA`、`GGML_EPD_NUMA_WEIGHT`、`GGML_EPD_REPACK`(WIP)、`GGML_EP_PREFAULT`、`GGML_EP_PREFAULT_THREADS` |

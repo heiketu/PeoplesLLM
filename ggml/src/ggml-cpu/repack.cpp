@@ -5713,7 +5713,23 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         // other nodes' windows (remote reads) to smooth out stragglers.
         // Rows are claimed in NB_COLS-aligned blocks, each dst row has a single writer,
         // and no barriers are needed inside the loops.
-        const bool ep = ggml_cpu_numa_ep_active();
+        // env GGML_NUMA_EP_CLAIM=0: keep the row-window page placement but bypass the
+        // EP compute path (falls through to the expert-first / default paths below).
+        // Diagnostic only, for attributing the claim path vs the placement.
+        static const bool ep_claim = []() {
+            const char * e = getenv("GGML_NUMA_EP_CLAIM");
+            return !e || atoi(e) != 0;
+        }();
+        // env GGML_NUMA_EP_STATIC=1: in the single-phase (small-batch) case, replace
+        // dynamic chunk claims with a static contiguous partition of the selected
+        // experts' local windows across this node's threads — mirror-style long
+        // sequential streams per thread, zero atomics, exactly balanced row counts.
+        // Numerics are unchanged (each dst row is computed exactly once).
+        static const bool ep_static = []() {
+            const char * e = getenv("GGML_NUMA_EP_STATIC");
+            return e && atoi(e) != 0;
+        }();
+        const bool ep = ggml_cpu_numa_ep_active() && ep_claim;
         const int ep_nodes = ep ? ggml_numa_node_count() : 1;
         const int ep_node = ep ? ggml_numa_node_for_thread(ith, nth) : 0;
         const int ep_phases = ep && ne12 > ggml_cpu_numa_ep_steal_min_tokens() ? 2 : 1;
@@ -5795,6 +5811,78 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         }
 
         if (ep) {
+            if (ep_static && ep_phases == 1) {
+                // static contiguous partition (GGML_NUMA_EP_STATIC=1): flatten every
+                // selected expert's local window into [0, total) and hand each thread
+                // of this node one NB_COLS-aligned contiguous slice, so a thread
+                // streams long sequential ranges of a single expert — the same access
+                // shape as the mirror expert-first path, but over the node-local
+                // window only. No atomics; slices have exactly balanced row counts.
+                const int64_t w_lo = (int64_t) ep_node*ep_win;
+                const int64_t w_hi = MIN(w_lo + ep_win, ne01);
+                // thread block of this node (matches ggml_numa_node_for_thread's block split)
+                const int t_first = (int) (((int64_t) ep_node*nth + ep_nodes - 1) / ep_nodes);
+                const int t_next  = (int) (((int64_t) (ep_node + 1)*nth + ep_nodes - 1) / ep_nodes);
+                const int t_node  = t_next - t_first;
+                const int rank    = ith - t_first;
+
+                if (w_lo < w_hi && rank >= 0 && rank < t_node) {
+                    const int64_t win_rows = w_hi - w_lo;
+                    int64_t n_sel = 0;
+                    for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+                        n_sel += matrix_row_counts[cur_a] > 0 ? 1 : 0;
+                    }
+                    const int64_t total = n_sel*win_rows;
+                    int64_t g0 = ((int64_t) rank*total)/t_node;
+                    int64_t g1 = ((int64_t) (rank + 1)*total)/t_node;
+                    // align slice boundaries to NB_COLS (round up, clamp to total)
+                    g0 = MIN((g0 % NB_COLS) ? g0 + NB_COLS - (g0 % NB_COLS) : g0, total);
+                    g1 = MIN((g1 % NB_COLS) ? g1 + NB_COLS - (g1 % NB_COLS) : g1, total);
+
+                    int64_t e_lo = 0;
+                    for (int cur_a = 0; cur_a < n_as && e_lo < g1; ++cur_a) {
+                        const int64_t cne1 = matrix_row_counts[cur_a];
+                        if (cne1 == 0) {
+                            continue;
+                        }
+                        const int64_t e_hi = e_lo + win_rows;
+                        const int64_t p_lo = MAX(g0, e_lo);
+                        const int64_t p_hi = MIN(g1, e_hi);
+                        if (p_lo < p_hi) {
+                            const int64_t r0 = w_lo + (p_lo - e_lo);
+                            const int64_t r1 = w_lo + (p_hi - e_lo);
+
+                            if (ep_dbg_on()) {
+                                ep_dbg().p0_rows[ep_node].fetch_add(r1 - r0, std::memory_order_relaxed);
+                            }
+
+                            const auto * src0_cur = (const char *) ggml_numa_tensor_data(src0, ggml_numa_node_for_thread(ith, nth)) + cur_a*nb02;
+
+                            for (int ir1 = 0; ir1 < cne1; ir1++) {
+                                struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, ir1);
+
+                                const int id = row_mapping.i1;  // selected expert index
+
+                                const int64_t i11 = id % ne11;
+                                const int64_t i12 = row_mapping.i2;  // row index in src1
+
+                                const int64_t i1 = id;               // selected expert index
+                                const int64_t i2 = i12;              // row
+
+                                const auto * src1_col = (const char *) wdata + (i11 * nbw1 + i12 * nbw2);
+
+                                gemv<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(
+                                    ne00, (float *) ((char *) dst->data + (i1 * nb1 + i2 * nb2)) + r0, ne01,
+                                    src0_cur + r0 * nb01, src1_col, 1, r1 - r0);
+                            }
+                        }
+                        e_lo = e_hi;
+                    }
+                }
+                if (ep_dbg_on()) {
+                    ep_dbg_finish(dbg_t_start, 0, 0, nth, ne01);
+                }
+            } else {
             int64_t dbg_t_p0_end = 0;
             int64_t dbg_p1_claimed = 0;
 
@@ -5872,6 +5960,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             }
             if (ep_dbg_on()) {
                 ep_dbg_finish(dbg_t_start, ep_phases > 1 ? dbg_t_p0_end : 0, dbg_p1_claimed, nth, ne01);
+            }
             }
         } else if (ne12 <= 8) {
             // small-batch (TG) path: expert-first partitioning. assign the selected

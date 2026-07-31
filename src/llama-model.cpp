@@ -1467,7 +1467,7 @@ void llama_model::numa_mirror_weights_partial() {
 // NUMA expert parallelism (GGML_NUMA_EP): bind the pages of each routed-expert tensor
 // (*_exps, [ff, embd, n_expert]) so that within EVERY expert plane, rows are split into
 // per-node windows ([n*win, min((n+1)*win, ne[1])) on node n) — the same row-window
-// mapping the compute side uses (repack.cpp forward_mul_mat_id, ep_chunk = 32 rows).
+// mapping the compute side uses (repack.cpp forward_mul_mat_id, ep_chunk = 16 rows).
 // Each node then holds a local slice of every expert, so both sockets stream every
 // selected expert from local memory regardless of the router's expert distribution.
 // Boundary pages go to the earlier node. Skipped when the model was loaded with mmap
