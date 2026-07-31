@@ -13,7 +13,9 @@ bool ggml_cpu_extra_compute_forward(struct ggml_compute_params * params, struct 
 bool ggml_cpu_extra_work_size(int n_threads, const struct ggml_tensor * op, size_t * size);
 
 // NUMA expert parallelism: true when GGML_NUMA_EP=1 and more than one NUMA node is
-// active; the expert->node mapping is cur_a * ggml_numa_node_count() / n_expert
+// active; every expert's rows are split into per-node windows (node n owns rows
+// [n*win, min((n+1)*win, ne01)), win aligned to 128 rows) — see repack.cpp
+// forward_mul_mat_id and llama_model::numa_ep_place_experts
 bool ggml_cpu_numa_ep_active(void);
 
 // NUMA EP work stealing threshold in tokens (GGML_NUMA_EP_STEAL_MIN_TOKENS, default 32)

@@ -950,9 +950,9 @@ int ggml_numa_node_count(void) {
     return g_state.numa.n_nodes > 0 ? (int) g_state.numa.n_nodes : 1;
 }
 
-// NUMA expert parallelism (GGML_NUMA_EP=1): routed experts are split across NUMA nodes
-// and each thread computes only the experts placed on its own node. The expert->node
-// mapping here must match llama_model::numa_ep_place_experts (llama-model.cpp).
+// NUMA expert parallelism (GGML_NUMA_EP=1): routed experts stay single-copy and their
+// rows are placed per node in row windows by llama_model::numa_ep_place_experts (the
+// repack mul_mat_id path claims rows from the matching per-node windows).
 bool ggml_cpu_numa_ep_active(void) {
     static int ep_enabled = -1;
     if (ep_enabled < 0) {
@@ -2277,11 +2277,15 @@ static void ggml_compute_forward_mul_mat_id(
 
     // NUMA expert parallelism (GGML_NUMA_EP): two phases over the shared per-expert
     // atomic chunk counters. Local phase: each thread claims chunks of the experts
-    // placed on its own node (local reads). Steal phase (only when the token count
-    // exceeds ggml_cpu_numa_ep_steal_min_tokens): threads then claim the remaining
-    // chunks of the remote experts (interleaved reads), so a fast node helps a slow
-    // one instead of idling; with few tokens the premature steals cost more than the
-    // static bubble, so the local phase runs alone (static per-node split).
+    // whose first half of rows is placed on its own node. Steal phase (only when the
+    // token count exceeds ggml_cpu_numa_ep_steal_min_tokens): threads then claim the
+    // remaining chunks of the other experts, so a fast node helps a slow one instead
+    // of idling; with few tokens the premature steals cost more than the static
+    // bubble, so the local phase runs alone (static per-node split).
+    // NOTE: expert weights are placed in per-node row windows (see
+    // llama_model::numa_ep_place_experts), so this expert-granular filter reads ~50%
+    // remote rows; the repack mul_mat_id path implements the matching row-window
+    // scheme. Results are unaffected (the expert weights are single-copy).
     // Chunks are claimed atomically, each dst row has a single writer, and no barriers
     // are needed inside the loops.
     const bool ep = ggml_cpu_numa_ep_active();

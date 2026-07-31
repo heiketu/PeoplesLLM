@@ -4870,9 +4870,10 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
                     size += sizeof_mmid_row_mapping*ne02*(ne12 + 1);
 
-                    // per-expert atomic row claim counters for NUMA EP work stealing
+                    // per-expert per-node-window atomic row claim counters for NUMA EP
+                    // work stealing (one cache line per expert per NUMA node)
                     size  = GGML_PAD(size, GGML_EP_CACHE_LINE);
-                    size += GGML_EP_CACHE_LINE*ne02;
+                    size += GGML_EP_CACHE_LINE*ne02*GGML_NUMA_MAX_NODES;
 
                     return true;
                 }
@@ -5130,6 +5131,74 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         }
     }
 
+    // --- NUMA EP steal diagnostics (GGML_NUMA_EP_DEBUG=1), temporary ---
+    struct ep_debug_stats {
+        std::atomic<int64_t> t0{0};            // start of current call (set by thread 0)
+        std::atomic<int64_t> done{0};          // threads finished in current call
+        std::atomic<int64_t> first_end{INT64_MAX};
+        std::atomic<int64_t> last_end{0};
+        std::atomic<int64_t> calls{0};
+        std::atomic<int64_t> p0_rows[2]{{0},{0}};  // rows claimed in local phase, per node
+        std::atomic<int64_t> p1_rows[2]{{0},{0}};  // rows claimed in steal phase, per node
+        std::atomic<int64_t> p1_entries{0};        // thread-entries into phase 1
+        std::atomic<int64_t> p1_remaining{0};      // unclaimed remote rows visible at phase-1 entry (sum)
+        std::atomic<int64_t> p1_idle_entries{0};   // phase-1 entries that claimed 0 rows
+        std::atomic<int64_t> busy_sum{0};          // sum of per-thread op durations (us)
+        std::atomic<int64_t> p1_sum{0};            // sum of per-thread phase-1 durations (us)
+        std::atomic<int64_t> spread_sum{0};        // sum of (last_end - first_end) per call (us)
+        std::atomic<int64_t> wall_sum{0};          // sum of last_end per call (us)
+    };
+    static ep_debug_stats & ep_dbg() { static ep_debug_stats s; return s; }
+    static bool ep_dbg_on() {
+        static const bool on = []() {
+            const char * e = getenv("GGML_NUMA_EP_DEBUG");
+            return e && atoi(e) != 0;
+        }();
+        return on;
+    }
+
+    static void ep_dbg_finish(int64_t t_start, int64_t t_p0_end, int64_t p1_claimed, int nth, int ne01) {
+        const int64_t t_end = ggml_time_us();
+        ep_dbg().busy_sum.fetch_add(t_end - t_start, std::memory_order_relaxed);
+        if (t_p0_end > 0) {
+            ep_dbg().p1_sum.fetch_add(t_end - t_p0_end, std::memory_order_relaxed);
+        }
+        if (p1_claimed == 0 && t_p0_end > 0) {
+            ep_dbg().p1_idle_entries.fetch_add(1, std::memory_order_relaxed);
+        }
+        const int64_t rel = t_end - ep_dbg().t0.load(std::memory_order_relaxed);
+        int64_t cur = ep_dbg().first_end.load(std::memory_order_relaxed);
+        while (rel < cur && !ep_dbg().first_end.compare_exchange_weak(cur, rel, std::memory_order_relaxed)) {}
+        cur = ep_dbg().last_end.load(std::memory_order_relaxed);
+        while (rel > cur && !ep_dbg().last_end.compare_exchange_weak(cur, rel, std::memory_order_relaxed)) {}
+        if (ep_dbg().done.fetch_add(1, std::memory_order_acq_rel) == nth - 1) {
+            // last thread of the call: fold per-call stats
+            const int64_t last = ep_dbg().last_end.exchange(0, std::memory_order_relaxed);
+            const int64_t first = ep_dbg().first_end.exchange(INT64_MAX, std::memory_order_relaxed);
+            ep_dbg().done.store(0, std::memory_order_relaxed);
+            ep_dbg().spread_sum.fetch_add(last - first, std::memory_order_relaxed);
+            ep_dbg().wall_sum.fetch_add(last, std::memory_order_relaxed);
+            const int64_t c = ep_dbg().calls.fetch_add(1, std::memory_order_relaxed) + 1;
+            if ((c & 0xFF) == 0) {
+                fprintf(stderr,
+                    "[ep-dbg] calls=%lld ne01=%d wall=%lld spread=%lld busy=%lld p1time=%lld "
+                    "p0rows0=%lld p0rows1=%lld p1rows0=%lld p1rows1=%lld p1_entries=%lld p1_idle=%lld p1_remaining_avg=%lld\n",
+                    (long long) c, ne01,
+                    (long long) (ep_dbg().wall_sum.load() / c),
+                    (long long) (ep_dbg().spread_sum.load() / c),
+                    (long long) (ep_dbg().busy_sum.load() / (c * nth)),
+                    (long long) (ep_dbg().p1_sum.load() / (c * nth)),
+                    (long long) (ep_dbg().p0_rows[0].load() / c),
+                    (long long) (ep_dbg().p0_rows[1].load() / c),
+                    (long long) (ep_dbg().p1_rows[0].load() / c),
+                    (long long) (ep_dbg().p1_rows[1].load() / c),
+                    (long long) (ep_dbg().p1_entries.load() / c),
+                    (long long) ep_dbg().p1_idle_entries.load(),
+                    (long long) (ep_dbg().p1_entries.load() ? ep_dbg().p1_remaining.load() / ep_dbg().p1_entries.load() : 0));
+            }
+        }
+    }
+
     void forward_mul_mat_id(ggml_compute_params * params, ggml_tensor * op) {
         const ggml_tensor * src0 = op->src[0];
         const ggml_tensor * src1 = op->src[1];
@@ -5175,7 +5244,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         GGML_ASSERT(params->wsize >=
                 (GGML_PAD(nbw3, sizeof(int64_t)) +
                  GGML_PAD(n_as*(ne12 + 1)*sizeof(mmid_row_mapping), GGML_EP_CACHE_LINE) +
-                 n_as*GGML_EP_CACHE_LINE));
+                 n_as*GGML_NUMA_MAX_NODES*GGML_EP_CACHE_LINE));
 
         auto * wdata          = (char *)params->wdata;
         auto * wdata_src1_end = (char *)wdata + GGML_PAD(nbw3, sizeof(int64_t));
@@ -5184,7 +5253,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         auto * matrix_row_counts = (int64_t *) (wdata_src1_end);                                        // [n_as]
         struct mmid_row_mapping * matrix_rows = (struct mmid_row_mapping *) (matrix_row_counts + n_as); // [n_as][ne12]
 
-        // per-expert atomic row claim counters for NUMA EP work stealing (one cache line each)
+        // per-expert per-node-window atomic row claim counters for NUMA EP work stealing
+        // (laid out as [n_as][GGML_NUMA_MAX_NODES], one cache line each)
         auto * row_claim = (std::atomic_int *) ((char *) wdata_src1_end +
             GGML_PAD(n_as*(ne12 + 1)*sizeof(mmid_row_mapping), GGML_EP_CACHE_LINE));
 
@@ -5217,34 +5287,75 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             }
         }
 
-        // NUMA expert parallelism (GGML_NUMA_EP): two phases over the shared per-expert
-        // atomic row claim counters. Local phase: each thread claims rows of the experts
-        // placed on its own node (local reads). Steal phase (only when the token count
-        // exceeds ggml_cpu_numa_ep_steal_min_tokens): threads then claim the remaining
-        // rows of the remote experts (interleaved reads), so a fast node helps a slow
-        // one instead of idling; with few tokens the premature steals cost more than the
-        // static bubble, so the local phase runs alone (static per-node split).
+        // NUMA expert parallelism (GGML_NUMA_EP): every expert's rows are split into
+        // per-node windows ([w*ep_win, min((w+1)*ep_win, ne01)) belongs to node w),
+        // placed on node w by llama_model::numa_ep_place_experts. Local phase: each
+        // thread claims rows of its own node's window of EVERY selected expert, so all
+        // sockets stream every selected expert from local memory in parallel — balanced
+        // by construction no matter how the router distributes experts across nodes.
+        // (Expert-granular placement left the tail bounded by a single socket's DRAM
+        // bandwidth; cross-UPI steals cannot add bandwidth to data that lives on one
+        // node.) Steal phase (only when the token count exceeds
+        // ggml_cpu_numa_ep_steal_min_tokens): threads then claim remaining rows of the
+        // other nodes' windows (remote reads) to smooth out stragglers.
         // Rows are claimed in NB_COLS-aligned blocks, each dst row has a single writer,
-        // and no barriers are needed inside the loops; every thread runs the same number
-        // of phases so the counters advance deterministically.
+        // and no barriers are needed inside the loops.
         const bool ep = ggml_cpu_numa_ep_active();
         const int ep_nodes = ep ? ggml_numa_node_count() : 1;
         const int ep_node = ep ? ggml_numa_node_for_thread(ith, nth) : 0;
         const int ep_phases = ep && ne12 > ggml_cpu_numa_ep_steal_min_tokens() ? 2 : 1;
 
+        // rows are claimed in blocks of ep_chunk (a multiple of NB_COLS); the per-node
+        // window size must match llama_model::numa_ep_place_experts. Smaller blocks
+        // shrink the per-thread tail quantum at batch=1 (one block ≈ one tail unit).
+        const int64_t ep_chunk = 16;
+        const int64_t ep_win = ep ? (((ne01 + ep_nodes - 1) / ep_nodes + ep_chunk - 1) / ep_chunk) * ep_chunk : 0;
+
         if (ep) {
             for (int cur_a = ith; cur_a < n_as; cur_a += nth) {
-                std::atomic_store_explicit(row_claim + cur_a, 0, std::memory_order_relaxed);
+                for (int w = 0; w < ep_nodes; ++w) {
+                    std::atomic_store_explicit(row_claim + cur_a*GGML_NUMA_MAX_NODES + w, 0, std::memory_order_relaxed);
+                }
             }
         }
 
         ggml_barrier(params->threadpool);
 
+        const int64_t dbg_t_start = (ep && ep_dbg_on()) ? ggml_time_us() : 0;
+        if (ep && ep_dbg_on() && ith == 0) {
+            ep_dbg().t0.store(dbg_t_start, std::memory_order_relaxed);
+        }
+
         if (ep) {
-            // rows are claimed in blocks of ep_chunk (a multiple of NB_COLS)
-            const int64_t ep_chunk = 32;
+            int64_t dbg_t_p0_end = 0;
+            int64_t dbg_p1_claimed = 0;
 
             for (int phase = 0; phase < ep_phases; phase++) {
+                if (ep_dbg_on() && phase == 1) {
+                    // how much remote work is still unclaimed as this thread enters the steal phase
+                    int64_t remaining = 0;
+                    for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+                        if (matrix_row_counts[cur_a] == 0) {
+                            continue;
+                        }
+                        for (int w = 0; w < ep_nodes; ++w) {
+                            if (w == ep_node) {
+                                continue;
+                            }
+                            const int64_t w_lo = (int64_t) w*ep_win;
+                            const int64_t w_hi = MIN(w_lo + ep_win, ne01);
+                            if (w_lo >= w_hi) {
+                                continue;
+                            }
+                            const int64_t claimed = std::atomic_load_explicit(row_claim + cur_a*GGML_NUMA_MAX_NODES + w, std::memory_order_relaxed);
+                            if (claimed < w_hi - w_lo) {
+                                remaining += w_hi - w_lo - claimed;
+                            }
+                        }
+                    }
+                    ep_dbg().p1_entries.fetch_add(1, std::memory_order_relaxed);
+                    ep_dbg().p1_remaining.fetch_add(remaining, std::memory_order_relaxed);
+                }
                 for (int cur_a = 0; cur_a < n_as; ++cur_a) {
                     const int64_t cne1 = matrix_row_counts[cur_a];
 
@@ -5252,39 +5363,63 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                         continue;
                     }
 
-                    const bool is_local = (int) (cur_a * ep_nodes / n_as) == ep_node;
-                    if (phase == 0 ? !is_local : is_local) {
-                        continue;
-                    }
-
                     const auto * src0_cur = (const char *) ggml_numa_tensor_data(src0, ggml_numa_node_for_thread(ith, nth)) + cur_a*nb02;
 
-                    for (;;) {
-                        const int64_t r0 = std::atomic_fetch_add_explicit(row_claim + cur_a, (int) ep_chunk, std::memory_order_relaxed);
-                        if (r0 >= ne01) {
-                            break;
+                    for (int w = 0; w < ep_nodes; ++w) {
+                        if (phase == 0 ? (w != ep_node) : (w == ep_node)) {
+                            continue; // handled in the other phase
                         }
-                        const int64_t r1 = MIN(r0 + ep_chunk, ne01);
 
-                        for (int ir1 = 0; ir1 < cne1; ir1++) {
-                            struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, ir1);
+                        const int64_t w_lo = (int64_t) w*ep_win;
+                        const int64_t w_hi = MIN(w_lo + ep_win, ne01);
+                        if (w_lo >= w_hi) {
+                            continue;
+                        }
 
-                            const int id = row_mapping.i1;  // selected expert index
+                        std::atomic_int * ctr = row_claim + cur_a*GGML_NUMA_MAX_NODES + w;
 
-                            const int64_t i11 = id % ne11;
-                            const int64_t i12 = row_mapping.i2;  // row index in src1
+                        for (;;) {
+                            const int64_t r0 = w_lo + std::atomic_fetch_add_explicit(ctr, (int) ep_chunk, std::memory_order_relaxed);
+                            if (r0 >= w_hi) {
+                                break;
+                            }
+                            const int64_t r1 = MIN(r0 + ep_chunk, w_hi);
 
-                            const int64_t i1 = id;               // selected expert index
-                            const int64_t i2 = i12;              // row
+                            if (ep_dbg_on()) {
+                                if (phase == 0) {
+                                    ep_dbg().p0_rows[ep_node].fetch_add(r1 - r0, std::memory_order_relaxed);
+                                } else {
+                                    ep_dbg().p1_rows[ep_node].fetch_add(r1 - r0, std::memory_order_relaxed);
+                                    dbg_p1_claimed += r1 - r0;
+                                }
+                            }
 
-                            const auto * src1_col = (const char *) wdata + (i11 * nbw1 + i12 * nbw2);
+                            for (int ir1 = 0; ir1 < cne1; ir1++) {
+                                struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, ir1);
 
-                            gemv<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(
-                                ne00, (float *) ((char *) dst->data + (i1 * nb1 + i2 * nb2)) + r0, ne01,
-                                src0_cur + r0 * nb01, src1_col, 1, r1 - r0);
+                                const int id = row_mapping.i1;  // selected expert index
+
+                                const int64_t i11 = id % ne11;
+                                const int64_t i12 = row_mapping.i2;  // row index in src1
+
+                                const int64_t i1 = id;               // selected expert index
+                                const int64_t i2 = i12;              // row
+
+                                const auto * src1_col = (const char *) wdata + (i11 * nbw1 + i12 * nbw2);
+
+                                gemv<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(
+                                    ne00, (float *) ((char *) dst->data + (i1 * nb1 + i2 * nb2)) + r0, ne01,
+                                    src0_cur + r0 * nb01, src1_col, 1, r1 - r0);
+                            }
                         }
                     }
                 }
+                if (ep_dbg_on() && phase == 0) {
+                    dbg_t_p0_end = ggml_time_us();
+                }
+            }
+            if (ep_dbg_on()) {
+                ep_dbg_finish(dbg_t_start, ep_phases > 1 ? dbg_t_p0_end : 0, dbg_p1_claimed, nth, ne01);
             }
         } else if (ne12 <= 8) {
             // small-batch (TG) path: expert-first partitioning. assign the selected

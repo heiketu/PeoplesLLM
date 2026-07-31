@@ -1464,12 +1464,14 @@ void llama_model::numa_mirror_weights_partial() {
             __func__, n_mirrored, n_nodes);
 }
 
-// NUMA expert parallelism (GGML_NUMA_EP=1): bind the pages of each routed-expert tensor
-// (*_exps, [ff, embd, n_expert], experts contiguous along ne[2]) so that the first half of
-// the experts lives on node 0 and the second half on node 1 (generalized to n_nodes with
-// the same e * n_nodes / n_expert mapping as the compute-side filter). Boundary pages go
-// to the earlier node. Skipped when the model was loaded with mmap (pages alias the file
-// mapping and must not be rebound).
+// NUMA expert parallelism (GGML_NUMA_EP): bind the pages of each routed-expert tensor
+// (*_exps, [ff, embd, n_expert]) so that within EVERY expert plane, rows are split into
+// per-node windows ([n*win, min((n+1)*win, ne[1])) on node n) — the same row-window
+// mapping the compute side uses (repack.cpp forward_mul_mat_id, ep_chunk = 32 rows).
+// Each node then holds a local slice of every expert, so both sockets stream every
+// selected expert from local memory regardless of the router's expert distribution.
+// Boundary pages go to the earlier node. Skipped when the model was loaded with mmap
+// (pages alias the file mapping and must not be rebound).
 void llama_model::numa_ep_place_experts(bool used_mmap) {
     const char * env = getenv("GGML_NUMA_EP");
     if (!env || atoi(env) == 0) {
@@ -1517,46 +1519,55 @@ void llama_model::numa_ep_place_experts(bool used_mmap) {
             }
             const int64_t n_expert = t->ne[2];
             const size_t eb = t->nb[2]; // bytes per expert plane (contiguous along ne[2])
+            // per-node row window inside each expert plane; must match the compute side
+            // in repack.cpp (rows claimed in blocks of ep_chunk, windows aligned to 128
+            // rows so any ep_chunk <= 128 divides them evenly)
+            const int64_t ne1 = t->ne[1];
+            const size_t rb = t->nb[1];
+            const int64_t win = ((ne1 + n_nodes - 1) / n_nodes + 127) / 128 * 128;
             char * base = (char *) t->data;
-            for (int n = 0; n < n_nodes; ++n) {
-                const int64_t e0 = (int64_t) n * n_expert / n_nodes;
-                const int64_t e1 = (int64_t) (n + 1) * n_expert / n_nodes;
-                if (e1 <= e0) {
-                    continue;
-                }
-                char * p = base + e0 * eb;
-                size_t sz = (size_t) (e1 - e0) * eb;
-                // keep the boundary page on the earlier node: only bind whole pages
-                const uintptr_t up = ((uintptr_t) p + pg - 1) & ~((uintptr_t) pg - 1);
-                if (n > 0) {
-                    if ((size_t) (up - (uintptr_t) p) >= sz) {
+            for (int64_t e = 0; e < n_expert; ++e) {
+                char * ebase = base + e * eb;
+                for (int n = 0; n < n_nodes; ++n) {
+                    const int64_t r0 = (int64_t) n * win;
+                    const int64_t r1 = r0 + win < ne1 ? r0 + win : ne1;
+                    if (r1 <= r0) {
                         continue;
                     }
-                    sz -= up - (uintptr_t) p;
-                    p = (char *) up;
-                }
-                if (used_mmap) {
-                    llama_numa_bind_policy(p, sz, n);
-                } else {
-                    llama_numa_bind(p, sz, n);
-                }
+                    char * p = ebase + r0 * rb;
+                    size_t sz = (size_t) (r1 - r0) * rb;
+                    // keep the boundary page on the earlier node: only bind whole pages
+                    const uintptr_t up = ((uintptr_t) p + pg - 1) & ~((uintptr_t) pg - 1);
+                    if (n > 0) {
+                        if ((size_t) (up - (uintptr_t) p) >= sz) {
+                            continue;
+                        }
+                        sz -= up - (uintptr_t) p;
+                        p = (char *) up;
+                    }
+                    if (used_mmap) {
+                        llama_numa_bind_policy(p, sz, n);
+                    } else {
+                        llama_numa_bind(p, sz, n);
+                    }
 #if defined(__gnu_linux__)
-                if (thp_collapse) {
-                    const uintptr_t ua = ((uintptr_t) p + pg - 1) & ~((uintptr_t) pg - 1);
-                    if ((size_t) (ua - (uintptr_t) p) < sz) {
-                        const size_t csz = sz - (ua - (uintptr_t) p);
-                        // the weight buffer is plain posix_memalign memory: make sure the
-                        // VMA is THP-eligible before asking for a synchronous collapse
-                        madvise((void *) ua, csz, MADV_HUGEPAGE);
-                        if (madvise((void *) ua, csz, MADV_COLLAPSE) == 0) {
-                            collapsed_bytes += csz;
-                        } else {
-                            LLAMA_LOG_WARN("%s: MADV_COLLAPSE failed on %.2f MiB (errno=%d); continuing\n",
-                                    __func__, csz/1048576.0, errno);
+                    if (thp_collapse) {
+                        const uintptr_t ua = ((uintptr_t) p + pg - 1) & ~((uintptr_t) pg - 1);
+                        if ((size_t) (ua - (uintptr_t) p) < sz) {
+                            const size_t csz = sz - (ua - (uintptr_t) p);
+                            // the weight buffer is plain posix_memalign memory: make sure the
+                            // VMA is THP-eligible before asking for a synchronous collapse
+                            madvise((void *) ua, csz, MADV_HUGEPAGE);
+                            if (madvise((void *) ua, csz, MADV_COLLAPSE) == 0) {
+                                collapsed_bytes += csz;
+                            } else {
+                                LLAMA_LOG_WARN("%s: MADV_COLLAPSE failed on %.2f MiB (errno=%d); continuing\n",
+                                        __func__, csz/1048576.0, errno);
+                            }
                         }
                     }
-                }
 #endif
+                }
             }
             ++n_placed;
             placed_bytes += ggml_nbytes(t);
