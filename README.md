@@ -14,17 +14,35 @@
 
 ## 实测数据
 
-DeepSeek-V4 284B（Q3_K 量化），双路 Xeon 8360Y（Ice Lake）+ 2× RTX 3090：
+DeepSeek-V4 284B（Q3_K 量化），双路 Xeon 8360Y（Ice Lake）+ 2× RTX 3090（GPU 卸载 14 层专家，72 线程，`--no-mmap`，2026-08-01 同口径复测）：
 
-| 实现 | 生成速度 (t/s) | 提示词处理 (t/s) |
-|---|---|---|
-| 主线 llama.cpp (b10173) | 5.85 | 23.6 |
-| **PeoplesLLM（NUMA 镜像）** | **~33** | — |
-| **PeoplesLLM（NUMA-EP）** | **28.5** | **310** |
+| 实现 | tg512 (t/s) | pp512 (t/s) | MoE 算子单次耗时 |
+|---|---|---|---|
+| 主线 llama.cpp（NUMA distribute） | 26.9-28.0 | 150.5-161.3 | ~102.5-125µs |
+| PeoplesLLM（isolate 单路参照） | 25.7-25.9 | 363.6-370.2 | 133.4µs |
+| **PeoplesLLM（NUMA 行窗 EP，内存减半）** | **30.34-30.48** | 318-333 | **88.4µs** |
+| **PeoplesLLM（NUMA 镜像 mirror）** | **30.35-30.44** | **344-349** | 80.3µs |
 
 > 注：以上 DeepSeek-V4 速度均为**未启用 MTP 投机解码**的实测值；开启 MTP 后 TG 还会更高（MTP 数据另行补充）。
+> PP 优先或单路场景 isolate 反而最快（pp512 370）；内存充裕时 mirror 是 TG 最优；内存受限时行窗 EP 以 ~10% MoE 开销换内存减半。
 
-GLM-5.2 745B（UD-Q2_K 量化）：生成 12.0 t/s（EP + GPU 专家卸载）。
+GLM-5.2 745B（UD-Q2_K_MXFP4，单机 + 2×3090，9 层专家 GPU 卸载，2026-08-01 同口径 A/B）：
+
+| 实现 | tg512 (t/s) | pp512 (t/s) | pp1020 (t/s) |
+|---|---|---|---|
+| PeoplesLLM 无 IQ traits | 11.23-11.27 | 56.8 | 98.2-99.1 |
+| **PeoplesLLM + IQ2_XS/IQ3_XXS traits** | **11.95（+6%）** | **298-307** | **399-406（4.1×）** |
+
+### 行窗口 EP + 线程亲和根因修复（2026-08-01）
+
+- **行窗口 EP**：专家并行放置从整专家粒度改为**每专家内行窗粒度**（节点 n 拥有每专家第 n 段行窗，mbind 单份），dst 行单写者零归并，结构性消除 batch=1 尾部不均衡（旧专家粒度 EP 双路只能跑出单路成绩）。
+- **线程亲和根因修复**：DISTRIBUTE 模式的钉核映射（`ith % n_nodes` 交错）与 EP 计算侧的窗口归属映射（块划分）不一致，**恰好一半线程被钉在错误节点、100% 跨 UPI 读"本地"行窗**（MoE 单次 155.7µs vs mirror 80.3µs）。修复后 88.4µs（收回差距的 89%），EP tg512 从 20.7-26.3 → **30.34-30.48，追平 mirror、反超主线 distribute**；正确性 mirror==EP 逐 token 一致。
+- 残余 ~10% MoE 开销已归因于 claim 两阶段计算路径（非放置问题）；`GGML_NUMA_EP_STATIC/EP_CLAIM/EP_CHUNK` 诊断开关见参数手册。
+
+### IQ2_XS/IQ3_XXS repack 内核 + mul_mat_id gemm 分流（2026-08-01）
+
+- GLM-5.2 专家主力量化 **IQ2_XS/IQ3_XXS 补齐 8×8 交错 repack traits**（布局 + 转换 + generic/AVX512(VNNI+VBMI 门禁) gemv/gemm 全套）：微基准 gemm **2.3-2.5×** vec_dot、native==generic 位级一致、test-backend-ops 1996/1996 PASS。
+- **mul_mat_id gemm 分流**：repack 的 MoE 批量路径此前全部逐行 gemv（Q2_K 同病），现 4 行一组 gather+量化进交错 tile 走 gemm——GLM 单机 **PP1020 99→406（4.1×）、tg512 +6%**，EP 与 mirror 逐 token 一致。
 
 ### CPU 内核完整基准（AVX512/VNNI/VBMI 8×8 重排 vs 主线 legacy vec_dot）
 
@@ -92,6 +110,8 @@ NUMA-EP + mirror、72 线程、fa=1、batch 4096/ubatch 1024；`--no-repack` 为
 | 双机 15 层 + `MIRROR=1`（TCP，ABBA） | 12.76 | **12.53-12.93（+9.4%）** | 19.9 | 4.31-5.33（-31%） | 15.1（-19%） | 31.1-33.1（-6%） |
 | 双机 32 层（3-34，TCP，规划器新最优点实测） | 9.24 | 9.46-10.26 | 16.4 | 8.30 | 19.2 | 31.7 |
 
+> 注：本表为 IQ traits 合入前（2026-07-31）数据；traits 合并后单机 pp1020 已达 399-406（4.1×），双机复测数据待补充。
+
 要点：
 
 - **slave 带宽 ×1.8 后 decode 全面提速**：worker 每层 compute 0.85-0.94ms（旧带宽估计 2.6ms），双机 TCP TG512 10.71→11.8（+10%）、RDMA →12.1；单机 TG512 ~10→13.2。RDMA 对 decode（KB 级帧）再 +3%。
@@ -106,15 +126,15 @@ NUMA-EP + mirror、72 线程、fa=1、batch 4096/ubatch 1024；`--no-repack` 为
 ## 核心技术
 
 - **NUMA 镜像**：非专家权重 + KV 双节点复制，线程绑核，UPI 流量归零
-- **NUMA-EP**：专家单副本按插槽放置（mbind 策略级），mul_mat_id 本地优先计算 —— 内存减半，超大模型可装载
-- **AVX512/VNNI 8×8 重排内核**：Q2_K~Q6_K、Q8_0、MXFP4、IQ1_S/IQ1_M 全格式覆盖，PP 批量（gemm nr≥16）加速最高 4.9×；其中 Q3_K/Q5_K/Q6_K/Q8_0 x86 内核与 IQ1_S/IQ1_M 全套（块布局+repack+内核）为本分支新增
+- **NUMA 行窗 EP**：专家单副本按**每专家内行窗口**跨插槽放置（mbind 策略级），mul_mat_id 本地优先计算 + per-(专家,节点) claim 派发 —— 内存减半、dst 行单写者零归并，TG 追平镜像；线程亲和块划分修复（半数线程跨 UPI 根因）
+- **AVX512/VNNI 8×8 重排内核**：Q2_K~Q6_K、Q8_0、MXFP4、IQ1_S/IQ1_M/IQ2_XS/IQ3_XXS 全格式覆盖，PP 批量（gemm nr≥16）加速最高 4.9×；其中 Q3_K/Q5_K/Q6_K/Q8_0 x86 内核与 IQ1_S/IQ1_M/IQ2_XS/IQ3_XXS 全套（块布局+repack+内核）为本分支新增；MoE 批量 mul_mat_id 走 4 行 tile gemm 分流（GLM PP 4.1×）
 - **融合算子**：dsv4 超连接 CUDA 内核、融合 MoE 路由器、RMS_NORM 吸收、GLM-DSA 闪电索引器
 - **MTP 投机解码**（dsv4）
 - **跨机 EP（已上线）**：激活派发（KB 级流量）而非权重传输，slave `llama-epd` worker 认领 MoE 层，RoCEv2 100G 直连（TCP/RDMA 双传输后端，RDMA opt-in）；MAX-EFFORT 层镜像（`GGML_REMOTE_EP_MIRROR`）把远程段从 decode 关键路径上重叠掉（TG +9~11%）；worker 固定开销已消除（DSV4 PP +75%）；支持 NUMA 加权交织（`GGML_EPD_NUMA=weighted`）；EP 规划器 `tools/epd/ep-plan.py` 按带宽实测给分层点
 
 ## 当前状态
 
-早期开发阶段。`main` 分支 = 生产可用；双机 expert-parallel 已上线（DSV4 追平单机 + master 内存省 26%；GLM-5.2 见上方数据表），EPD worker / RDMA 后端 / 层镜像 / 规划器均在 `tools/epd`。
+早期开发阶段。`main` 分支 = 生产可用；双机 expert-parallel 已上线（DSV4 追平单机 + master 内存省 26%；GLM-5.2 见上方数据表），EPD worker / RDMA 后端 / 层镜像 / 规划器均在 `tools/epd`。2026-08-01：行窗 EP + 亲和修复、IQ2_XS/IQ3_XXS traits + mul_mat_id gemm 分流已合入（GLM PP 4.1×）；GPU 侧评估过上游 meta-backend 张量并行（`-sm tensor`），2×3090+NVLink 实测 **-20% 负收益**（MIRRORED 复制计算+allreduce 边界+launch 开销为结构性，数值正确性 KL=0 验证通过），不合入、保留在实验分支。
 
 **完整改动清单见 [docs/CHANGES.md](docs/CHANGES.md)**（NUMA 体系、CPU 内核格式支持、融合算子、环境变量速查）。
 

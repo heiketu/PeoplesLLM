@@ -14,17 +14,35 @@ Current tuning targets: **GLM-5.2** and **DeepSeek-V4**. Issues are welcome.
 
 ## Benchmarks
 
-DeepSeek-V4 284B (Q3_K quant), dual Xeon 8360Y (Ice Lake) + 2× RTX 3090:
+DeepSeek-V4 284B (Q3_K quant), dual Xeon 8360Y (Ice Lake) + 2× RTX 3090 (14 expert layers on GPU, 72 threads, `--no-mmap`; re-measured same-config 2026-08-01):
 
-| Implementation | TG (t/s) | PP (t/s) |
-|---|---|---|
-| Upstream llama.cpp (b10173) | 5.85 | 23.6 |
-| **PeoplesLLM (NUMA mirror)** | **~33** | — |
-| **PeoplesLLM (NUMA-EP)** | **28.5** | **310** |
+| Implementation | tg512 (t/s) | pp512 (t/s) | MoE op wall |
+|---|---|---|---|
+| Upstream llama.cpp (NUMA distribute) | 26.9-28.0 | 150.5-161.3 | ~102.5-125µs |
+| PeoplesLLM (isolate, single-socket ref) | 25.7-25.9 | 363.6-370.2 | 133.4µs |
+| **PeoplesLLM (NUMA row-window EP, half memory)** | **30.34-30.48** | 318-333 | **88.4µs** |
+| **PeoplesLLM (NUMA mirror)** | **30.35-30.44** | **344-349** | 80.3µs |
 
 > Note: all DeepSeek-V4 numbers above are measured **without MTP speculative decoding**; TG goes higher with MTP enabled (MTP figures to be published separately).
+> For PP-heavy or single-socket scenarios isolate is actually fastest (pp512 370); with ample RAM mirror wins TG; when memory-bound, row-window EP trades ~10% MoE overhead for half the expert memory.
 
-GLM-5.2 745B (UD-Q2_K quant): TG 12.0 t/s (EP + GPU expert offload).
+GLM-5.2 745B (UD-Q2_K_MXFP4, single machine + 2× 3090, 9 expert layers on GPU; same-config A/B 2026-08-01):
+
+| Implementation | tg512 (t/s) | pp512 (t/s) | pp1020 (t/s) |
+|---|---|---|---|
+| PeoplesLLM w/o IQ traits | 11.23-11.27 | 56.8 | 98.2-99.1 |
+| **PeoplesLLM + IQ2_XS/IQ3_XXS traits** | **11.95 (+6%)** | **298-307** | **399-406 (4.1×)** |
+
+### Row-window EP + thread-affinity root-cause fix (2026-08-01)
+
+- **Row-window EP**: expert-parallel placement moved from whole-expert granularity to **row windows within each expert** (node n owns the n-th window of every expert, single mbind copy) — single-writer dst rows, zero merge, structurally kills the batch=1 tail imbalance that made whole-expert EP perform like a single socket.
+- **Thread-affinity root-cause fix**: DISTRIBUTE pinning (`ith % n_nodes`, interleaved) disagreed with the EP compute side's window ownership (block mapping) — **exactly half the threads were pinned to the wrong node and read their "local" windows 100% over UPI** (155.7µs vs mirror's 80.3µs per MoE op). Fixed: 88.4µs (89% of the gap recovered); EP tg512 20.7-26.3 → **30.34-30.48, matching mirror and beating upstream distribute**; correctness: mirror==EP token-identical.
+- The residual ~10% MoE overhead is attributed to the two-phase claim compute path (not placement); `GGML_NUMA_EP_STATIC/EP_CLAIM/EP_CHUNK` diagnostic switches documented in the params manual.
+
+### IQ2_XS/IQ3_XXS repack kernels + mul_mat_id gemm dispatch (2026-08-01)
+
+- GLM-5.2's dominant expert quants **IQ2_XS/IQ3_XXS got full 8×8 interleaved repack traits** (layouts + conversion + generic & AVX512 (VNNI+VBMI gated) gemv/gemm): micro-bench gemm **2.3-2.5×** vs vec_dot, native==generic bit-exact, test-backend-ops 1996/1996 PASS.
+- **mul_mat_id gemm dispatch**: repacked MoE batch paths previously ran row-by-row gemv (Q2_K had the same gap); now 4-row tiles are gathered + quantized into interleaved tiles for gemm — GLM single-machine **PP1020 99→406 (4.1×), tg512 +6%**, EP and mirror token-identical.
 
 ### CPU kernel full benchmark (AVX512/VNNI/VBMI 8×8 repack vs upstream legacy vec_dot)
 
@@ -92,6 +110,8 @@ Topology: master (dual Xeon 8360Y-class / 251G / 2×3090) ←100G RoCEv2 direct 
 | 15L + `MIRROR=1` (TCP, ABBA) | 12.76 | **12.53-12.93 (+9.4%)** | 19.9 | 4.31-5.33 (-31%) | 15.1 (-19%) | 31.1-33.1 (-6%) |
 | Two-machine 32L (3-34, TCP; planner's new optimum, measured) | 9.24 | 9.46-10.26 | 16.4 | 8.30 | 19.2 | 31.7 |
 
+> Note: this table predates the IQ traits merge (2026-07-31 data); with traits merged, single-machine pp1020 is now 399-406 (4.1×) — two-machine re-measurement in progress.
+
 Highlights:
 
 - **Decode sped up across the board with 1.8× slave bandwidth**: worker compute is now 0.85-0.94 ms/layer (2.6 ms estimated on the old memory); two-machine TCP TG512 10.71→11.8 (+10%), RDMA →12.1; single-machine TG512 ~10→13.2. RDMA adds another +3% for decode (KB-scale frames).
@@ -106,15 +126,15 @@ Setup guide and full env reference: [tools/epd/README.md](tools/epd/README.md); 
 ## What's inside
 
 - **NUMA mirror**: duplicate non-expert weights + KV per socket, pin threads per node — zero UPI traffic
-- **NUMA-EP**: single-copy expert placement across sockets (mbind policy-level), local-first `mul_mat_id` — halves expert memory, makes 745B-class models fit
-- **AVX512/VNNI 8×8 repack kernels**: full coverage of Q2_K–Q6_K, Q8_0, MXFP4, IQ1_S/IQ1_M — up to 4.9× on PP batches (gemm nr≥16); the Q3_K/Q5_K/Q6_K/Q8_0 x86 kernels and the entire IQ1_S/IQ1_M stack (block layout + repack + kernels) are new in this fork
+- **NUMA row-window EP**: single-copy expert placement by **row windows within each expert** across sockets (mbind policy-level), local-first `mul_mat_id` + per-(expert,node) claim dispatch — halves expert memory, single-writer dst rows with zero merge, TG matches mirror; thread-affinity block-mapping fix (half the threads were reading over UPI)
+- **AVX512/VNNI 8×8 repack kernels**: full coverage of Q2_K–Q6_K, Q8_0, MXFP4, IQ1_S/IQ1_M/IQ2_XS/IQ3_XXS — up to 4.9× on PP batches (gemm nr≥16); the Q3_K/Q5_K/Q6_K/Q8_0 x86 kernels and the entire IQ1_S/IQ1_M/IQ2_XS/IQ3_XXS stacks (block layout + repack + kernels) are new in this fork; batched MoE `mul_mat_id` dispatched to 4-row tile gemm (GLM PP 4.1×)
 - **Fused ops**: DeepSeek-V4 hyper-connection CUDA kernel, fused MoE router, RMS_NORM absorption, GLM-DSA Lightning Indexer
 - **MTP speculative decoding** (DeepSeek-V4)
 - **Cross-machine EP (live)**: activation dispatch (KB-scale traffic) instead of weight transfer; the slave `llama-epd` worker owns MoE layers over a 100G RoCEv2 direct link (TCP/RDMA dual transports, RDMA opt-in); MAX-EFFORT layer mirroring (`GGML_REMOTE_EP_MIRROR`) overlaps the remote segment off the decode critical path (TG +9~11%); worker per-request fixed overhead eliminated (DSV4 PP +75%); NUMA weighted interleave (`GGML_EPD_NUMA=weighted`); the EP planner `tools/epd/ep-plan.py` recommends layer splits from measured bandwidth
 
 ## Status
 
-Early development. `main` branch = production-ready; two-machine expert-parallel is live (DSV4 matches single-machine speed with 26% lower master RAM; GLM-5.2 numbers in the table above), with the EPD worker / RDMA transport / layer mirroring / planner in `tools/epd`.
+Early development. `main` branch = production-ready; two-machine expert-parallel is live (DSV4 matches single-machine speed with 26% lower master RAM; GLM-5.2 numbers in the table above), with the EPD worker / RDMA transport / layer mirroring / planner in `tools/epd`. 2026-08-01: row-window EP + affinity fix and IQ2_XS/IQ3_XXS traits + mul_mat_id gemm dispatch merged (GLM PP 4.1×). On the GPU side we evaluated upstream's meta-backend tensor parallelism (`-sm tensor`): on 2× RTX 3090 + NVLink it measured **-20% (structural regression** — MIRRORED duplicated compute + allreduce boundaries + launch overhead; numerical correctness verified, KL=0), so it stays on an experimental branch and is not merged.
 
 **Full changelog and feature documentation: [docs/CHANGES.md](docs/CHANGES.md)** (Chinese) — NUMA architecture, CPU kernel format matrix, fused ops, environment variable reference.
 
