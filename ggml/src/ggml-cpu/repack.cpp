@@ -5229,6 +5229,9 @@ template <> struct gemm_min_nrows<block_iq1_m, 8, 8, GGML_TYPE_Q8_K> { static co
 template <> struct gemm_min_nrows<block_iq2_xs, 8, 8, GGML_TYPE_Q8_K> { static constexpr int64_t value = 4; };
 template <> struct gemm_min_nrows<block_iq3_xxs, 8, 8, GGML_TYPE_Q8_K> { static constexpr int64_t value = 4; };
 
+// Tile of src1 rows gathered per gemm call in forward_mul_mat_id (multiple of 4).
+static constexpr int64_t MMID_GEMM_TILE = 32;
+
 class tensor_traits_base : public ggml::cpu::tensor_traits {
   public:
     virtual int repack(struct ggml_tensor * t, const void * data, size_t data_size) = 0;
@@ -5236,7 +5239,7 @@ class tensor_traits_base : public ggml::cpu::tensor_traits {
 
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PARAM_TYPE> class tensor_traits : public tensor_traits_base {
 
-    bool work_size(int /* n_threads */, const struct ggml_tensor * op, size_t & size) override {
+    bool work_size(int n_threads, const struct ggml_tensor * op, size_t & size) override {
         // not realy a GGML_TYPE_Q8_0 but same size.
         switch (op->op) {
             case GGML_OP_MUL_MAT:
@@ -5260,6 +5263,19 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                     // work stealing (one cache line per expert per NUMA node)
                     size  = GGML_PAD(size, GGML_EP_CACHE_LINE);
                     size += GGML_EP_CACHE_LINE*ne02*GGML_NUMA_MAX_NODES;
+
+                    // per-thread gather/scatter tiles for the mul_mat_id gemm path:
+                    // an expert's selected src1 rows are scattered (slot, token) pairs,
+                    // so tiles of MMID_GEMM_TILE f32 rows are gathered (4 at a time)
+                    // into contiguous scratch, quantized to the interleaved layout the
+                    // gemm kernels consume, multiplied, and scattered back. Column
+                    // ranges are bounded by the per-thread row split (else branch) and
+                    // the NUMA EP claim quantum of 16 rows.
+                    const int64_t nbw1 = ggml_row_size(PARAM_TYPE, op->src[1]->ne[0]);
+                    const int64_t ne01 = op->src[0]->ne[1];
+                    const int64_t cols = MAX((int64_t) 16, (ne01 + n_threads - 1)/n_threads + NB_COLS);
+                    size += n_threads*(MMID_GEMM_TILE*nbw1 + MMID_GEMM_TILE*cols*sizeof(float) +
+                                     4*op->src[1]->ne[0]*sizeof(float));
 
                     return true;
                 }
@@ -5627,10 +5643,19 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             int32_t i2;
         };
 
+        // per-thread gather/scatter tiles for the gemm path (laid out after row_claim,
+        // sized in work_size): interleaved src1 tile + dense dst tile + 4-row f32
+        // gather buffer. Column ranges are bounded by the per-thread row split
+        // (large-batch branch) and the NUMA EP claim quantum of 16 rows.
+        const int64_t mmid_max_cols = MAX((int64_t) 16, (ne01 + nth - 1)/nth + NB_COLS);
+        const size_t  mmid_scratch_stride = MMID_GEMM_TILE*nbw1 + MMID_GEMM_TILE*mmid_max_cols*sizeof(float) +
+                                            4*ne00*sizeof(float);
+
         GGML_ASSERT(params->wsize >=
                 (GGML_PAD(nbw3, sizeof(int64_t)) +
                  GGML_PAD(n_as*(ne12 + 1)*sizeof(mmid_row_mapping), GGML_EP_CACHE_LINE) +
-                 n_as*GGML_NUMA_MAX_NODES*GGML_EP_CACHE_LINE));
+                 n_as*GGML_NUMA_MAX_NODES*GGML_EP_CACHE_LINE +
+                 nth*mmid_scratch_stride));
 
         auto * wdata          = (char *)params->wdata;
         auto * wdata_src1_end = (char *)wdata + GGML_PAD(nbw3, sizeof(int64_t));
@@ -5643,6 +5668,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         // (laid out as [n_as][GGML_NUMA_MAX_NODES], one cache line each)
         auto * row_claim = (std::atomic_int *) ((char *) wdata_src1_end +
             GGML_PAD(n_as*(ne12 + 1)*sizeof(mmid_row_mapping), GGML_EP_CACHE_LINE));
+
+        char * mmid_scratch = (char *) row_claim + n_as*GGML_NUMA_MAX_NODES*GGML_EP_CACHE_LINE;
 
         // src1: float32 => param type
         for (int64_t i12 = 0; i12 < ne12; ++i12) {
@@ -5706,6 +5733,61 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         }
 
         ggml_barrier(params->threadpool);
+
+        // Compute dst columns [ws, we) of expert cur_a for all its selected src1 rows.
+        // The selected rows are scattered (slot, token) pairs, so tiles of
+        // MMID_GEMM_TILE rows are gathered from src1 (4 f32 rows at a time), quantized
+        // into the interleaved layout the gemm kernels consume (same scheme as
+        // forward_mul_mat's src1 quantization), multiplied with gemm, and scattered
+        // back; the tail rows (< 4, or column ranges not NB_COLS-aligned) go through
+        // per-row gemv as before.
+        auto mmid_rows_range = [&](int64_t cur_a, const char * src0_cur, int64_t ws, int64_t we) {
+            const int64_t cne1  = matrix_row_counts[cur_a];
+            const int64_t ncols = we - ws;
+
+            int64_t nrows_gemm = 0;
+            if (cne1 >= gemm_min_nrows<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>::value && ncols % NB_COLS == 0) {
+                nrows_gemm = cne1 - (cne1 % 4);
+            }
+
+            char * vy_tile  = mmid_scratch + ith*mmid_scratch_stride;
+            auto * dst_tile = (float *) (vy_tile + MMID_GEMM_TILE*nbw1);
+            auto * x4       = dst_tile + MMID_GEMM_TILE*mmid_max_cols; // 4*ne00 floats
+
+            for (int64_t base = 0; base < nrows_gemm; base += MMID_GEMM_TILE) {
+                const int64_t tr = MIN(MMID_GEMM_TILE, nrows_gemm - base);
+                for (int64_t k = 0; k < tr; k += 4) {
+                    for (int64_t m = 0; m < 4; m++) {
+                        const struct mmid_row_mapping rm = MMID_MATRIX_ROW(cur_a, base + k + m);
+                        memcpy(x4 + m*ne00, (const char *) src1->data + rm.i2*nb12 + (rm.i1 % ne11)*nb11,
+                               ne00*sizeof(float));
+                    }
+                    ggml_quantize_mat_t<INTER_SIZE, PARAM_TYPE>(x4, vy_tile + k*nbw1, 4, ne00);
+                }
+                gemm<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(ne00, dst_tile, ncols,
+                                                                 src0_cur + ws*nb01, vy_tile, tr, ncols);
+                for (int64_t k = 0; k < tr; k++) {
+                    const struct mmid_row_mapping rm = MMID_MATRIX_ROW(cur_a, base + k);
+                    memcpy((char *) dst->data + rm.i1*nb1 + rm.i2*nb2 + ws*sizeof(float),
+                           dst_tile + k*ncols, ncols*sizeof(float));
+                }
+            }
+
+            for (int64_t ir1 = nrows_gemm; ir1 < cne1; ir1++) {
+                struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, ir1);
+
+                const int id = row_mapping.i1;  // selected expert index
+
+                const int64_t i11 = id % ne11;
+                const int64_t i12 = row_mapping.i2;  // row index in src1
+
+                const auto * src1_col = (const char *) wdata + (i11 * nbw1 + i12 * nbw2);
+
+                gemv<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(
+                    ne00, (float *) ((char *) dst->data + (id * nb1 + i12 * nb2)) + ws, ne01,
+                    src0_cur + ws*nb01, src1_col, 1, ncols);
+            }
+        };
 
         const int64_t dbg_t_start = (ep && ep_dbg_on()) ? ggml_time_us() : 0;
         if (ep && ep_dbg_on() && ith == 0) {
@@ -5780,23 +5862,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                                 }
                             }
 
-                            for (int ir1 = 0; ir1 < cne1; ir1++) {
-                                struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, ir1);
-
-                                const int id = row_mapping.i1;  // selected expert index
-
-                                const int64_t i11 = id % ne11;
-                                const int64_t i12 = row_mapping.i2;  // row index in src1
-
-                                const int64_t i1 = id;               // selected expert index
-                                const int64_t i2 = i12;              // row
-
-                                const auto * src1_col = (const char *) wdata + (i11 * nbw1 + i12 * nbw2);
-
-                                gemv<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(
-                                    ne00, (float *) ((char *) dst->data + (i1 * nb1 + i2 * nb2)) + r0, ne01,
-                                    src0_cur + r0 * nb01, src1_col, 1, r1 - r0);
-                            }
+                            mmid_rows_range(cur_a, src0_cur, r0, r1);
                         }
                     }
                 }
@@ -5904,9 +5970,6 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
                 const auto * src0_cur = (const char *) ggml_numa_tensor_data(src0, ggml_numa_node_for_thread(ith, nth)) + cur_a*nb02;
 
-                //const int64_t nr0 = ne01; // src0 rows
-                const int64_t nr1 = cne1; // src1 rows
-
                 int64_t src0_cur_start = (ith * ne01) / nth;
                 int64_t src0_cur_end   = ((ith + 1) * ne01) / nth;
 
@@ -5921,23 +5984,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                     continue;
                 }
 
-                for (int ir1 = 0; ir1 < nr1; ir1++) {
-                    struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, ir1);
-
-                    const int id = row_mapping.i1;  // selected expert index
-
-                    const int64_t i11 = id % ne11;
-                    const int64_t i12 = row_mapping.i2;  // row index in src1
-
-                    const int64_t i1 = id;               // selected expert index
-                    const int64_t i2 = i12;              // row
-
-                    const auto * src1_col = (const char *) wdata + (i11 * nbw1 + i12 * nbw2);
-
-                    gemv<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(
-                        ne00, (float *) ((char *) dst->data + (i1 * nb1 + i2 * nb2)) + src0_cur_start, ne01,
-                        src0_cur + src0_cur_start * nb01, src1_col, 1, src0_cur_end - src0_cur_start);
-                }
+                mmid_rows_range(cur_a, src0_cur, src0_cur_start, src0_cur_end);
             }
         }
 #undef MMID_MATRIX_ROW

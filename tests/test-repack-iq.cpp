@@ -233,12 +233,13 @@ static int test_gemm(const char * name, ggml_type type,
 // ---------------------------------------------------------------------------
 
 template <typename BLOCK>
-static int test_graph(const char * name, ggml_type type, void (*fill)(BLOCK *, int64_t), ggml_backend_t backend) {
-    printf("  %s end-to-end (repack buffer vs vec_dot)\n", name);
+static int test_graph(const char * name, ggml_type type, void (*fill)(BLOCK *, int64_t), ggml_backend_t backend, int64_t ntok) {
+    printf("  %s end-to-end (repack buffer vs vec_dot, ntok=%lld)\n", name, (long long) ntok);
     const int64_t ne00 = 1024;
     const int64_t nb   = ne00 / QK_K;
     const int64_t ne01 = 64;
-    const int64_t ntok = 8;   // >= 4 src1 rows -> repack gemm path for mul_mat
+    // ntok >= 4 -> repack gemm path for mul_mat; ntok > 8 -> mul_mat_id large-batch
+    // branch (gemm tiles + gather/scatter); ntok <= 8 -> mul_mat_id small-batch gemv
     const int64_t nexp = 8;
     const int64_t nids = 3;
 
@@ -435,8 +436,10 @@ int main(int argc, char ** argv) {
     ggml_backend_cpu_set_n_threads(backend, 8);
 
     printf("== graph tests ==\n");
-    bad += test_graph<block_iq2_xs>("iq2_xs", GGML_TYPE_IQ2_XS, fill_random_iq2_xs, backend);
-    bad += test_graph<block_iq3_xxs>("iq3_xxs", GGML_TYPE_IQ3_XXS, fill_random_iq3_xxs, backend);
+    for (int64_t ntok : { 8, 33 }) {
+        bad += test_graph<block_iq2_xs>("iq2_xs", GGML_TYPE_IQ2_XS, fill_random_iq2_xs, backend, ntok);
+        bad += test_graph<block_iq3_xxs>("iq3_xxs", GGML_TYPE_IQ3_XXS, fill_random_iq3_xxs, backend, ntok);
+    }
 
     ggml_backend_free(backend);
 
