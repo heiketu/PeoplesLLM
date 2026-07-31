@@ -2854,7 +2854,18 @@ static void set_numa_thread_affinity(int thread_n, int n_threads) {
     switch(g_state.numa.numa_strategy) {
         case GGML_NUMA_STRATEGY_DISTRIBUTE:
             // run thread on node_num thread_n / (threads per node)
-            node_num = thread_n % g_state.numa.n_nodes;
+            // NUMA EP (row-window expert placement) keys each thread's local weight
+            // window to ggml_numa_node_for_thread's block split; the affinity must
+            // use the same block mapping, otherwise half of the threads (interleaved
+            // pinning vs block-split windows) stream their whole "local" window over
+            // UPI. Plain distribute has no per-thread weight redirection (pages are
+            // interleaved), so the historical round-robin pinning is kept there.
+            if (ggml_cpu_numa_ep_active()) {
+                node_num = ggml_numa_node_for_thread(thread_n, n_threads);
+                tl_numa_node = node_num; // remember our node for the hierarchical barrier
+            } else {
+                node_num = thread_n % g_state.numa.n_nodes;
+            }
             break;
         case GGML_NUMA_STRATEGY_ISOLATE:
             // run thread on current_node
