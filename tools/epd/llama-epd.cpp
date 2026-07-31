@@ -21,6 +21,12 @@
 // slow start (full read), RSS = owned weights permanently resident, zero page-in
 // stalls, immune to page-cache eviction (slow-disk setups where mmap page-in
 // dominates). GGML_EP_PREFAULT is skipped (meaningless) when --no-mmap is on.
+//
+// After loading, the owned expert weights are converted into the CPU_REPACK
+// (interleaved) layout so mul_mat_id dispatches to the repack gemv/gemm kernels
+// instead of generic vec_dot (one-time cost at startup; the original mapping is
+// no longer referenced, --no-mmap anonymous copies are freed). Tensors without
+// matching repack traits keep the raw layout. GGML_EPD_REPACK=0 disables.
 
 #include "llama-ep-transport.h"
 
@@ -66,6 +72,15 @@ static bool ep_debug_enabled() {
     static const bool v = []() {
         const char * e = getenv("GGML_REMOTE_EP_DEBUG");
         return e && e[0] != '\0' && strcmp(e, "0") != 0;
+    }();
+    return v;
+}
+
+// env-gated weight repacking into the CPU_REPACK layout (GGML_EPD_REPACK=0 disables), default on
+static bool ep_repack_enabled() {
+    static const bool v = []() {
+        const char * e = getenv("GGML_EPD_REPACK");
+        return !(e && e[0] != '\0' && strcmp(e, "0") == 0);
     }();
     return v;
 }
@@ -142,6 +157,16 @@ struct ep_model {
 
     // --no-mmap: name -> (shard, absolute file offset of tensor data)
     std::map<std::string, std::pair<ep_shard *, uint64_t>> tensor_src;
+
+    // CPU_REPACK buffers holding the owned expert weights in interleaved
+    // layout (ep_repack_weights); empty when repack is unavailable/disabled
+    std::vector<ggml_backend_buffer_t> repack_bufs;
+
+    ~ep_model() {
+        for (ggml_backend_buffer_t b : repack_bufs) {
+            ggml_backend_buffer_free(b);
+        }
+    }
 
     std::string arch;
     int n_layer = 0;
@@ -279,6 +304,138 @@ static bool ep_nommap_load_weights(ep_model & m) {
     LOG("llama-epd: no-mmap: done in %.1f s (%.2f GB/s)\n",
         (ggml_time_us() - t0) / 1e6, total / 1073741824.0 / ((ggml_time_us() - t0) / 1e6));
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// CPU_REPACK weight layout
+//
+// The worker's MoE graph runs mul_mat_id with the expert weights as src0. In a
+// plain CPU buffer that op falls back to the generic vec_dot path; the same op
+// with src0 in a CPU_REPACK buffer (tensor->extra set by the buffer's
+// init_tensor) dispatches to the repack gemv/gemm kernels (8x8 interleaved,
+// AVX512), which are several times faster on both PP batches and TG batch=1.
+// The conversion is a one-time load-time cost. Tensors whose type/shape has no
+// repack traits keep their original storage and silently use the old path;
+// when the CPU_REPACK buffer type is unavailable (build without GGML_CPU_REPACK)
+// the whole step is skipped.
+// ---------------------------------------------------------------------------
+static void ep_repack_weights(ep_model & m, bool no_mmap) {
+    if (!ep_repack_enabled()) {
+        LOG("llama-epd: repack: disabled (GGML_EPD_REPACK=0), keeping raw weight layout\n");
+        return;
+    }
+
+    // locate the CPU_REPACK buffer type via the CPU device's extra bufts
+    ggml_backend_buffer_type_t repack_buft = nullptr;
+    if (ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) {
+        ggml_backend_reg_t cpu_reg = ggml_backend_dev_backend_reg(cpu_dev);
+        auto get_extra_bufts = (ggml_backend_dev_get_extra_bufts_t)
+            ggml_backend_reg_get_proc_address(cpu_reg, "ggml_backend_dev_get_extra_bufts");
+        if (get_extra_bufts) {
+            for (ggml_backend_buffer_type_t * extra = get_extra_bufts(cpu_dev); extra && *extra; ++extra) {
+                if (strcmp(ggml_backend_buft_name(*extra), "CPU_REPACK") == 0) {
+                    repack_buft = *extra;
+                    break;
+                }
+            }
+        }
+    }
+    if (!repack_buft) {
+        LOG("llama-epd: repack: CPU_REPACK buffer type not available, keeping raw weight layout\n");
+        return;
+    }
+
+    std::vector<ggml_tensor *> wts;
+    for (auto & kv : m.layers) {
+        for (ggml_tensor * t : {kv.second.gate_up, kv.second.gate, kv.second.up, kv.second.down}) {
+            if (t) {
+                wts.push_back(t);
+            }
+        }
+    }
+
+    size_t total = 0;
+    for (const ggml_tensor * t : wts) {
+        total += ggml_backend_buft_get_alloc_size(repack_buft, t);
+    }
+    LOG("llama-epd: repack: converting %.2f GiB of expert weights (%zu tensors) to CPU_REPACK layout\n",
+        total / 1073741824.0, wts.size());
+    const int64_t t0 = ggml_time_us();
+
+    ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(repack_buft, total);
+    if (!buf) {
+        LOG("llama-epd: repack: buffer alloc failed, keeping raw weight layout\n");
+        return;
+    }
+
+    // place every tensor in the repack buffer; init_tensor sets tensor->extra
+    // to the repack traits, or leaves it nullptr when the type/shape has none
+    char * base = (char *) ggml_backend_buffer_get_base(buf);
+    size_t off = 0;
+    std::vector<std::pair<ggml_tensor *, const void *>> jobs; // (tensor, original data)
+    for (ggml_tensor * t : wts) {
+        const void * src = t->data;
+        t->buffer = buf;
+        t->data   = base + off;
+        off += ggml_backend_buffer_get_alloc_size(buf, t);
+        ggml_backend_buffer_init_tensor(buf, t);
+        if (t->extra) {
+            jobs.emplace_back(t, src);
+        } else {
+            // no repack traits for this type/shape: revert to the original storage
+            t->buffer = nullptr;
+            t->data   = const_cast<void *>(src);
+            LOG("llama-epd: repack: %s (%s) has no repack traits, keeping raw layout\n",
+                t->name, ggml_type_name(t->type));
+        }
+    }
+
+    if (jobs.empty()) {
+        LOG("llama-epd: repack: no tensor has matching repack traits, keeping raw weight layout\n");
+        ggml_backend_buffer_free(buf);
+        return;
+    }
+
+    // set_tensor runs the actual layout conversion; parallelize across tensors
+    // (the conversion is memory bound, ~8 threads saturate)
+    const int nth = (int) std::min<size_t>(8, jobs.size());
+    std::atomic<size_t> next{0};
+    std::vector<std::thread> pool;
+    pool.reserve((size_t) nth);
+    for (int i = 0; i < nth; ++i) {
+        pool.emplace_back([&]() {
+            for (;;) {
+                const size_t idx = next.fetch_add(1);
+                if (idx >= jobs.size()) {
+                    break;
+                }
+                ggml_tensor * t = jobs[idx].first;
+                ggml_backend_tensor_set(t, jobs[idx].second, 0, ggml_nbytes(t));
+            }
+        });
+    }
+    for (auto & th : pool) {
+        th.join();
+    }
+
+    // --no-mmap: the original anonymous copies are no longer referenced
+    if (no_mmap) {
+        for (const auto & job : jobs) {
+            for (auto & sh : m.shards) {
+                auto it = std::find(sh->load_bufs.begin(), sh->load_bufs.end(), job.second);
+                if (it != sh->load_bufs.end()) {
+                    free(*it);
+                    sh->load_bufs.erase(it);
+                    break;
+                }
+            }
+        }
+    }
+
+    m.repack_bufs.push_back(buf);
+
+    LOG("llama-epd: repack: %zu/%zu tensors converted in %.1f s\n",
+        jobs.size(), wts.size(), (ggml_time_us() - t0) / 1e6);
 }
 
 // probe one tensor name in the global map; returns nullptr if absent
@@ -420,6 +577,7 @@ static bool ep_model_load(ep_model & m, const char * path, int layer_first, int 
     if (no_mmap && !ep_nommap_load_weights(m)) {
         return false;
     }
+    ep_repack_weights(m, no_mmap);
     return true;
 }
 
@@ -1740,6 +1898,8 @@ static void ep_usage(const char * argv0) {
         "env: GGML_EPD_NUMA=off|interleave|weighted (default off) — weight page NUMA\n"
         "     placement; weighted uses GGML_EPD_NUMA_WEIGHT=a:b or a startup bandwidth\n"
         "     probe (MPOL_WEIGHTED_INTERLEAVE, kernel >= 6.9)\n"
+        "     GGML_EPD_REPACK=0 — keep raw GGUF weight layout (default: convert to\n"
+        "     CPU_REPACK interleaved layout for the repack gemv/gemm kernels)\n"
         "\n",
         argv0);
 }
