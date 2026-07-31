@@ -203,6 +203,7 @@ llama-epd -m model.gguf --selftest [--selftest-layer N] [--selftest-tokens N]
 10. **worker 线程勿超物理核**：`-t 128/136`（超 36 物理核）TG512 崩到 4-7 t/s 且非单调；交给 autotune 或设物理核数。
 11. **PP 口径警告**：本仓库 PP 数字默认 5-token 短 prompt，固定开销摊薄严重，不代表长 prompt 吞吐；比较请用 63/254/1020 档摊销曲线。
 12. **任何模型进程全程 `flock -x /tmp/xllama-bench.lock`**：多 agent 并发加载模型曾 OOM 杀整个会话。
+13. **llama-cli 脚本化必须 `--single-turn` + `</dev/null`**：新版 tools/cli 交互主循环没有 EOF 退出路径——`-no-cnv` 止不住，stdin=</dev/null 时 readline 立即返回 false → 无限打印 `\n> ` 空转（实测写出 3GB/410MB 垃圾并占锁 17 分钟）；唯一可靠退出 = `--single-turn`（cli-context.cpp:655 break）。配套坑：llama-cli 用 `--no-mmap`、llama-bench 用 `--mmap 0`（互不认，报 "error: invalid argument: 0"）；llama-cli `-fa` 只认 on/off/auto 不认 `1`；空输出 cmp 会假阳性，对拍前必须 `wc -c` 验非空。
 
 ---
 
