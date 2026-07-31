@@ -66,6 +66,21 @@ static void fill_random_iq3_xxs(block_iq3_xxs * x, int64_t nblocks) {
     }
 }
 
+static void fill_random_q2_K(block_q2_K * x, int64_t nblocks) {
+    for (int64_t i = 0; i < nblocks; i++) {
+        // d/dmin sit in a trailing {d, dmin} pair (access path varies by GGML_COMMON_AGGR)
+        ggml_half * hd = (ggml_half *) ((char *) (x + i + 1) - 2*sizeof(ggml_half));
+        hd[0] = ggml_fp32_to_fp16(frand(0.05f, 0.3f) * (urand() & 1 ? 1 : -1));
+        hd[1] = ggml_fp32_to_fp16(frand(0.01f, 0.1f));
+        for (int k = 0; k < QK_K/16; k++) {
+            x[i].scales[k] = (uint8_t) urand();
+        }
+        for (int k = 0; k < QK_K/4; k++) {
+            x[i].qs[k] = (uint8_t) urand();
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // diff helpers
 // ---------------------------------------------------------------------------
@@ -439,6 +454,7 @@ int main(int argc, char ** argv) {
     for (int64_t ntok : { 8, 33 }) {
         bad += test_graph<block_iq2_xs>("iq2_xs", GGML_TYPE_IQ2_XS, fill_random_iq2_xs, backend, ntok);
         bad += test_graph<block_iq3_xxs>("iq3_xxs", GGML_TYPE_IQ3_XXS, fill_random_iq3_xxs, backend, ntok);
+        bad += test_graph<block_q2_K>("q2_K", GGML_TYPE_Q2_K, fill_random_q2_K, backend, ntok);
     }
 
     ggml_backend_free(backend);
