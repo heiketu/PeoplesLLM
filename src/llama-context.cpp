@@ -540,6 +540,22 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
             ggml_backend_dev_t device_layer = model.dev_layer(node.il);
 
             if (device_fused != device_layer) {
+                // the scheduler may place the fused op on a different device than the layer even
+                // when the layer's device supports it (e.g. pure CPU run with GPU devices visible:
+                // the probe graph gets the op assigned to a GPU backend while all layers are on
+                // the CPU). Disabling the fused op in that case is harmful - it forces the
+                // decomposed fallback (and, for DSV4, changes the kq mask types which the fused
+                // attention path cannot consume). Only treat the mismatch as "not supported" when
+                // the layer's device actually cannot run the op.
+                if (device_layer && ggml_backend_dev_supports_op(device_layer, node.tensor)) {
+                    LLAMA_LOG_WARN("%s: layer %d is assigned to device %s but %s "
+                            "is assigned to device %s; the layer device supports the op, keeping it enabled\n",
+                            func, node.il,
+                            ggml_backend_dev_name(device_layer),
+                            probe.name,
+                            device_fused ? ggml_backend_dev_name(device_fused) : "none");
+                    continue;
+                }
                 LLAMA_LOG_WARN("%s: layer %d is assigned to device %s but %s "
                         "is assigned to device %s (usually due to missing support)\n",
                         func, node.il,

@@ -704,7 +704,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_top_k_mask(
     ggml_tensor * top_k_3d = ggml_view_4d(ctx0, top_k, top_k->ne[0], top_k->ne[1], top_k->ne[3], 1,
             top_k->nb[1], top_k->nb[2], top_k->ne[3]*top_k->nb[3], 0);
 
-    ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32, 1, top_k_3d->ne[0], top_k_3d->ne[1], top_k_3d->ne[2]);
+    ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, kq_mask->type, 1, top_k_3d->ne[0], top_k_3d->ne[1], top_k_3d->ne[2]);
     zeros = ggml_fill(ctx0, zeros, 0.0f);
 
     ggml_tensor * kq_mask_top_k = ggml_set_rows(ctx0, kq_mask_all, zeros, top_k_3d);
@@ -747,6 +747,16 @@ ggml_tensor * llama_model_deepseek4::graph::build_attn_mha_2kv(
     }
     if (k2->type == GGML_TYPE_F32) {
         k2 = ggml_cast(ctx0, k2, GGML_TYPE_F16);
+    }
+
+    // ggml_flash_attn_ext requires an F16 mask. When flash attention is disabled
+    // (e.g. the fused-op probe resolved it off), the masks are built as F32 -
+    // cast them instead of tripping the assert in ggml_flash_attn_ext.
+    if (mask1 && mask1->type != GGML_TYPE_F16) {
+        mask1 = ggml_cast(ctx0, mask1, GGML_TYPE_F16);
+    }
+    if (mask2 && mask2->type != GGML_TYPE_F16) {
+        mask2 = ggml_cast(ctx0, mask2, GGML_TYPE_F16);
     }
 
     // DEBUG: keep the old 2kv op available for comparison (broken on CUDA, see above)
