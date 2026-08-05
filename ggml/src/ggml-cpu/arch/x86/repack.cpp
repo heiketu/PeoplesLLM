@@ -112,6 +112,12 @@ static inline int nearest_int(float fval) {
     return (i & 0x007fffff) - 0x00400000;
 }
 
+static inline int64_t ggml_load_i64_unaligned(const void * ptr) {
+    int64_t value;
+    memcpy(&value, ptr, sizeof(value));
+    return value;
+}
+
 #if defined(__AVX2__) || defined(__AVX512F__)
 #if defined(__AVX512F__)
 // add int16_t pairwise and return as 512 bit int vector, then add the accumulator
@@ -173,6 +179,27 @@ static inline __m256i mul_sum_i8_pairs_acc_int32x8(const __m256i acc, const __m2
     return mul_sum_us8_pairs_acc_int32x8(acc, ax, sy);
 #endif
 }
+
+static inline __m256 ggml_e8m0_half_to_f32x8(const uint8_t * x) {
+    const __m256i e = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *) x));
+    const __m256i normal = _mm256_slli_epi32(_mm256_sub_epi32(e, _mm256_set1_epi32(1)), 23);
+    const __m256i denormal = _mm256_sllv_epi32(_mm256_set1_epi32(0x00200000), e);
+    const __m256i is_normal = _mm256_cmpgt_epi32(e, _mm256_set1_epi32(1));
+    return _mm256_castsi256_ps(_mm256_blendv_epi8(denormal, normal, is_normal));
+}
+
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+static inline __m512 ggml_e8m0_half_to_f32x16(const uint8_t * x0, const uint8_t * x1) {
+    const __m128i packed = _mm_unpacklo_epi64(
+        _mm_loadl_epi64((const __m128i *) x0),
+        _mm_loadl_epi64((const __m128i *) x1));
+    const __m512i e = _mm512_cvtepu8_epi32(packed);
+    const __m512i normal = _mm512_slli_epi32(_mm512_sub_epi32(e, _mm512_set1_epi32(1)), 23);
+    const __m512i denormal = _mm512_sllv_epi32(_mm512_set1_epi32(0x00200000), e);
+    const __mmask16 is_normal = _mm512_cmpgt_epi32_mask(e, _mm512_set1_epi32(1));
+    return _mm512_castsi512_ps(_mm512_mask_blend_epi32(is_normal, denormal, normal));
+}
+#endif
 #endif
 
 void ggml_quantize_mat_q8_0_4x8(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
@@ -582,17 +609,9 @@ static void gemv_q4_b32_8x8_q8_0_lut_avx(int n, float * GGML_RESTRICT s, size_t 
                     const __m128i changemask = _mm_set_epi8(15, 14, 7, 6, 13, 12, 5, 4, 11, 10, 3, 2, 9, 8, 1, 0);
                     col_scale_f32 = GGML_F32Cx8_REARRANGE_LOAD(b_ptr[b].d, changemask);
                 } else if constexpr (std::is_same_v<block_tx8, block_mxfp4x8>) {
-                    // Load 8 E8M0 exponents and convert to float via LUT
-                    // Rearranged to match changemask order: 0,4,1,5,2,6,3,7
-                    col_scale_f32 = _mm256_set_ps(
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr[b].e[7]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr[b].e[3]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr[b].e[6]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr[b].e[2]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr[b].e[5]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr[b].e[1]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr[b].e[4]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr[b].e[0]));
+                    const __m256 scale = ggml_e8m0_half_to_f32x8(b_ptr[b].e);
+                    const __m256i order = _mm256_set_epi32(7, 3, 6, 2, 5, 1, 4, 0);
+                    col_scale_f32 = _mm256_permutevar8x32_ps(scale, order);
                 }
 
                 // Load and convert to FP32 scale from block_q8_0
@@ -764,24 +783,7 @@ static void gemm_q4_b32_8x8_q8_0_lut_avx(int n, float * GGML_RESTRICT s, size_t 
                         std::is_same_v<block_tx8, block_iq4_nlx8>) {
                     col_scale_f32 = GGML_F32Cx8x2_LOAD(b_ptr_0[b].d, b_ptr_1[b].d);
                 } else if constexpr (std::is_same_v<block_tx8, block_mxfp4x8>) {
-                    //TODO: simd-ify
-                    col_scale_f32 = _mm512_set_ps(
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_1[b].e[7]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_1[b].e[6]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_1[b].e[5]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_1[b].e[4]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_1[b].e[3]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_1[b].e[2]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_1[b].e[1]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_1[b].e[0]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_0[b].e[7]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_0[b].e[6]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_0[b].e[5]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_0[b].e[4]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_0[b].e[3]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_0[b].e[2]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_0[b].e[1]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_0[b].e[0]));
+                    col_scale_f32 = ggml_e8m0_half_to_f32x16(b_ptr_0[b].e, b_ptr_1[b].e);
                 }
 
                 // Process LHS in pairs of rows
@@ -975,24 +977,7 @@ static void gemm_q4_b32_8x8_q8_0_lut_avx(int n, float * GGML_RESTRICT s, size_t 
                         std::is_same_v<block_tx8, block_iq4_nlx8>) {
                     col_scale_f32 = GGML_F32Cx8x2_LOAD(b_ptr_0[b].d, b_ptr_1[b].d);
                 } else if constexpr (std::is_same_v<block_tx8, block_mxfp4x8>) {
-                    //TODO: simd-ify
-                    col_scale_f32 = _mm512_set_ps(
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_1[b].e[7]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_1[b].e[6]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_1[b].e[5]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_1[b].e[4]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_1[b].e[3]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_1[b].e[2]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_1[b].e[1]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_1[b].e[0]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_0[b].e[7]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_0[b].e[6]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_0[b].e[5]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_0[b].e[4]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_0[b].e[3]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_0[b].e[2]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_0[b].e[1]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr_0[b].e[0]));
+                    col_scale_f32 = ggml_e8m0_half_to_f32x16(b_ptr_0[b].e, b_ptr_1[b].e);
                 }
 
                 // Load the four blocks of quantized values interleaved with each other in chunks of eight - A0,A1,A2,A3
@@ -1176,15 +1161,7 @@ static void gemm_q4_b32_8x8_q8_0_lut_avx(int n, float * GGML_RESTRICT s, size_t 
                         std::is_same_v<block_tx8, block_iq4_nlx8>) {
                     col_scale_f32 = GGML_F32Cx8_LOAD(b_ptr[b].d);
                 } else if constexpr (std::is_same_v<block_tx8, block_mxfp4x8>) {
-                    col_scale_f32 = _mm256_set_ps(
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr[b].e[7]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr[b].e[6]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr[b].e[5]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr[b].e[4]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr[b].e[3]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr[b].e[2]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr[b].e[1]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr[b].e[0]));
+                    col_scale_f32 = ggml_e8m0_half_to_f32x8(b_ptr[b].e);
                 }
 
                 // Process LHS in groups of four
@@ -1346,15 +1323,7 @@ static void gemm_q4_b32_8x8_q8_0_lut_avx(int n, float * GGML_RESTRICT s, size_t 
                         std::is_same_v<block_tx8, block_iq4_nlx8>) {
                     col_scale_f32 = GGML_F32Cx8_LOAD(b_ptr[b].d);
                 } else if constexpr (std::is_same_v<block_tx8, block_mxfp4x8>) {
-                    col_scale_f32 = _mm256_set_ps(
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr[b].e[7]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr[b].e[6]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr[b].e[5]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr[b].e[4]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr[b].e[3]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr[b].e[2]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr[b].e[1]),
-                        GGML_CPU_E8M0_TO_FP32_HALF(b_ptr[b].e[0]));
+                    col_scale_f32 = ggml_e8m0_half_to_f32x8(b_ptr[b].e);
                 }
 
                 // Load the four blocks of quantized values interleaved with each other in chunks of eight - A0,A1,A2,A3
@@ -3111,7 +3080,8 @@ void ggml_gemv_iq1_s_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
                         _mm512_slli_epi64(_mm512_and_si512(_mm512_srlv_epi64(qh64, _mm512_set1_epi64(3 * l)), _mm512_set1_epi64(7)), 8));
                     const __m512i q1b = _mm512_add_epi8(_mm512_i64gather_epi64(idx, (const long long *)iq1s_grid, 8), mone8);
                     // dword lanes 2j/2j+1 aggregate col j's first/second 4 values of the entry
-                    dot = _mm512_dpbusd_epi32(dot, q1b, _mm512_set1_epi64(*(const long long *)(a_ptr[b].qs + 8 * e)));
+                    dot = _mm512_dpbusd_epi32(dot, q1b,
+                        _mm512_set1_epi64(ggml_load_i64_unaligned(a_ptr[b].qs + 8 * e)));
                 }
 
                 iacc8 = _mm256_dpwssd_epi32(iacc8, _mm512_cvtepi32_epi16(dot), ls8_pairs);
@@ -3227,9 +3197,9 @@ void ggml_gemv_iq1_m_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
                     _mm512_maskz_mov_epi64((__mmask8)~sm1, mtwo8));
 
                 __m512i dot = _mm512_dpbusd_epi32(_mm512_setzero_si512(), q1b0,
-                    _mm512_set1_epi64(*(const long long *)(a_ptr[b].qs + 16 * g)));
+                    _mm512_set1_epi64(ggml_load_i64_unaligned(a_ptr[b].qs + 16 * g)));
                 dot = _mm512_dpbusd_epi32(dot, q1b1,
-                    _mm512_set1_epi64(*(const long long *)(a_ptr[b].qs + 16 * g + 8)));
+                    _mm512_set1_epi64(ggml_load_i64_unaligned(a_ptr[b].qs + 16 * g + 8)));
 
                 iacc8 = _mm256_dpwssd_epi32(iacc8, _mm512_cvtepi32_epi16(dot), ls_pairs);
                 iacc8 = _mm256_add_epi32(iacc8, _mm256_mullo_epi32(dd32, _mm256_set1_epi32((int32_t)a_ptr[b].bsums[g])));
@@ -3337,7 +3307,8 @@ void ggml_gemv_iq2_xs_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const 
                     const __m512i q2b  = _mm512_i64gather_epi64(word, (const long long *)iq2xs_grid, 8);
                     const __mmask64 neg = _mm512_test_epi8_mask(_mm512_permutexvar_epi8(splat_sel_e[e], sb), bit_selector);
 
-                    const __m512i q8b = _mm512_set1_epi64(*(const long long *)(a_ptr[b].qs + 32 * g + 8 * e));
+                    const __m512i q8b = _mm512_set1_epi64(
+                        ggml_load_i64_unaligned(a_ptr[b].qs + 32 * g + 8 * e));
                     const __m512i q8s = _mm512_mask_sub_epi8(q8b, neg, _mm512_setzero_si512(), q8b);
 
                     const __m512i dot = _mm512_dpbusd_epi32(_mm512_setzero_si512(), q2b, q8s);
@@ -8811,7 +8782,7 @@ void ggml_gemm_iq1_s_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
                         __m512i dot = _mm512_setzero_si512();
                         for (int l = 0; l < 4; l++) {
                             dot = _mm512_dpbusd_epi32(dot, q1b[l],
-                                _mm512_set1_epi64(*(const long long *)(q8 + (l / 2) * 64 + (l % 2) * 32)));
+                                _mm512_set1_epi64(ggml_load_i64_unaligned(q8 + (l / 2) * 64 + (l % 2) * 32)));
                         }
 
                         iacc_rows[rp] = _mm256_dpwssd_epi32(iacc_rows[rp], _mm512_cvtepi32_epi16(dot), ls8_pairs);
@@ -8885,7 +8856,7 @@ void ggml_gemm_iq1_s_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
                         __m512i dot = _mm512_setzero_si512();
                         for (int l = 0; l < 4; l++) {
                             dot = _mm512_dpbusd_epi32(dot, q1b[l],
-                                _mm512_set1_epi64(*(const long long *)(q8 + (l / 2) * 64 + (l % 2) * 32)));
+                                _mm512_set1_epi64(ggml_load_i64_unaligned(q8 + (l / 2) * 64 + (l % 2) * 32)));
                         }
 
                         iacc_rows[rp] = _mm256_dpwssd_epi32(iacc_rows[rp], _mm512_cvtepi32_epi16(dot), ls8_pairs);
@@ -9033,9 +9004,9 @@ void ggml_gemm_iq1_m_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
                         const int8_t * q8 = ap->qs + g * 64 + m * 8;
 
                         __m512i dot = _mm512_dpbusd_epi32(_mm512_setzero_si512(), q1b0,
-                            _mm512_set1_epi64(*(const long long *)q8));
+                            _mm512_set1_epi64(ggml_load_i64_unaligned(q8)));
                         dot = _mm512_dpbusd_epi32(dot, q1b1,
-                            _mm512_set1_epi64(*(const long long *)(q8 + 32)));
+                            _mm512_set1_epi64(ggml_load_i64_unaligned(q8 + 32)));
 
                         iacc_rows[rp] = _mm256_dpwssd_epi32(iacc_rows[rp], _mm512_cvtepi32_epi16(dot), ls_pairs);
                         iacc_rows[rp] = _mm256_add_epi32(iacc_rows[rp], _mm256_mullo_epi32(dd32,
@@ -9118,9 +9089,9 @@ void ggml_gemm_iq1_m_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
                         const int8_t * q8 = a_ptr[b].qs + g * 64 + rp * 8;
 
                         __m512i dot = _mm512_dpbusd_epi32(_mm512_setzero_si512(), q1b0,
-                            _mm512_set1_epi64(*(const long long *)q8));
+                            _mm512_set1_epi64(ggml_load_i64_unaligned(q8)));
                         dot = _mm512_dpbusd_epi32(dot, q1b1,
-                            _mm512_set1_epi64(*(const long long *)(q8 + 32)));
+                            _mm512_set1_epi64(ggml_load_i64_unaligned(q8 + 32)));
 
                         iacc_rows[rp] = _mm256_dpwssd_epi32(iacc_rows[rp], _mm512_cvtepi32_epi16(dot), ls_pairs);
                         iacc_rows[rp] = _mm256_add_epi32(iacc_rows[rp], _mm256_mullo_epi32(dd32,
@@ -9245,7 +9216,8 @@ void ggml_gemm_iq2_xs_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const 
                         const int8_t * q8 = a_ptr[b].qs + g * 128 + m * 8;
 
                         for (int e = 0; e < 4; e++) {
-                            const __m512i q8b = _mm512_set1_epi64(*(const long long *)(q8 + (e / 2) * 64 + (e % 2) * 32));
+                            const __m512i q8b = _mm512_set1_epi64(
+                                ggml_load_i64_unaligned(q8 + (e / 2) * 64 + (e % 2) * 32));
                             const __m512i q8s = _mm512_mask_sub_epi8(q8b, neg[e], _mm512_setzero_si512(), q8b);
                             const __m512i dot = _mm512_dpbusd_epi32(_mm512_setzero_si512(), q2b[e], q8s);
                             iacc_rows[m] = _mm256_dpwssd_epi32(iacc_rows[m], _mm512_cvtepi32_epi16(dot), e < 2 ? ls1_pairs : ls2_pairs);
@@ -9345,8 +9317,8 @@ void ggml_gemm_iq3_xxs_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const
                     for (int m = 0; m < 4; m++) {
                         const int8_t * q8 = a_ptr[b].qs + g * 128 + m * 8;
                         q8v[m] = _mm512_broadcast_i64x4(_mm256_set_epi64x(
-                            *(const long long *)(q8 + 3 * 32), *(const long long *)(q8 + 2 * 32),
-                            *(const long long *)(q8 + 1 * 32), *(const long long *)(q8 + 0 * 32)));
+                            ggml_load_i64_unaligned(q8 + 3 * 32), ggml_load_i64_unaligned(q8 + 2 * 32),
+                            ggml_load_i64_unaligned(q8 + 1 * 32), ggml_load_i64_unaligned(q8 + 0 * 32)));
                     }
 
                     for (int p = 0; p < 4; p++) {
@@ -9602,4 +9574,3 @@ void ggml_gemm_q8_0_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
 
 #endif
 }
-

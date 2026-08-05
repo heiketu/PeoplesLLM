@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <random>
 #include <string>
 #include <vector>
@@ -29,6 +30,8 @@ extern "C" {
 void ggml_vec_dot_iq2_xs_q8_K (int n, float * s, size_t bs, const void * vx, size_t bx, const void * vy, size_t by, int nrc);
 void ggml_vec_dot_iq3_xxs_q8_K(int n, float * s, size_t bs, const void * vx, size_t bx, const void * vy, size_t by, int nrc);
 void quantize_row_q8_K(const float * x, void * y, int64_t k);
+void quantize_row_q8_0(const float * x, void * y, int64_t k);
+void ggml_gemm_mxfp4_8x8_q8_0(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc);
 }
 
 static std::mt19937 g_rng(1234);
@@ -76,6 +79,15 @@ static void fill_random_q2_K(block_q2_K * x, int64_t nblocks) {
             x[i].scales[k] = (uint8_t) urand();
         }
         for (int k = 0; k < QK_K/4; k++) {
+            x[i].qs[k] = (uint8_t) urand();
+        }
+    }
+}
+
+static void fill_random_mxfp4(block_mxfp4 * x, int64_t nblocks) {
+    for (int64_t i = 0; i < nblocks; ++i) {
+        x[i].e = (uint8_t) (118 + urand() % 10);
+        for (int k = 0; k < QK_MXFP4/2; ++k) {
             x[i].qs[k] = (uint8_t) urand();
         }
     }
@@ -248,47 +260,82 @@ static int test_gemm(const char * name, ggml_type type,
 // ---------------------------------------------------------------------------
 
 template <typename BLOCK>
-static int test_graph(const char * name, ggml_type type, void (*fill)(BLOCK *, int64_t), ggml_backend_t backend, int64_t ntok) {
-    printf("  %s end-to-end (repack buffer vs vec_dot, ntok=%lld)\n", name, (long long) ntok);
-    const int64_t ne00 = 1024;
-    const int64_t nb   = ne00 / QK_K;
-    const int64_t ne01 = 64;
+static int test_graph(const char * name, ggml_type type, void (*fill)(BLOCK *, int64_t), ggml_backend_t backend,
+                      int64_t ntok, bool test_prequantized = false,
+                      int64_t ne00 = 1024, int64_t ne01 = 64, int64_t nexp = 8, int64_t nids = 3) {
+    printf("  %s end-to-end (repack buffer vs vec_dot, k=%lld, m=%lld, experts=%lld, topk=%lld, ntok=%lld)\n",
+           name, (long long) ne00, (long long) ne01, (long long) nexp,
+           (long long) nids, (long long) ntok);
+    const int64_t nb   = ne00 / ggml_blck_size(type);
     // ntok >= 4 -> repack gemm path for mul_mat; ntok > 8 -> mul_mat_id large-batch
     // branch (gemm tiles + gather/scatter); ntok <= 8 -> mul_mat_id small-batch gemv
-    const int64_t nexp = 8;
-    const int64_t nids = 3;
 
     std::vector<BLOCK> plain(ne01 * nexp * nb);
     fill(plain.data(), (int64_t) plain.size());
 
     std::vector<float> xf(ne00 * ntok);
     for (auto & v : xf) v = frand();
+    std::vector<block_q8_0> xq((ne00 / QK8_0) * ntok);
+    for (int64_t i = 0; i < ntok; ++i) {
+        quantize_row_q8_0(xf.data() + i * ne00, xq.data() + i * ne00 / QK8_0, ne00);
+    }
+
+    int quant_bad = 0;
+    std::vector<block_q8_0x4> xq4;
+    if (test_prequantized) {
+        const int64_t q8_blocks = ne00 / QK8_0;
+        xq4.resize(q8_blocks * (ntok / 4));
+        for (int64_t group = 0; group < ntok / 4; ++group) {
+            block_q8_0x4 * interleaved = xq4.data() + group * q8_blocks;
+            ggml_quantize_mat_q8_0_4x8(xf.data() + group * 4 * ne00, interleaved, ne00);
+            for (int64_t block = 0; block < q8_blocks; ++block) {
+                for (int row = 0; row < 4; ++row) {
+                    const block_q8_0 & plain_q = xq[(group * 4 + row) * q8_blocks + block];
+                    quant_bad += interleaved[block].d[row] != plain_q.d;
+                    for (int chunk = 0; chunk < QK8_0 / 8; ++chunk) {
+                        quant_bad += memcmp(interleaved[block].qs + chunk * 32 + row * 8,
+                                            plain_q.qs + chunk * 8, 8) != 0;
+                    }
+                }
+            }
+        }
+        printf("    q8_0 row vs 4x8 interleave mismatches=%d %s\n",
+               quant_bad, quant_bad == 0 ? "OK" : "FAIL");
+    }
 
     std::vector<int32_t> ids(nids * ntok);
     for (auto & v : ids) v = (int32_t) (urand() % nexp);
 
-    repacked_weights rw = repack_via_buffer<BLOCK>(type, plain.data(), ne00, ne01, nexp);
+    repacked_weights rw_mmid = repack_via_buffer<BLOCK>(type, plain.data(), ne00, ne01, nexp);
+    repacked_weights rw_mm   = repack_via_buffer<BLOCK>(type, plain.data(), ne00, ne01);
 
-    const auto run = [&](bool use_repack, bool is_mmid, std::vector<float> & dst) {
+    const auto run = [&](bool use_repack, bool is_mmid, bool prequantized, std::vector<float> & dst) {
         ggml_context * ctx = ggml_init({ ggml_tensor_overhead() * 16 + ggml_graph_overhead(), nullptr, true });
         ggml_tensor * src0 = is_mmid ? ggml_new_tensor_3d(ctx, type, ne00, ne01, nexp)
                                      : ggml_new_tensor_2d(ctx, type, ne00, ne01);
-        ggml_tensor * src1 = is_mmid ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne00, 1, ntok)
-                                     : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne00, ntok);
+        const ggml_type src1_type = prequantized ? GGML_TYPE_Q8_0 : GGML_TYPE_F32;
+        ggml_tensor * src1 = is_mmid ? ggml_new_tensor_3d(ctx, src1_type, ne00, 1, ntok)
+                                     : ggml_new_tensor_2d(ctx, src1_type, ne00, ntok);
         ggml_tensor * out;
+        ggml_tensor * idst = nullptr;
         if (is_mmid) {
-            ggml_tensor * idst = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, nids, ntok);
+            idst = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, nids, ntok);
             out = ggml_mul_mat_id(ctx, src0, src1, idst);
-            ggml_backend_alloc_ctx_tensors(ctx, backend);
-            memcpy(idst->data, ids.data(), ids.size() * sizeof(int32_t));
         } else {
             out = ggml_mul_mat(ctx, src0, src1);
-            ggml_backend_alloc_ctx_tensors(ctx, backend);
         }
-        memcpy(src1->data, xf.data(), xf.size() * sizeof(float));
+        ggml_backend_buffer_t ctx_buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        if (idst != nullptr) {
+            memcpy(idst->data, ids.data(), ids.size() * sizeof(int32_t));
+        }
+        if (prequantized) {
+            memcpy(src1->data, xq.data(), ggml_nbytes(src1));
+        } else {
+            memcpy(src1->data, xf.data(), xf.size() * sizeof(float));
+        }
         if (use_repack) {
             // point src0 at the repacked weight buffer (same layout the model loader produces)
-            ggml_tensor * rt = rw.t;
+            ggml_tensor * rt = is_mmid ? rw_mmid.t : rw_mm.t;
             src0->buffer = rt->buffer;
             src0->data   = rt->data;
             src0->extra  = rt->extra;
@@ -303,19 +350,39 @@ static int test_graph(const char * name, ggml_type type, void (*fill)(BLOCK *, i
         }
         dst.resize(ggml_nelements(out));
         memcpy(dst.data(), out->data, ggml_nbytes(out));
+        ggml_backend_buffer_free(ctx_buffer);
         ggml_free(ctx);
     };
 
-    int bad = 0;
+    int bad = quant_bad;
     for (int is_mmid = 0; is_mmid <= 1; is_mmid++) {
         std::vector<float> a, b;
-        run(true,  is_mmid, a);
-        run(false, is_mmid, b);
+        run(true,  is_mmid, false, a);
+        run(false, is_mmid, false, b);
         bad += compare(is_mmid ? "mul_mat_id repack vs vec_dot" : "mul_mat repack vs vec_dot",
                        a.data(), b.data(), (int64_t) a.size(), 1e-5).n_bad;
+        if (test_prequantized && !is_mmid && ntok % 4 == 0) {
+            std::vector<float> direct(ne01 * ntok);
+            const size_t weight_row_size = ggml_row_size(type, ne00);
+            for (int64_t col = 0; col < ne01; col += 8) {
+                ggml_gemm_mxfp4_8x8_q8_0(ne00, direct.data() + col, ne01,
+                                          (const char *) rw_mm.t->data + col * weight_row_size,
+                                          xq4.data(), ntok, 8);
+            }
+            bad += compare("mul_mat direct kernel vs vec_dot",
+                           direct.data(), b.data(), (int64_t) b.size(), 1e-5).n_bad;
+        }
+    }
+    if (test_prequantized) {
+        std::vector<float> f32, q8;
+        run(true, true, false, f32);
+        run(true, true, true, q8);
+        bad += compare("mul_mat_id f32 vs prequantized q8_0",
+                       q8.data(), f32.data(), (int64_t) f32.size(), 0.0).n_bad;
     }
 
-    free_repacked(rw);
+    free_repacked(rw_mm);
+    free_repacked(rw_mmid);
     return bad;
 }
 
@@ -413,10 +480,84 @@ static void bench(const char * name, ggml_type type,
     free_repacked(rw);
 }
 
+template <typename BLOCK>
+static void bench_mmid_graph(const char * name, ggml_type type, int qk,
+                             void (*fill)(BLOCK *, int64_t), ggml_backend_t backend) {
+    const int64_t ne00 = 2048;
+    const int64_t ne01 = 2048;
+    const int64_t nexp = 32;
+    const int64_t nids = 8;
+    const int64_t ntok = 512;
+    const int n_warmup = 2;
+    const int n_iter = 7;
+
+    std::vector<BLOCK> plain(ne01*nexp*(ne00/qk));
+    fill(plain.data(), (int64_t) plain.size());
+    repacked_weights rw = repack_via_buffer<BLOCK>(type, plain.data(), ne00, ne01, nexp);
+
+    std::vector<float> xf(ne00*ntok);
+    for (auto & v : xf) {
+        v = frand();
+    }
+    std::vector<int32_t> ids(nids*ntok);
+    for (int64_t t = 0; t < ntok; ++t) {
+        for (int64_t id = 0; id < nids; ++id) {
+            ids[t*nids + id] = (int32_t) ((t*nids + id) % nexp);
+        }
+    }
+
+    ggml_context * ctx = ggml_init({ ggml_tensor_overhead()*16 + ggml_graph_overhead(), nullptr, true });
+    ggml_tensor * src0 = ggml_new_tensor_3d(ctx, type, ne00, ne01, nexp);
+    ggml_tensor * src1 = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne00, 1, ntok);
+    ggml_tensor * idst = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, nids, ntok);
+    ggml_tensor * out = ggml_mul_mat_id(ctx, src0, src1, idst);
+    ggml_backend_buffer_t ctx_buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+
+    memcpy(src1->data, xf.data(), xf.size()*sizeof(float));
+    memcpy(idst->data, ids.data(), ids.size()*sizeof(int32_t));
+    src0->buffer = rw.t->buffer;
+    src0->data   = rw.t->data;
+    src0->extra  = rw.t->extra;
+
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, out);
+    for (int i = 0; i < n_warmup; ++i) {
+        GGML_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
+    }
+
+    std::vector<double> samples;
+    samples.reserve(n_iter);
+    for (int i = 0; i < n_iter; ++i) {
+        const double t0 = now_s();
+        GGML_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
+        samples.push_back((now_s() - t0)*1e3);
+    }
+    std::sort(samples.begin(), samples.end());
+    printf("  %s MUL_MAT_ID graph: k=%lld m=%lld experts=%lld topk=%lld tokens=%lld median=%.3f ms min=%.3f ms\n",
+           name, (long long) ne00, (long long) ne01, (long long) nexp, (long long) nids,
+           (long long) ntok, samples[samples.size()/2], samples.front());
+
+    ggml_backend_buffer_free(ctx_buffer);
+    ggml_free(ctx);
+    free_repacked(rw);
+}
+
 // ---------------------------------------------------------------------------
 
 int main(int argc, char ** argv) {
     const bool do_bench = argc > 1 && std::string(argv[1]) == "bench";
+    const bool do_numa  = argc > 1 && std::string(argv[1]) == "numa";
+    const bool do_bench_mmid = argc > 1 && std::string(argv[1]) == "bench-mmid";
+    const bool do_model_shape = argc > 1 && std::string(argv[1]) == "model-shape";
+
+    if (do_numa || do_model_shape) {
+#if defined(_WIN32)
+        _putenv_s("GGML_NUMA_EP", "1");
+#else
+        setenv("GGML_NUMA_EP", "1", 1);
+#endif
+        ggml_numa_init(GGML_NUMA_STRATEGY_DISTRIBUTE);
+    }
 
     if (do_bench) {
         printf("== IQ2_XS ==\n");
@@ -425,6 +566,23 @@ int main(int argc, char ** argv) {
         printf("== IQ3_XXS ==\n");
         bench<block_iq3_xxs>("iq3_xxs", GGML_TYPE_IQ3_XXS, fill_random_iq3_xxs, ggml_vec_dot_iq3_xxs_q8_K,
                              ggml_gemv_iq3_xxs_8x8_q8_K, ggml_gemm_iq3_xxs_8x8_q8_K);
+        return 0;
+    }
+
+    if (do_bench_mmid) {
+        if (getenv("GGML_NUMA_EP") != nullptr) {
+            ggml_numa_init(GGML_NUMA_STRATEGY_DISTRIBUTE);
+        }
+        ggml_backend_register(ggml_backend_cpu_reg());
+        ggml_backend_t backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+        if (backend == nullptr) {
+            fprintf(stderr, "failed to init CPU backend\n");
+            return 1;
+        }
+        const int n_threads = argc > 2 ? atoi(argv[2]) : 72;
+        ggml_backend_cpu_set_n_threads(backend, n_threads);
+        bench_mmid_graph<block_mxfp4>("mxfp4", GGML_TYPE_MXFP4, QK_MXFP4, fill_random_mxfp4, backend);
+        ggml_backend_free(backend);
         return 0;
     }
 
@@ -448,13 +606,25 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "failed to init CPU backend\n");
         return 1;
     }
-    ggml_backend_cpu_set_n_threads(backend, 8);
+    const char * test_threads = getenv("TEST_REPACK_THREADS");
+    ggml_backend_cpu_set_n_threads(backend, test_threads ? std::max(1, atoi(test_threads)) : 8);
+
+    if (do_model_shape) {
+        // Keep the expert count bounded so this remains safe on development
+        // machines, while matching the model's k/m/top-k and prefill shape.
+        bad += test_graph<block_mxfp4>("mxfp4 model-shape", GGML_TYPE_MXFP4,
+                fill_random_mxfp4, backend, 512, true, 4096, 2048, 8, 6);
+        ggml_backend_free(backend);
+        printf(bad == 0 ? "ALL OK\n" : "FAILURES: %d\n", bad);
+        return bad == 0 ? 0 : 1;
+    }
 
     printf("== graph tests ==\n");
     for (int64_t ntok : { 8, 33 }) {
         bad += test_graph<block_iq2_xs>("iq2_xs", GGML_TYPE_IQ2_XS, fill_random_iq2_xs, backend, ntok);
         bad += test_graph<block_iq3_xxs>("iq3_xxs", GGML_TYPE_IQ3_XXS, fill_random_iq3_xxs, backend, ntok);
         bad += test_graph<block_q2_K>("q2_K", GGML_TYPE_Q2_K, fill_random_q2_K, backend, ntok);
+        bad += test_graph<block_mxfp4>("mxfp4", GGML_TYPE_MXFP4, fill_random_mxfp4, backend, ntok, true);
     }
 
     ggml_backend_free(backend);

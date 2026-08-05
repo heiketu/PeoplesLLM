@@ -57,8 +57,31 @@ struct repacked_weights {
     int64_t                  nbytes = 0;
 };
 
+bool repack_supported(ggml_type type, int nc, int k) {
+    struct ggml_init_params params = { 16 * 1024, nullptr, true };
+    ggml_context * ctx = ggml_init(params);
+    if (ctx == nullptr) {
+        return false;
+    }
+
+    ggml_tensor * tensor = ggml_new_tensor_2d(ctx, type, k, nc);
+    ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(
+        ggml_backend_cpu_repack_buffer_type(), ggml_nbytes(tensor));
+    if (buffer == nullptr) {
+        ggml_free(ctx);
+        return false;
+    }
+
+    ggml_backend_tensor_alloc(buffer, tensor, ggml_backend_buffer_get_base(buffer));
+    const bool supported = tensor->extra != nullptr;
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    return supported;
+}
+
 bool make_repacked(ggml_type type, const std::vector<float> & w, int nc, int k, repacked_weights & out) {
     const ggml_type_traits * traits = ggml_get_type_traits(type);
+    ggml_quantize_init(type);
 
     const size_t row_bytes = ggml_row_size(type, k);
     out.raw.resize(row_bytes * nc);
@@ -67,8 +90,8 @@ bool make_repacked(ggml_type type, const std::vector<float> & w, int nc, int k, 
             traits->from_float_ref(w.data() + (size_t) r * k, out.raw.data() + row_bytes * r, k);
         }
     } else {
-        // types without a from_float_ref row quantizer (IQ1_S/IQ1_M): go through
-        // ggml_quantize_chunk with a flat importance matrix
+        // Types without a from_float_ref row quantizer go through the initialized
+        // chunk quantizer with a flat importance matrix.
         const std::vector<float> imatrix((size_t) k, 1.0f);
         ggml_quantize_chunk(type, w.data(), out.raw.data(), 0, nc, k, imatrix.data());
     }
@@ -86,6 +109,12 @@ bool make_repacked(ggml_type type, const std::vector<float> & w, int nc, int k, 
         return false;
     }
     ggml_backend_tensor_alloc(out.buffer, out.tensor, ggml_backend_buffer_get_base(out.buffer));
+    if (out.tensor->extra == nullptr) {
+        ggml_backend_buffer_free(out.buffer);
+        ggml_free(out.ctx);
+        out = repacked_weights();
+        return false;
+    }
     ggml_backend_tensor_set(out.tensor, out.raw.data(), 0, out.raw.size());
 
     out.data = out.tensor->data;
@@ -248,7 +277,7 @@ void perf_type(const kernel_fns & fn, int nc, int k, int nr, int nthreads, int n
             std::vector<std::thread> ths;
             ths.reserve(slices.size());
             for (const auto & sl : slices) {
-                ths.emplace_back([&] { for (int i = 0; i < n_iter; i++) body(sl.first, sl.second); });
+                ths.emplace_back([&, sl] { for (int i = 0; i < n_iter; i++) body(sl.first, sl.second); });
             }
             for (auto & th : ths) th.join();
         }
@@ -304,12 +333,18 @@ int main(int argc, char ** argv) {
           ggml_gemm_iq1_s_8x8_q8_K, ggml_gemm_iq1_s_8x8_q8_K_generic },
         { GGML_TYPE_IQ1_M, "IQ1_M", ggml_vec_dot_iq1_m_q8_K, ggml_gemv_iq1_m_8x8_q8_K, ggml_gemv_iq1_m_8x8_q8_K_generic,
           ggml_gemm_iq1_m_8x8_q8_K, ggml_gemm_iq1_m_8x8_q8_K_generic },
+        { GGML_TYPE_IQ2_XS, "IQ2_XS", ggml_vec_dot_iq2_xs_q8_K, ggml_gemv_iq2_xs_8x8_q8_K, ggml_gemv_iq2_xs_8x8_q8_K_generic,
+          ggml_gemm_iq2_xs_8x8_q8_K, ggml_gemm_iq2_xs_8x8_q8_K_generic },
+        { GGML_TYPE_IQ3_XXS, "IQ3_XXS", ggml_vec_dot_iq3_xxs_q8_K, ggml_gemv_iq3_xxs_8x8_q8_K, ggml_gemv_iq3_xxs_8x8_q8_K_generic,
+          ggml_gemm_iq3_xxs_8x8_q8_K, ggml_gemm_iq3_xxs_8x8_q8_K_generic },
         { GGML_TYPE_Q4_0, "Q4_0", ggml_vec_dot_q4_0_q8_0, ggml_gemv_q4_0_8x8_q8_0, ggml_gemv_q4_0_8x8_q8_0_generic,
           ggml_gemm_q4_0_8x8_q8_0, ggml_gemm_q4_0_8x8_q8_0_generic, GGML_TYPE_Q8_0 },
         { GGML_TYPE_Q4_K, "Q4_K", ggml_vec_dot_q4_K_q8_K, ggml_gemv_q4_K_8x8_q8_K, ggml_gemv_q4_K_8x8_q8_K_generic,
           ggml_gemm_q4_K_8x8_q8_K, ggml_gemm_q4_K_8x8_q8_K_generic },
         { GGML_TYPE_Q6_K, "Q6_K", ggml_vec_dot_q6_K_q8_K, ggml_gemv_q6_K_8x8_q8_K, ggml_gemv_q6_K_8x8_q8_K_generic,
           ggml_gemm_q6_K_8x8_q8_K, ggml_gemm_q6_K_8x8_q8_K_generic },
+        { GGML_TYPE_IQ4_NL, "IQ4_NL", ggml_vec_dot_iq4_nl_q8_0, ggml_gemv_iq4_nl_8x8_q8_0, ggml_gemv_iq4_nl_8x8_q8_0_generic,
+          ggml_gemm_iq4_nl_8x8_q8_0, ggml_gemm_iq4_nl_8x8_q8_0_generic, GGML_TYPE_Q8_0 },
         { GGML_TYPE_MXFP4, "MXFP4", ggml_vec_dot_mxfp4_q8_0, ggml_gemv_mxfp4_8x8_q8_0, ggml_gemv_mxfp4_8x8_q8_0_generic,
           ggml_gemm_mxfp4_8x8_q8_0, ggml_gemm_mxfp4_8x8_q8_0_generic, GGML_TYPE_Q8_0 },
         // Q8_0 has no generic 8x8 kernels; native-vs-generic checks are skipped for it
@@ -326,6 +361,10 @@ int main(int argc, char ** argv) {
             printf("== shape nc=%d k=%d threads=%d ==\n", sh.nc, sh.k, nthreads);
             for (const auto & fn : types) {
                 if (!only.empty() && only != fn.name) continue;
+                if (!repack_supported(fn.type, sh.nc, sh.k)) {
+                    printf("  [%s] SKIPPED: no CPU_REPACK kernel for this build\n", fn.name);
+                    continue;
+                }
                 for (const int nr : nrs) {
                     const int64_t dots = (int64_t) sh.nc * nr;
                     const int n_iter = dots > 200000 ? 2 : (dots > 50000 ? 4 : 10);
@@ -336,7 +375,7 @@ int main(int argc, char ** argv) {
         return 0;
     }
 
-    if (!ggml_cpu_has_avx512() || !ggml_cpu_has_avx512_vnni() || !ggml_cpu_has_avx512_vbmi()) {
+    if (!ggml_cpu_has_avx512_vnni() || !ggml_cpu_has_avx512_vbmi()) {
         printf("WARNING: AVX512/VNNI/VBMI not available - native kernels fall back to generic,\n");
         printf("         native-vs-generic comparisons are vacuous on this machine\n");
     }
@@ -345,14 +384,23 @@ int main(int argc, char ** argv) {
     const std::vector<int> gemm_nrs = { 4, 8, 16, 20, 32 };
 
     for (const auto & fn : types) {
+        if (!repack_supported(fn.type, 512, 2048)) {
+            printf("[%s] SKIPPED: no CPU_REPACK kernel for this build\n", fn.name);
+            continue;
+        }
         printf("[%s] nc=512 k=2048 (main paths)\n", fn.name);
         ok &= test_type(fn, 512, 2048, gemm_nrs, false);
         printf("[%s] nc=8 k=2048 (256-bit tail column group only)\n", fn.name);
-        ok &= test_type(fn, 8, 2048, { 4, 16 }, false);
+        ok &= test_type(fn, 8, 2048, { 4, 8, 16 }, false);
         printf("[%s] nc=520 k=2048 (odd trailing 8-column group)\n", fn.name);
         ok &= test_type(fn, 520, 2048, { 4, 20 }, false);
+        if (fn.type == GGML_TYPE_MXFP4) {
+            printf("[%s] nc=64 k=1024 (small-batch model path)\n", fn.name);
+            ok &= test_type(fn, 64, 1024, { 8 }, false);
+        }
     }
 
     printf("%s\n", ok ? "ALL TESTS PASSED" : "TESTS FAILED");
+    ggml_quantize_free();
     return ok ? 0 : 1;
 }

@@ -4414,10 +4414,14 @@ void ggml_vec_dot_iq1_s_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
 
         __m512i sumi = _mm512_setzero_si512();
         for (int ib = 0; ib < QK_K/64; ib += 2) {
+            uint32_t qh0;
+            uint32_t qh1;
+            memcpy(&qh0, qh,     sizeof(qh0));
+            memcpy(&qh1, qh + 2, sizeof(qh1));
             __m512i idx0 = _mm512_cvtepu8_epi64(_mm_loadl_epi64((const __m128i *)qs));
-            idx0 = _mm512_ternarylogic_epi64(idx0, _mm512_srlv_epi64(_mm512_slli_epi64(_mm512_set1_epi64(*(const uint32_t *)qh), 8), ishift), m700, 0xF8);
+            idx0 = _mm512_ternarylogic_epi64(idx0, _mm512_srlv_epi64(_mm512_slli_epi64(_mm512_set1_epi64(qh0), 8), ishift), m700, 0xF8);
             __m512i idx1 = _mm512_cvtepu8_epi64(_mm_loadl_epi64((const __m128i *)(qs + 8)));
-            idx1 = _mm512_ternarylogic_epi64(idx1, _mm512_srlv_epi64(_mm512_slli_epi64(_mm512_set1_epi64(*(const uint32_t *)(qh + 2)), 8), ishift), m700, 0xF8);
+            idx1 = _mm512_ternarylogic_epi64(idx1, _mm512_srlv_epi64(_mm512_slli_epi64(_mm512_set1_epi64(qh1), 8), ishift), m700, 0xF8);
             const __m512i q1b_0 = _mm512_add_epi8(_mm512_i64gather_epi64(idx0, (const long long *)iq1s_grid, 8), mone8);
             const __m512i q1b_1 = _mm512_add_epi8(_mm512_i64gather_epi64(idx1, (const long long *)iq1s_grid, 8), mone8);
 

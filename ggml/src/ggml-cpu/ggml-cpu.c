@@ -1104,16 +1104,18 @@ void ggml_numa_bind_policy(void * ptr, size_t size, int node) {
 
 // Configure the hierarchical barrier for the given thread count. Called single-threaded from
 // ggml_graph_compute before workers start. Allocates the node-local counter lines once.
-// Opt-in via GGML_NUMA_HIER_BARRIER=1 (default off keeps the flat barrier), and only when NUMA
-// mirroring is on (threads are pinned per node, matching the block split used by
-// ggml_numa_node_for_thread); otherwise leaves the flat barrier in place.
+// Opt-in via GGML_NUMA_HIER_BARRIER=1 (default off keeps the flat barrier), and only when threads
+// are block-split across NUMA nodes by mirroring or NUMA EP; otherwise leaves the flat barrier in
+// place.
 static void ggml_numa_barrier_setup(int n_threads) {
     static int hier_enabled = -1;
     if (hier_enabled < 0) {
         const char * env = getenv("GGML_NUMA_HIER_BARRIER");
         hier_enabled = (env && atoi(env)) ? 1 : 0;
     }
-    if (!hier_enabled || g_state.numa.numa_strategy != GGML_NUMA_STRATEGY_MIRROR || g_state.numa.n_nodes < 2 || n_threads <= 1) {
+    const bool block_split = g_state.numa.numa_strategy == GGML_NUMA_STRATEGY_MIRROR ||
+        (g_state.numa.numa_strategy == GGML_NUMA_STRATEGY_DISTRIBUTE && ggml_cpu_numa_ep_active());
+    if (!hier_enabled || !block_split || g_state.numa.n_nodes < 2 || n_threads <= 1) {
         g_numa_barrier.active = 0;
         return;
     }
@@ -2203,6 +2205,9 @@ static void ggml_compute_forward_mul_mat_id(
     // row groups
     const int n_ids = ids->ne[0]; // n_expert_used
     const int n_as  = ne02;       // n_expert
+    const int expert_id_offset = ggml_get_op_params_i32(dst, 2);
+    const int expert_id_total  = ggml_get_op_params_i32(dst, 3);
+    const bool expert_slice = expert_id_total > n_as;
 
     void * wdata_cur = params->wdata;
 
@@ -2216,8 +2221,8 @@ static void ggml_compute_forward_mul_mat_id(
     struct mmid_row_mapping * matrix_rows = // [n_as][ids->ne[0]*ids->ne[1]]
         incr_ptr_aligned(&wdata_cur, n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping), sizeof(int64_t));
 
-    char (*atomic_current_chunk)[CACHE_LINE_SIZE] = // [n_as]
-        incr_ptr_aligned(&wdata_cur, CACHE_LINE_SIZE * n_as, CACHE_LINE_SIZE);
+    char (*atomic_row_claim)[GGML_NUMA_MAX_NODES][CACHE_LINE_SIZE] = // [n_as][node]
+        incr_ptr_aligned(&wdata_cur, CACHE_LINE_SIZE * n_as * GGML_NUMA_MAX_NODES, CACHE_LINE_SIZE);
 
     GGML_ASSERT(params->wsize >= (size_t)((char *) wdata_cur - (char *) params->wdata));
 
@@ -2267,53 +2272,96 @@ static void ggml_compute_forward_mul_mat_id(
             for (int id = 0; id < n_ids; ++id) {
                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
 
-                assert(i02 >= 0 && i02 < n_as);
+                if (expert_slice && (i02 < expert_id_offset || i02 >= expert_id_offset + n_as)) {
+                    memset((char *) dst->data + iid1*dst->nb[2] + id*dst->nb[1], 0, ne0*sizeof(float));
+                    continue;
+                }
 
-                MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
-                matrix_row_counts[i02] += 1;
+                const int32_t i02_local = i02 - expert_id_offset;
+                assert(i02_local >= 0 && i02_local < n_as);
+
+                MMID_MATRIX_ROW(i02_local, matrix_row_counts[i02_local]) = (struct mmid_row_mapping) {id, iid1};
+                matrix_row_counts[i02_local] += 1;
             }
         }
     }
 
-    // NUMA expert parallelism (GGML_NUMA_EP): two phases over the shared per-expert
-    // atomic chunk counters. Local phase: each thread claims chunks of the experts
-    // whose first half of rows is placed on its own node. Steal phase (only when the
-    // token count exceeds ggml_cpu_numa_ep_steal_min_tokens): threads then claim the
-    // remaining chunks of the other experts, so a fast node helps a slow one instead
-    // of idling; with few tokens the premature steals cost more than the static
-    // bubble, so the local phase runs alone (static per-node split).
-    // NOTE: expert weights are placed in per-node row windows (see
-    // llama_model::numa_ep_place_experts), so this expert-granular filter reads ~50%
-    // remote rows; the repack mul_mat_id path implements the matching row-window
-    // scheme. Results are unaffected (the expert weights are single-copy).
-    // Chunks are claimed atomically, each dst row has a single writer, and no barriers
-    // are needed inside the loops.
-    const bool ep = ggml_cpu_numa_ep_active();
+    // NUMA expert parallelism (GGML_NUMA_EP): match the model loader's row-window
+    // placement. Every node first claims rows from its local window of every selected
+    // expert. Large batches add a remote steal phase to smooth stragglers. Each output
+    // row has one writer, so no barrier is needed between phases.
+    // Keep the generic fallback aligned with the repack path's diagnostic bypass.
+    // Read the environment per operation instead of lazily initializing a shared
+    // static from worker threads.
+    const char * ep_claim_env = getenv("GGML_NUMA_EP_CLAIM");
+    const bool ep_claim = !ep_claim_env || atoi(ep_claim_env) != 0;
+    const bool ep = ggml_cpu_numa_ep_active() && ep_claim;
     const int ep_nodes = ep ? ggml_numa_node_count() : 1;
     const int ep_node = ep ? ggml_numa_node_for_thread(ith, nth) : 0;
     const int ep_phases = ep && ne12 > ggml_cpu_numa_ep_steal_min_tokens() ? 2 : 1;
 
-    // reset current_chunk
+    // Reset the counters. Non-EP scheduling uses window zero as its historical
+    // per-expert chunk counter.
     for (int cur_a = ith; cur_a < n_as; cur_a += nth) {
-        atomic_int * current_chunk_ctr = (atomic_int *)(atomic_current_chunk + cur_a);
-        *current_chunk_ctr = ep ? 0 : nth;
+        const int n_counters = ep ? ep_nodes : 1;
+        for (int w = 0; w < n_counters; ++w) {
+            atomic_int * ctr = (atomic_int *) &atomic_row_claim[cur_a][w][0];
+            *ctr = ep ? 0 : nth;
+        }
     }
 
     ggml_barrier(params->threadpool);
 
-    for (int phase = 0; phase < ep_phases; phase++) {
+    if (ep) {
+        const char * ep_chunk_env = getenv("GGML_NUMA_EP_CHUNK");
+        const int ep_chunk_value = ep_chunk_env ? atoi(ep_chunk_env) : (ne12 > 8 ? 64 : 16);
+        const int64_t ep_chunk = ep_chunk_value >= 16 && 128 % ep_chunk_value == 0 ? ep_chunk_value : 16;
+        const int64_t ep_win = ((ne01 + ep_nodes - 1)/ep_nodes + 127)/128*128;
+
+        for (int phase = 0; phase < ep_phases; ++phase) {
+            for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+                const int64_t cne1 = matrix_row_counts[cur_a];
+                if (cne1 == 0) {
+                    continue;
+                }
+
+                const char * src0_cur = src0_data + cur_a*nb02;
+                const void * wdata = src1->type == vec_dot_type ? src1->data : params->wdata;
+                const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+
+                for (int w = 0; w < ep_nodes; ++w) {
+                    if (phase == 0 ? w != ep_node : w == ep_node) {
+                        continue;
+                    }
+                    const int64_t w_lo = (int64_t) w*ep_win;
+                    const int64_t w_hi = MIN(w_lo + ep_win, ne01);
+                    if (w_lo >= w_hi) {
+                        continue;
+                    }
+
+                    atomic_int * ctr = (atomic_int *) &atomic_row_claim[cur_a][w][0];
+                    for (;;) {
+                        const int64_t r0 = w_lo + atomic_fetch_add_explicit(ctr, (int) ep_chunk, memory_order_relaxed);
+                        if (r0 >= w_hi) {
+                            break;
+                        }
+                        const int64_t r1 = MIN(r0 + ep_chunk, w_hi);
+                        ggml_compute_forward_mul_mat_id_one_chunk(
+                            dst, src0, src1, ids, cur_a,
+                            r0, r1, 0, cne1,
+                            src0_cur, matrix_rows, row_size, src1_cont, wdata);
+                    }
+                }
+            }
+        }
+        return;
+    }
+
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
         const int64_t cne1 = matrix_row_counts[cur_a];
 
         if (cne1 == 0) {
             continue;
-        }
-
-        if (ep) {
-            const bool is_local = (int) (cur_a * ep_nodes / n_as) == ep_node;
-            if (phase == 0 ? !is_local : is_local) {
-                continue; // handled in the other phase
-            }
         }
 
         const char * src0_cur = src0_data + cur_a * nb02;
@@ -2342,11 +2390,9 @@ static void ggml_compute_forward_mul_mat_id(
         const int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
         const int64_t dr1 = (nr1 + nchunk1 - 1) / nchunk1;
 
-        atomic_int * current_chunk_ctr = (atomic_int *)(atomic_current_chunk + cur_a);
+        atomic_int * current_chunk_ctr = (atomic_int *) &atomic_row_claim[cur_a][0][0];
 
-        // with NUMA EP all chunks are claimed from the shared counter; otherwise each
-        // thread starts from its own chunk index
-        int current_chunk = ep ? atomic_fetch_add_explicit(current_chunk_ctr, 1, memory_order_relaxed) : ith;
+        int current_chunk = ith;
 
         while (current_chunk < nchunk0 * nchunk1) {
             const int64_t ith0 = current_chunk % nchunk0;
@@ -2370,7 +2416,6 @@ static void ggml_compute_forward_mul_mat_id(
 
             current_chunk = atomic_fetch_add_explicit(current_chunk_ctr, 1, memory_order_relaxed);
         }
-    }
     }
 }
 
@@ -3501,6 +3546,59 @@ void ggml_threadpool_resume(struct ggml_threadpool * threadpool) {
 #endif
 }
 
+static bool ggml_cpu_disable_fusion = false;  // initialized once in ggml_cpu_init(), read-only afterwards
+static bool ggml_cpu_numa_moe_gate_up_parallel = false;
+
+// DSV4-style MoE gate/up projections are independent branches which meet at
+// GLU.  With two NUMA nodes and row-window EP enabled, each socket can split its
+// local workers between the two projections while every worker continues to
+// read only its node-local half of the corresponding expert tensor.
+static bool ggml_cpu_can_fuse_numa_moe_gate_up(
+        const struct ggml_cgraph * cgraph,
+        int node_n,
+        int n_threads) {
+    if (!ggml_cpu_numa_moe_gate_up_parallel || !ggml_cpu_numa_ep_active() ||
+            ggml_numa_node_count() != 2 || n_threads < 8 || n_threads % 4 != 0 ||
+            node_n + 5 > cgraph->n_nodes) {
+        return false;
+    }
+
+    const enum ggml_op ops[] = {
+        GGML_OP_MUL_MAT_ID, GGML_OP_CLAMP,
+        GGML_OP_MUL_MAT_ID, GGML_OP_CLAMP,
+        GGML_OP_GLU,
+    };
+    const int outputs[] = { node_n + 4 };
+    if (!ggml_can_fuse_subgraph(cgraph, node_n, 5, ops, outputs, 1)) {
+        return false;
+    }
+
+    const struct ggml_tensor * gate       = cgraph->nodes[node_n + 0];
+    const struct ggml_tensor * gate_clamp = cgraph->nodes[node_n + 1];
+    const struct ggml_tensor * up         = cgraph->nodes[node_n + 2];
+    const struct ggml_tensor * up_clamp   = cgraph->nodes[node_n + 3];
+    const struct ggml_tensor * glu        = cgraph->nodes[node_n + 4];
+
+    // Restrict the first implementation to the repacked small-batch path with
+    // identical routing.  Other quantizations, larger batches and non-DSV4 GLU
+    // layouts keep the normal sequential executor.
+    if (gate->src[0] == NULL || up->src[0] == NULL ||
+            gate->src[0]->extra == NULL || up->src[0]->extra == NULL ||
+            gate->src[1] != up->src[1] || gate->src[2] != up->src[2] ||
+            gate->src[2] == NULL || gate->src[2]->ne[1] > 8 ||
+            gate_clamp->src[0] != gate || up_clamp->src[0] != up ||
+            !((glu->src[0] == gate_clamp && glu->src[1] == up_clamp) ||
+              (glu->src[0] == up_clamp && glu->src[1] == gate_clamp))) {
+        return false;
+    }
+
+    size_t gate_work = 0;
+    size_t up_work = 0;
+    const int team_threads = n_threads / 2;
+    return ggml_cpu_extra_work_size(team_threads, gate, &gate_work) &&
+           ggml_cpu_extra_work_size(team_threads, up, &up_work);
+}
+
 struct ggml_cplan ggml_graph_plan(
           const struct ggml_cgraph * cgraph,
                                int   n_threads,
@@ -3592,8 +3690,8 @@ struct ggml_cplan ggml_graph_plan(
                         cur += n_as * sizeof(int64_t) + sizeof(int64_t);
                         // matrix_rows
                         cur += n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping) + sizeof(int64_t);
-                        // atomic_current_chunk
-                        cur += CACHE_LINE_SIZE*n_as + CACHE_LINE_SIZE;
+                        // per-expert, per-NUMA-window row claim counters
+                        cur += CACHE_LINE_SIZE*n_as*GGML_NUMA_MAX_NODES + CACHE_LINE_SIZE;
                     } break;
                 case GGML_OP_OUT_PROD:
                     {
@@ -3727,6 +3825,16 @@ struct ggml_cplan ggml_graph_plan(
         }
 
         work_size = MAX(work_size, cur);
+
+        if (ggml_cpu_can_fuse_numa_moe_gate_up(cgraph, i, n_threads)) {
+            size_t gate_work = 0;
+            size_t up_work = 0;
+            const int team_threads = n_threads / 2;
+            GGML_ASSERT(ggml_cpu_extra_work_size(team_threads, cgraph->nodes[i + 0], &gate_work));
+            GGML_ASSERT(ggml_cpu_extra_work_size(team_threads, cgraph->nodes[i + 2], &up_work));
+            const size_t pair_work = GGML_PAD(gate_work, CACHE_LINE_SIZE) + up_work;
+            work_size = MAX(work_size, pair_work);
+        }
     }
 
     if (work_size > 0) {
@@ -3744,8 +3852,6 @@ struct ggml_cplan ggml_graph_plan(
 
 // Try to fuse the current node with subsequent nodes for better performance.
 // Returns the number of nodes skipped by fusion (>=1), or 0 if no fusion was applied.
-static bool ggml_cpu_disable_fusion = false;  // initialized once in ggml_cpu_init(), read-only afterwards
-
 static int ggml_cpu_try_fuse_ops(
         const struct ggml_cgraph * cgraph,
         const int node_n,
@@ -3757,6 +3863,52 @@ static int ggml_cpu_try_fuse_ops(
     }
 
     struct ggml_tensor * node = cgraph->nodes[node_n];
+
+    if (ggml_cpu_can_fuse_numa_moe_gate_up(cgraph, node_n, params->nth)) {
+        struct ggml_tensor * gate       = cgraph->nodes[node_n + 0];
+        struct ggml_tensor * gate_clamp = cgraph->nodes[node_n + 1];
+        struct ggml_tensor * up         = cgraph->nodes[node_n + 2];
+        struct ggml_tensor * up_clamp   = cgraph->nodes[node_n + 3];
+        struct ggml_tensor * glu        = cgraph->nodes[node_n + 4];
+
+        const int node_threads = params->nth / 2;
+        const int team_node_threads = node_threads / 2;
+        const int numa_node = params->ith / node_threads;
+        const int node_rank = params->ith % node_threads;
+        const bool gate_team = node_rank < team_node_threads;
+
+        struct ggml_compute_params team_params = *params;
+        team_params.nth = params->nth / 2;
+        team_params.ith = numa_node * team_node_threads +
+            (gate_team ? node_rank : node_rank - team_node_threads);
+
+        size_t gate_work = 0;
+        size_t up_work = 0;
+        GGML_ASSERT(ggml_cpu_extra_work_size(team_params.nth, gate, &gate_work));
+        GGML_ASSERT(ggml_cpu_extra_work_size(team_params.nth, up, &up_work));
+        const size_t up_offset = GGML_PAD(gate_work, CACHE_LINE_SIZE);
+        GGML_ASSERT(params->wsize >= up_offset + up_work);
+
+        if (gate_team) {
+            team_params.wsize = gate_work;
+            ggml_compute_forward(&team_params, gate);
+        } else {
+            team_params.wdata = (char *) params->wdata + up_offset;
+            team_params.wsize = up_work;
+            ggml_compute_forward(&team_params, up);
+        }
+
+        // A team partitions the complete projection output, so no clamp may
+        // start until every member of that team has finished its MMID rows.
+        ggml_barrier(params->threadpool);
+        ggml_compute_forward(&team_params, gate_team ? gate_clamp : up_clamp);
+
+        // GLU consumes both clamped branches and returns to the full thread set.
+        ggml_barrier(params->threadpool);
+        struct ggml_compute_params full_params = *params;
+        ggml_compute_forward(&full_params, glu);
+        return 4;
+    }
 
     if (node->op == GGML_OP_RMS_NORM) {
         // RMS_NORM + MUL fusion
@@ -5209,6 +5361,10 @@ void ggml_cpu_init(void) {
         {
             const char * env = getenv("GGML_CPU_DISABLE_FUSION");
             ggml_cpu_disable_fusion = (env != NULL && atoi(env) == 1);
+        }
+        {
+            const char * env = getenv("GGML_NUMA_EP_GATE_UP_PARALLEL");
+            ggml_cpu_numa_moe_gate_up_parallel = env != NULL && atoi(env) != 0;
         }
 
         ggml_cpu_chain_init_thresholds();

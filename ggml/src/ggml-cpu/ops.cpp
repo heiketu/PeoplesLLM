@@ -8550,8 +8550,10 @@ static void ggml_compute_forward_top_k_f32(
 
         std::copy(tmp, tmp + top_k, dst_data);
 
-        // emphasize that the order is not important
-        if (top_k > 1) {
+        if (ggml_get_op_params_i32(dst, 0) != 0) {
+            std::sort(dst_data, dst_data + top_k);
+        // Emphasize that the default top-k order is not part of the contract.
+        } else if (top_k > 1) {
             std::swap(dst_data[0], dst_data[1]);
         }
     }
@@ -8591,11 +8593,18 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
     // optional second KV segment (ggml_flash_attn_ext_2kv): rows of k2/v2 follow the rows
     // of k1/v1 in the attention sequence, replacing a full-KV concat
-    const ggml_tensor * k2 = dst->src[5];
+    const ggml_tensor * src5 = dst->src[5];
     const ggml_tensor * v2 = dst->src[6];
     const ggml_tensor * mask2 = dst->src[7];
+    const ggml_tensor * sparse_idx = src5 && !v2 ? src5 : NULL;
+    const bool sparse_2kv = sparse_idx && dst->src[8] && dst->src[9];
+    const ggml_tensor * k2 = sparse_2kv ? dst->src[8] : v2 ? src5 : NULL;
+    v2 = sparse_2kv ? dst->src[9] : v2;
     const bool two_kv = (k2 != NULL);
+    const ggml_tensor * sparse_mask = sparse_idx ? mask2 : NULL;
+    mask2 = two_kv && !sparse_2kv ? mask2 : NULL;
     const int64_t n_kv1 = two_kv ? k->ne[1] : 0;
+    const int64_t n_raw = sparse_idx ? mask->ne[0] : 0;
 
     // NUMA mirror: read K/V from this thread's node-local copy (k/v are views of the mirrored
     // cache tensors; falls back to ->data when KV mirroring is inactive).
@@ -8708,6 +8717,10 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
         const ggml_fp16_t * mp = mask ? (ggml_fp16_t *)((char *) mask->data + iq1*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) : NULL;
         const ggml_fp16_t * mp2 = mask2 ? (ggml_fp16_t *)((char *) mask2->data + iq1*mask2->nb[1] + (iq2%mask2->ne[2])*mask2->nb[2] + (iq3%mask2->ne[3])*mask2->nb[3]) : NULL;
+        const ggml_fp16_t * sparse_mp = sparse_mask ? (ggml_fp16_t *)((char *) sparse_mask->data +
+                iq1*sparse_mask->nb[1] + (iq3%sparse_mask->ne[3])*sparse_mask->nb[3]) : NULL;
+        const int32_t * sparse_rows = sparse_idx ? (const int32_t *) ((const char *) sparse_idx->data +
+                iq1*sparse_idx->nb[1] + iq3*sparse_idx->nb[3]) : NULL;
 
         // k indices
         const int ik3 = iq3 / rk3;
@@ -8725,10 +8738,16 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         // ref: https://arxiv.org/pdf/2112.05682.pdf
 
         for (int64_t ic = ic_start; ic < ic_end; ++ic) {
-            const bool seg2 = two_kv && (ic >= n_kv1);
-            const int64_t icr = seg2 ? ic - n_kv1 : ic;
-            const float mv = seg2 ? (mp2 ? slope*GGML_CPU_FP16_TO_FP32(mp2[icr]) : 0.0f)
-                                  : (mp  ? slope*GGML_CPU_FP16_TO_FP32(mp [ic]) : 0.0f);
+            const bool sparse_seg2 = sparse_2kv && ic >= n_raw;
+            const bool seg2 = sparse_seg2 || (two_kv && !sparse_2kv && ic >= n_kv1);
+            const int64_t sparse_row = sparse_rows && ic >= n_raw ? sparse_rows[ic - n_raw] : 0;
+            const int64_t icr = sparse_seg2 ? sparse_row : seg2 ? ic - n_kv1 : ic;
+            const int64_t physical_row = sparse_rows && ic >= n_raw && !sparse_2kv ?
+                n_raw + sparse_row : ic;
+            const float mv = sparse_seg2 ? slope*GGML_CPU_FP16_TO_FP32(sparse_mp[sparse_row]) :
+                seg2 ? (mp2 ? slope*GGML_CPU_FP16_TO_FP32(mp2[icr]) : 0.0f) :
+                sparse_rows && ic >= n_raw ? slope*GGML_CPU_FP16_TO_FP32(sparse_mp[sparse_rows[ic - n_raw]]) :
+                mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
             if (mv == -INFINITY) {
                 continue;
             }
@@ -8736,7 +8755,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             float s; // KQ value
 
             const char * k_data = seg2 ? k2_base + (icr*k2->nb[1] + ik2*k2->nb[2] + ik3*k2->nb[3])
-                                       : k_base  + (ic *nbk1      + ik2*nbk2      + ik3*nbk3);
+                                       : k_base  + (physical_row*nbk1 + ik2*nbk2 + ik3*nbk3);
             kq_vec_dot(DK, &s, 0, k_data, 0, Q_q, 0, 1);
 
             s = s*scale; // scale KQ value
@@ -8753,7 +8772,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             float vs = 1.0f; // post-softmax KQ value, expf(s - M)
 
             const char * v_data = seg2 ? (v2_base + (icr*v2->nb[1] + iv2*v2->nb[2] + iv3*v2->nb[3]))
-                                       : (v_base  + (ic *nbv1      + iv2*nbv2      + iv3*nbv3));
+                                       : (v_base  + (physical_row*nbv1 + iv2*nbv2 + iv3*nbv3));
 
             if (v->type == GGML_TYPE_F16) {
                 if (s > M) {
@@ -9151,8 +9170,12 @@ static void ggml_flash_attn_ext_reduce_partials(
 
     const int64_t DK        = k->ne[0];
     const int64_t DV        = v->ne[0];
-    // include the optional second KV segment (ggml_flash_attn_ext_2kv) in the total row count
-    const int64_t nek1      = k->ne[1] + (dst->src[5] ? dst->src[5]->ne[1] : 0);
+    // Include an optional second KV segment. Sparse attention also uses src[5],
+    // but its logical row count is already represented by k->ne[1].
+    const bool sparse_2kv   = dst->src[5] && !dst->src[6] && dst->src[8] && dst->src[9];
+    const bool two_kv       = dst->src[5] && dst->src[6];
+    const int64_t nek1      = k->ne[1] + (sparse_2kv ? dst->src[5]->ne[0] :
+        two_kv ? dst->src[5]->ne[1] : 0);
     const int64_t n_q_heads = q->ne[2];
 
     const int ith = params->ith;
@@ -9258,9 +9281,12 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     // When use_ref is set, force the vec-only reference implementation (no tiling, no KV-chunking)
     const bool use_ref = params->use_ref;
 
-    const ggml_tensor * k2 = dst->src[5];
+    const bool sparse = dst->src[5] && !dst->src[6];
+    const bool sparse_2kv = sparse && dst->src[8] && dst->src[9];
+    const ggml_tensor * k2 = sparse_2kv ? dst->src[8] : dst->src[6] ? dst->src[5] : NULL;
     const bool two_kv = (k2 != NULL);
-    const int64_t nek1_total = two_kv ? nek1 + k2->ne[1] : nek1;
+    const int64_t nek1_total = sparse_2kv ? nek1 + dst->src[5]->ne[0] :
+        two_kv ? nek1 + k2->ne[1] : nek1;
 
     const bool kv_is_f32_or_f16 = (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
     const bool use_split_kv_path = !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1_total >= 512;
@@ -9321,7 +9347,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
 
         static constexpr int64_t Q_TILE_SZ  = ggml_fa_tile_config::Q;
         // the tiled prefill path does not support the two-segment KV layout
-        bool use_tiled = !use_ref && !two_kv &&
+        bool use_tiled = !use_ref && !two_kv && !sparse &&
                                (q->type == GGML_TYPE_F32 &&
                                 kv_is_f32_or_f16 &&
                                 k->type == v->type &&
