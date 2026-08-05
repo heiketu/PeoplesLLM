@@ -88,7 +88,9 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <regex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
@@ -754,6 +756,147 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 }
 
 
+// resident f16/bf16 weight materialization (opt-in, default off)
+//
+// GGML_CUDA_RESIDENT_BF16=1: when quantized weights are uploaded to a CUDA
+// device buffer, dequantize matching tensors to f16 (or bf16) in VRAM instead
+// so their MUL_MAT runs through the f16/bf16 (mmf/mmvf/cuBLAS) path rather
+// than MMQ. Only 2D leaf weights match; 3D expert stacks, compute buffers and
+// host (pinned) expert buffers are never touched.
+// GGML_CUDA_RESIDENT_BF16_TENSORS: optional regex restricting tensor names.
+// GGML_CUDA_RESIDENT_BF16_TYPE: "f16" (default) or "bf16".
+
+struct ggml_cuda_resident_bf16_cfg {
+    bool        enabled = false;
+    ggml_type   target = GGML_TYPE_F16;
+    bool        has_pattern = false;
+    std::regex  pattern;
+};
+
+static const ggml_cuda_resident_bf16_cfg & ggml_cuda_resident_bf16_get_cfg() {
+    static const ggml_cuda_resident_bf16_cfg cfg = []() {
+        ggml_cuda_resident_bf16_cfg c;
+        const char * env = getenv("GGML_CUDA_RESIDENT_BF16");
+        c.enabled = env != nullptr && atoi(env) != 0;
+        const char * type = getenv("GGML_CUDA_RESIDENT_BF16_TYPE");
+        if (type != nullptr && strcmp(type, "bf16") == 0) {
+            c.target = GGML_TYPE_BF16;
+        }
+        const char * pattern = getenv("GGML_CUDA_RESIDENT_BF16_TENSORS");
+        if (pattern != nullptr && pattern[0] != '\0') {
+            c.has_pattern = true;
+            c.pattern = std::regex(pattern);
+        }
+        return c;
+    }();
+    return cfg;
+}
+
+static bool ggml_cuda_resident_bf16_match(const ggml_tensor * tensor) {
+    const ggml_cuda_resident_bf16_cfg & cfg = ggml_cuda_resident_bf16_get_cfg();
+    if (!cfg.enabled) {
+        return false;
+    }
+    if (tensor->op != GGML_OP_NONE || tensor->view_src != nullptr) {
+        return false;
+    }
+    if (!ggml_is_quantized(tensor->type)) {
+        return false;
+    }
+    // 3D expert stacks stay on the MMQ/MMQ_ID path
+    if (tensor->ne[2] != 1 || tensor->ne[3] != 1) {
+        return false;
+    }
+    if (cfg.has_pattern && !std::regex_search(tensor->name, cfg.pattern)) {
+        return false;
+    }
+    return true;
+}
+
+struct ggml_cuda_resident_bf16_staging {
+    std::vector<uint8_t> data;
+    size_t               received = 0;
+};
+
+static std::mutex g_resident_bf16_mutex;
+static std::unordered_map<ggml_tensor *, ggml_cuda_resident_bf16_staging> g_resident_bf16_staging;
+
+static void ggml_cuda_resident_bf16_finalize(ggml_tensor * tensor, const uint8_t * host_q, int device, cudaStream_t stream, bool synchronize) {
+    const ggml_cuda_resident_bf16_cfg & cfg = ggml_cuda_resident_bf16_get_cfg();
+    const ggml_type qtype = tensor->type;
+    const int64_t   ne0   = tensor->ne[0];
+    const int64_t   nrows = tensor->ne[1];
+
+    const ggml_type_traits * qtraits = ggml_get_type_traits(qtype);
+    const ggml_type_traits * ttraits = ggml_get_type_traits(cfg.target);
+    const ggml_from_float_t from_float = ttraits->from_float_ref;
+    GGML_ASSERT(qtraits->to_float != nullptr && from_float != nullptr);
+
+    const size_t row_q = ggml_row_size(qtype, ne0);
+    const size_t row_t = ggml_row_size(cfg.target, ne0);
+
+    std::vector<uint8_t> host_t(row_t*nrows);
+    std::vector<float> row_f32(ne0);
+    for (int64_t r = 0; r < nrows; ++r) {
+        qtraits->to_float(host_q + r*row_q, row_f32.data(), ne0);
+        from_float(row_f32.data(), host_t.data() + r*row_t, ne0);
+    }
+
+    ggml_cuda_set_device(device);
+    CUDA_CHECK(cudaMemcpyAsync(tensor->data, host_t.data(), host_t.size(), cudaMemcpyHostToDevice, stream));
+    if (synchronize) {
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+
+    tensor->type  = cfg.target;
+    tensor->nb[0] = ggml_element_size(tensor);
+    for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+        tensor->nb[i] = tensor->nb[i-1]*tensor->ne[i-1];
+    }
+
+    static std::atomic<int64_t> total_q{0};
+    static std::atomic<int64_t> total_t{0};
+    total_q += (int64_t) (row_q*nrows);
+    total_t += (int64_t) (row_t*nrows);
+    GGML_LOG_INFO("%s: %s %s -> %s (%.2f -> %.2f MiB), cumulative %.2f -> %.2f MiB\n", __func__,
+        tensor->name, ggml_type_name(qtype), ggml_type_name(cfg.target),
+        row_q*nrows/1024.0/1024.0, row_t*nrows/1024.0/1024.0,
+        total_q.load()/1024.0/1024.0, total_t.load()/1024.0/1024.0);
+}
+
+// consume a host->device weight upload chunk for a matched tensor; returns
+// true if the tensor matched (caller must not do the raw copy)
+static bool ggml_cuda_resident_bf16_set(ggml_tensor * tensor, const void * data, size_t offset, size_t size, int device, cudaStream_t stream, bool synchronize) {
+    if (!ggml_cuda_resident_bf16_match(tensor)) {
+        return false;
+    }
+    const size_t nbytes_q = ggml_nbytes(tensor); // type is still the quantized one here
+    GGML_ASSERT(offset + size <= nbytes_q);
+    if (offset == 0 && size == nbytes_q) {
+        ggml_cuda_resident_bf16_finalize(tensor, (const uint8_t *) data, device, stream, synchronize);
+        return true;
+    }
+    // chunked async upload: accumulate, finalize on the last chunk
+    std::vector<uint8_t> staging;
+    {
+        std::lock_guard<std::mutex> lock(g_resident_bf16_mutex);
+        auto & entry = g_resident_bf16_staging[tensor];
+        if (entry.data.empty()) {
+            entry.data.resize(nbytes_q);
+        }
+        memcpy(entry.data.data() + offset, data, size);
+        entry.received += size;
+        if (entry.received < nbytes_q) {
+            return true;
+        }
+        staging.swap(entry.data);
+        g_resident_bf16_staging.erase(tensor);
+    }
+    ggml_cuda_resident_bf16_finalize(tensor, staging.data(), device, stream, synchronize);
+    return true;
+}
+
+
 // cuda buffer
 
 struct ggml_backend_cuda_buffer_context {
@@ -793,7 +936,8 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
         return GGML_STATUS_SUCCESS;
     }
 
-    if (ggml_is_quantized(tensor->type) && tensor->view_src == nullptr && ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+    if (ggml_is_quantized(tensor->type) && tensor->view_src == nullptr && ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE
+            && !ggml_cuda_resident_bf16_match(tensor)) {
         // initialize padding to 0 to avoid possible NaN values
         const size_t original_size = ggml_nbytes(tensor);
         const size_t padded_size = ggml_backend_buft_get_alloc_size(buffer->buft, tensor);
@@ -817,6 +961,10 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
 static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
+    if (ggml_cuda_resident_bf16_set(tensor, data, offset, size, ctx->device, cudaStreamPerThread, true)) {
+        return;
+    }
+
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
@@ -833,6 +981,8 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
 static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data,
         size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+
+    GGML_ASSERT(!ggml_cuda_resident_bf16_match(tensor) && "resident-bf16 tensors do not support 2d uploads");
 
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemcpy2DAsync(
@@ -940,6 +1090,10 @@ static size_t ggml_backend_cuda_buffer_type_get_alignment(ggml_backend_buffer_ty
 
 static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
     ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *) buft->context;
+
+    if (ggml_cuda_resident_bf16_match(tensor)) {
+        return ggml_row_size(ggml_cuda_resident_bf16_get_cfg().target, tensor->ne[0])*tensor->ne[1];
+    }
 
     size_t size = tensor->op == GGML_OP_FLASH_ATTN_EXT
         ? ggml_cuda_flash_attn_ext_get_alloc_size(buft_ctx->device, tensor)
@@ -2515,6 +2669,10 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    if (ggml_cuda_resident_bf16_set(tensor, data, offset, size, cuda_ctx->device, cuda_ctx->stream(), false)) {
+        return;
+    }
+
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
 
@@ -2660,6 +2818,7 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+    GGML_ASSERT(!ggml_cuda_resident_bf16_match(tensor) && "resident-bf16 tensors do not support 2d uploads");
 
     CUDA_CHECK(cudaMemcpy2DAsync(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cuda_ctx->stream()));

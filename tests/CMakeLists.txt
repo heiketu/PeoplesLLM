@@ -344,6 +344,10 @@ if (GGML_CUDA)
 endif()
 llama_test(test-layer-major LABEL model)
 
+# standalone correctness harness for GGML_CUDA_RESIDENT_BF16 resident f16/bf16
+# weight materialization in the CUDA device buffer
+llama_build(test-resident-bf16.cpp)
+
 # standalone numerical tests + microbenchmarks for the 8x8 repack matmul kernels
 # (Q2_K / Q5_K x Q8_K); needs the internal ggml-cpu repack headers and symbols
 if (NOT LLAMA_USE_SYSTEM_GGML AND TARGET ggml-cpu)
