@@ -81,6 +81,12 @@ Upstream `--numa distribute` interleaves weight pages across both sockets, so ~5
 
 DSV4 284B Q3_K on pure CPU (72 threads, interleave): **PP +38%, TG +17-18%**. Re-measured 2026-08-05 under loaded environment; to be finalized in a quiet window.
 
+### Multi-slot concurrency & hybrid re-measurement (2026-08-05)
+
+![Multi-slot concurrency](docs/benchmarks/multislot_concurrency.png)
+
+llama-server 8-slot concurrency (512 tok each): aggregate throughput leads upstream at 1/2/4 slots (+14%/+4%/even), but **upstream pulls ahead by 7% at 8 slots** — a known weak spot being tracked. Hybrid config (14 expert layers on 2 GPUs), same-methodology llama-bench: EP pp512 **227.8 vs upstream 158.4 (+44%)**, tg512 31.3 vs 29.1 (+7.5%); mirror pp512 200.2 (+26%).
+
 ### Long context: layer-major prefill (DSV4-Flash, 16K)
 
 ![16K PP progression](docs/benchmarks/longctx_pp_progression.png)
