@@ -143,8 +143,10 @@ llama_kv_cache::llama_kv_cache(
     GGML_ASSERT(n_stream == 1 || n_stream == n_seq_max);
 
     v_heads.resize(n_stream);
+    v_cell_limits.resize(n_stream);
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_heads[s] = 0;
+        v_cell_limits[s] = kv_size;
     }
 
     v_cells.resize(n_stream);
@@ -527,6 +529,7 @@ void llama_kv_cache::clear(bool data) {
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();
         v_heads[s] = 0;
+        v_cell_limits[s] = v_cells[s].size();
     }
 
     if (data) {
@@ -577,6 +580,9 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         if (new_head != cells.size() && new_head < head) {
             head = new_head;
         }
+        if (cells.get_used() == 0) {
+            v_cell_limits[seq_to_stream[seq_id]] = cells.size();
+        }
     } else {
         // match any sequence
         for (uint32_t s = 0; s < n_stream; ++s) {
@@ -600,6 +606,9 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
             // If we freed up a slot, set head to it so searching can start there.
             if (new_head != cells.size() && new_head < head) {
                 head = new_head;
+            }
+            if (cells.get_used() == 0) {
+                v_cell_limits[s] = cells.size();
             }
         }
     }
@@ -1165,6 +1174,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
         res.idxs[s].reserve(n_tokens);
 
         const auto & cells = v_cells[seq_to_stream[seq_id]];
+        const uint32_t cell_limit = v_cell_limits[seq_to_stream[seq_id]];
 
         uint32_t head_cur = v_heads[seq_to_stream[seq_id]];
 
@@ -1174,8 +1184,8 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
             head_cur = 0;
         }
 
-        if (n_tokens > cells.size()) {
-            LLAMA_LOG_ERROR("%s: n_tokens = %d > size = %u\n", __func__, n_tokens, cells.size());
+        if (n_tokens > cell_limit) {
+            LLAMA_LOG_ERROR("%s: n_tokens = %d > size = %u\n", __func__, n_tokens, cell_limit);
             return { };
         }
 
@@ -1186,8 +1196,8 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
         const uint32_t n_test = cont ? n_tokens : 1;
 
         while (true) {
-            if (head_cur + n_test > cells.size()) {
-                n_tested += cells.size() - head_cur;
+            if (head_cur + n_test > cell_limit) {
+                n_tested += cell_limit - head_cur;
                 head_cur = 0;
                 continue;
             }
@@ -1245,7 +1255,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                 res.idxs[s].clear();
             }
 
-            if (n_tested >= cells.size()) {
+            if (n_tested >= cell_limit) {
                 //LLAMA_LOG_ERROR("%s: failed to find a slot for %d tokens\n", __func__, n_tokens);
                 return { };
             }
@@ -1361,6 +1371,103 @@ uint32_t llama_kv_cache::get_n_stream() const {
     return n_stream;
 }
 
+bool llama_kv_cache::compact_decode_window(
+        llama_seq_id seq_id,
+        uint32_t n_keep,
+        uint32_t capacity) {
+    if (other || n_stream != 1 || n_swa == 0 || seq_id < 0 ||
+            n_keep == 0 || capacity < n_keep || capacity > get_size()) {
+        return false;
+    }
+
+    auto & cells = v_cells[0];
+    std::vector<std::pair<llama_pos, uint32_t>> positions;
+    positions.reserve(cells.get_used());
+
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (cells.is_empty(i)) {
+            continue;
+        }
+        if (cells.seq_count(i) != 1 || !cells.seq_has(i, seq_id)) {
+            return false;
+        }
+        positions.emplace_back(cells.pos_get(i), i);
+    }
+
+    if (positions.empty()) {
+        return false;
+    }
+
+    const bool already_bounded = positions.size() <= capacity &&
+        std::all_of(positions.begin(), positions.end(), [capacity](const auto & entry) {
+            return entry.second < capacity;
+        });
+    if (already_bounded) {
+        v_cell_limits[0] = capacity;
+        return true;
+    }
+
+    std::sort(positions.begin(), positions.end());
+    const size_t keep = std::min<size_t>(n_keep, positions.size());
+    positions.erase(positions.begin(), positions.end() - keep);
+
+    std::vector<uint32_t> src_idxs;
+    src_idxs.reserve(positions.size());
+    for (const auto & entry : positions) {
+        src_idxs.push_back(entry.second);
+    }
+
+    // The large-prefill transition moves a high cache suffix into a low ring.
+    // Refuse an overlapping layout so direct device copies cannot clobber a
+    // source row that has not been copied yet.
+    if (*std::min_element(src_idxs.begin(), src_idxs.end()) < capacity) {
+        return false;
+    }
+
+    for (const auto & layer : layers) {
+        // DSV4 raw attention is K-only. A transposed V cache would require a
+        // different physical copy layout and is intentionally not handled here.
+        if (layer.v != nullptr) {
+            return false;
+        }
+    }
+
+    const llama_kv_cells compact_cells = cells.cp(src_idxs);
+    for (const auto & layer : layers) {
+        uint32_t dst_begin = 0;
+        while (dst_begin < src_idxs.size()) {
+            uint32_t run = 1;
+            while (dst_begin + run < src_idxs.size() &&
+                    src_idxs[dst_begin + run] == src_idxs[dst_begin] + run) {
+                ++run;
+            }
+
+            ggml_tensor src = *layer.k;
+            ggml_tensor dst = *layer.k;
+            src.ne[1] = run;
+            src.ne[2] = 1;
+            dst.ne[1] = run;
+            dst.ne[2] = 1;
+            src.data = (char *) layer.k->data + src_idxs[dst_begin]*layer.k->nb[1];
+            dst.data = (char *) layer.k->data + dst_begin*layer.k->nb[1];
+            ggml_backend_tensor_copy(&src, &dst);
+
+            dst_begin += run;
+        }
+    }
+
+    resync_numa_mirror();
+
+    cells.reset();
+    cells.set(0, compact_cells);
+    v_heads[0] = positions.size();
+    v_cell_limits[0] = capacity;
+
+    LLAMA_LOG_INFO("%s: packed %zu SWA cells into a %u-cell decode ring\n",
+            __func__, positions.size(), capacity);
+    return true;
+}
+
 bool llama_kv_cache::get_has_shift() const {
     bool result = false;
 
@@ -1406,7 +1513,8 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const auto & cells = v_cells[sinfo.strm[s]];
 
-        result = std::max(std::min(cells.size(), std::max(n_pad_cur, GGML_PAD(cells.used_max_p1(), n_pad_cur))), result);
+        result = std::max(std::min(v_cell_limits[sinfo.strm[s]],
+                    std::max(n_pad_cur, GGML_PAD(cells.used_max_p1(), n_pad_cur))), result);
     }
 
     return result;

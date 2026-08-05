@@ -190,6 +190,12 @@ public:
     bool next() override;
     bool apply() override;
 
+    // Restart the prepared ubatch sequence. In replay mode the cache slot
+    // metadata is already committed, so apply() only exposes the prepared
+    // read/write views for another decoder layer.
+    void rewind(bool replay);
+    void enable_input_replay_cache();
+
     llama_memory_status get_status() const override;
     const llama_ubatch & get_ubatch() const override;
 
@@ -205,6 +211,7 @@ public:
     void set_input_k_idxs(ggml_tensor * dst) const;
     void set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_k_rot(ggml_tensor * dst) const;
+    const std::vector<uint8_t> * get_input_replay_mask(size_t tile_index) const;
 
 private:
     size_t i_next = 0;
@@ -220,6 +227,10 @@ private:
     const llama_memory_context_ptr ctx_swa_mem;
 
     uint32_t n_kv = 0;
+
+    bool replay = false;
+    mutable bool input_replay_cache_enabled = false;
+    mutable std::vector<std::vector<uint8_t>> kq_mask_replay_cache;
 
     const llama_memory_status status;
 };
@@ -238,6 +249,8 @@ public:
             std::vector<llama_ubatch> ubatches);
 
     bool next();
+
+    void rewind();
 
     uint32_t get_n_kv() const;
 
@@ -328,6 +341,10 @@ public:
 
     bool next()  override;
     bool apply() override;
+
+    // Reuse the immutable split/slot/compression plan for the next layer.
+    void rewind(bool replay);
+    void enable_input_replay_cache();
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;

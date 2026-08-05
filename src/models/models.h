@@ -1192,6 +1192,7 @@ struct llama_model_deepseek4 : public llama_model_base {
                 ggml_tensor * k2,
                 ggml_tensor * mask1,
                 ggml_tensor * mask2,
+                ggml_tensor * top_k,
                 ggml_tensor * sinks,
                 float kq_scale,
                 int il) const;

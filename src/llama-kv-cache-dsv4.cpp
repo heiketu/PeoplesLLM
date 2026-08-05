@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <new>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -1625,7 +1626,24 @@ bool llama_kv_cache_dsv4_raw_context::next() {
     return true;
 }
 
+void llama_kv_cache_dsv4_raw_context::rewind(bool replay) {
+    i_next = 0;
+    this->replay = replay;
+
+    if (replay && !sinfos_read.empty()) {
+        n_kv = kv_swa->get_n_kv(sinfos_read[0]);
+    }
+}
+
+void llama_kv_cache_dsv4_raw_context::enable_input_replay_cache() {
+    input_replay_cache_enabled = true;
+}
+
 bool llama_kv_cache_dsv4_raw_context::apply() {
+    if (replay) {
+        return true;
+    }
+
     bool res = true;
 
     if (ctx_base_mem) {
@@ -1715,11 +1733,41 @@ void llama_kv_cache_dsv4_raw_context::set_input_k_idxs(ggml_tensor * dst) const 
 }
 
 void llama_kv_cache_dsv4_raw_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+    if (input_replay_cache_enabled && replay &&
+            i_next < kq_mask_replay_cache.size() &&
+            kq_mask_replay_cache[i_next].size() == ggml_nbytes(dst)) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+        memcpy(dst->data, kq_mask_replay_cache[i_next].data(), ggml_nbytes(dst));
+        return;
+    }
+
     kv_swa->set_input_kq_mask(dst, ubatch, causal_attn);
+
+    if (input_replay_cache_enabled) {
+        try {
+            if (kq_mask_replay_cache.size() < ubatches.size()) {
+                kq_mask_replay_cache.resize(ubatches.size());
+            }
+            auto & cache = kq_mask_replay_cache[i_next];
+            cache.resize(ggml_nbytes(dst));
+            memcpy(cache.data(), dst->data, cache.size());
+        } catch (const std::bad_alloc &) {
+            std::vector<std::vector<uint8_t>>().swap(kq_mask_replay_cache);
+            input_replay_cache_enabled = false;
+            LLAMA_LOG_WARN("%s: replay cache allocation failed, regenerating masks\n", __func__);
+        }
+    }
 }
 
 void llama_kv_cache_dsv4_raw_context::set_input_k_rot(ggml_tensor * dst) const {
     kv_swa->set_input_k_rot(dst);
+}
+
+const std::vector<uint8_t> * llama_kv_cache_dsv4_raw_context::get_input_replay_mask(size_t tile_index) const {
+    if (tile_index >= kq_mask_replay_cache.size() || kq_mask_replay_cache[tile_index].empty()) {
+        return nullptr;
+    }
+    return &kq_mask_replay_cache[tile_index];
 }
 
 //
@@ -1759,6 +1807,10 @@ bool llama_kv_cache_dsv4_comp_context::next() {
     }
 
     return true;
+}
+
+void llama_kv_cache_dsv4_comp_context::rewind() {
+    i_cur = 0;
 }
 
 uint32_t llama_kv_cache_dsv4_comp_context::get_n_kv() const {
@@ -1886,6 +1938,20 @@ bool llama_kv_cache_dsv4_context::next() {
     }
 
     return true;
+}
+
+void llama_kv_cache_dsv4_context::rewind(bool replay) {
+    assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
+
+    i_next = 0;
+    ctx_raw->rewind(replay);
+    ctx_csa->rewind();
+    ctx_hca->rewind();
+    ctx_lid->rewind();
+}
+
+void llama_kv_cache_dsv4_context::enable_input_replay_cache() {
+    ctx_raw->enable_input_replay_cache();
 }
 
 bool llama_kv_cache_dsv4_context::apply() {

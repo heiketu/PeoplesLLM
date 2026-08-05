@@ -652,11 +652,12 @@ extern "C" {
 
     // this tensor...
     enum ggml_tensor_flag {
-        GGML_TENSOR_FLAG_INPUT   =  1, // ...is an input for the GGML compute graph
-        GGML_TENSOR_FLAG_OUTPUT  =  2, // ...is an output for the GGML compute graph
-        GGML_TENSOR_FLAG_PARAM   =  4, // ...contains trainable parameters
-        GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
-        GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
+        GGML_TENSOR_FLAG_INPUT            =  1, // ...is an input for the GGML compute graph
+        GGML_TENSOR_FLAG_OUTPUT           =  2, // ...is an output for the GGML compute graph
+        GGML_TENSOR_FLAG_PARAM            =  4, // ...contains trainable parameters
+        GGML_TENSOR_FLAG_LOSS             =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
+        GGML_TENSOR_FLAG_COMPUTE          = 16, // ...must be computed
+        GGML_TENSOR_FLAG_INPUT_PERSISTENT = 32, // ...is an input whose storage remains valid until backend completion
     };
 
     enum ggml_tri_type {
@@ -1553,6 +1554,10 @@ extern "C" {
             struct ggml_tensor  * a,
             enum   ggml_type      type);
 
+    // Match the optimized CPU Q8_0 quantizer: 127/max scaling and
+    // round-to-nearest-even. Only valid for an F32 -> Q8_0 CPY/CAST tensor.
+    GGML_API void ggml_cpy_set_q8_0_nearest_even(struct ggml_tensor * a);
+
     // make contiguous
     GGML_API struct ggml_tensor * ggml_cont(
             struct ggml_context * ctx,
@@ -2408,6 +2413,10 @@ extern "C" {
             struct ggml_tensor  * a,
             int                   k);
 
+    // Request ascending physical-index order for the selected set. The default
+    // top-k output order remains unspecified.
+    GGML_API void ggml_top_k_set_sorted_indices(struct ggml_tensor * a);
+
     GGML_API struct ggml_tensor * ggml_arange(
             struct ggml_context * ctx,
             float                 start,
@@ -2431,6 +2440,43 @@ extern "C" {
             struct ggml_tensor  * k,
             struct ggml_tensor  * v,
             struct ggml_tensor  * mask,
+            float                 scale,
+            float                 max_bias,
+            float                 logit_softcap);
+
+    // Flash attention over a compact logical KV sequence. The first raw_mask->ne[0]
+    // rows of k/v are addressed directly and use raw_mask. Remaining logical rows
+    // are mapped to physical rows by top_k, relative to the end of the raw segment.
+    //
+    // top_k: [n_top_k, n_batch, 1, ne3], type I32, each row sorted ascending
+    // compressed_mask: [n_compressed, n_batch, 1, ne3], type F16
+    // k/v physical backing: [raw rows, compressed rows]
+    // k/v logical shape:   [raw rows, selected compressed rows]
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_sparse(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * raw_mask,
+            struct ggml_tensor  * compressed_mask,
+            struct ggml_tensor  * top_k,
+            float                 scale,
+            float                 max_bias,
+            float                 logit_softcap);
+
+    // Sparse flash attention over physically separate raw and compressed KV
+    // segments. This preserves the same logical row order as the compact
+    // sparse op without requiring a full raw+compressed concat.
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_sparse_2kv(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k1,
+            struct ggml_tensor  * v1,
+            struct ggml_tensor  * k2,
+            struct ggml_tensor  * v2,
+            struct ggml_tensor  * raw_mask,
+            struct ggml_tensor  * compressed_mask,
+            struct ggml_tensor  * top_k,
             float                 scale,
             float                 max_bias,
             float                 logit_softcap);

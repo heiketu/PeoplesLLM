@@ -158,9 +158,11 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-grammar-integration.cpp)
     llama_build_and_test(test-llama-grammar.cpp)
     llama_build_and_test(test-batch-alloc.cpp)
-    llama_build_and_test(test-chat.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
-    target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
-    target_link_libraries(test-chat PRIVATE server-context)
+    if (LLAMA_BUILD_SERVER)
+        llama_build_and_test(test-chat.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+        target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+        target_link_libraries(test-chat PRIVATE server-context)
+    endif()
     # TODO: disabled on loongarch64 because the ggml-ci node lacks Python 3.8
     if (NOT ${CMAKE_SYSTEM_PROCESSOR} MATCHES "loongarch64")
         llama_build_and_test(test-json-schema-to-grammar.cpp   WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
@@ -332,6 +334,15 @@ if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
+
+# Manual DSV4 integration check. With no model argument it reports usage and
+# succeeds, so ordinary CI remains model-independent.
+llama_build(test-layer-major.cpp)
+if (GGML_CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    target_link_libraries(test-layer-major PRIVATE CUDA::cudart)
+endif()
+llama_test(test-layer-major LABEL model)
 
 # standalone numerical tests + microbenchmarks for the 8x8 repack matmul kernels
 # (Q2_K / Q5_K x Q8_K); needs the internal ggml-cpu repack headers and symbols

@@ -16,6 +16,7 @@
 
 struct llama_model;
 class llama_batch_allocr;
+struct llama_layer_major_graph_input;
 
 class llama_io_read_i;
 class llama_io_write_i;
@@ -142,10 +143,14 @@ struct llama_context {
                 const llama_ubatch & ubatch,
                     llm_graph_type   gtype,
             llama_memory_context_i * mctx,
-                       ggml_status & ret);
+                       ggml_status & ret,
+                           int32_t   layer_begin = -1,
+                           int32_t   layer_end   = -1,
+            const llama_layer_major_graph_input * layer_input = nullptr);
 
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
+    int decode_layer_major(const llama_batch & batch_inp, uint32_t n_ubatch);
 
     //
     // state save/load
@@ -262,7 +267,9 @@ private:
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const;
+                          llm_graph_type   gtype,
+                              int32_t      layer_begin = -1,
+                              int32_t      layer_end   = -1) const;
 
     llm_graph_cb graph_get_cb() const;
 

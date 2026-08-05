@@ -709,6 +709,12 @@ struct llm_graph_params {
 
     uint32_t n_outputs;
 
+    // Optional half-open decoder layer range. The default [-1, -1) builds the
+    // complete model graph. Only architectures that explicitly support a
+    // partial graph may consume these fields.
+    int32_t layer_begin = -1;
+    int32_t layer_end   = -1;
+
     llm_graph_cb cb;
 
     llm_graph_result * res;
@@ -779,6 +785,8 @@ struct llm_graph_params {
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
+            layer_begin == other.layer_begin &&
+            layer_end   == other.layer_end   &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
@@ -805,6 +813,8 @@ public:
     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
     ggml_tensor * get_h_nextn()     const { return t_h_nextn; }
     ggml_tensor * get_h_pre_norm()  const { return t_h_pre_norm; }
+    ggml_tensor * get_h_input()     const { return t_h_input; }
+    ggml_tensor * get_dsv4_raw_kq_mask() const { return t_dsv4_raw_kq_mask; }
 
     ggml_tensor * get_layer_inp(int il) const { return t_layer_inp[il]; }
 
@@ -841,6 +851,8 @@ public:
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
     ggml_tensor * t_h_pre_norm  = nullptr; // [n_embd_h, n_outputs] MTP chaining state (DSV4: flat hyper-connection state)
+    ggml_tensor * t_h_input     = nullptr; // experimental layer-major HC input
+    ggml_tensor * t_dsv4_raw_kq_mask = nullptr; // experimental layer-major replay input
 
     std::vector<ggml_tensor *> t_layer_inp;
 
@@ -918,6 +930,8 @@ struct llm_graph_context {
 
     const int64_t n_tokens;
     const int64_t n_outputs;
+    const int32_t layer_begin;
+    const int32_t layer_end;
     const int32_t n_ctx_orig; // yarn
 
     const enum llama_pooling_type pooling_type;

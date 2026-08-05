@@ -1160,6 +1160,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
 
         ggml_backend_buffer_type_t buft = nullptr;
+        bool buft_from_override = false;
 
         // check overrides
         if (tensor_buft_overrides) {
@@ -1178,6 +1179,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                         }
                     } else {
                         buft = overrides->buft;
+                        buft_from_override = true;
                     }
 
                     LLAMA_LOG_DEBUG("tensor %s (%zu MiB %s) buffer type overridden to %s\n",
@@ -1211,6 +1213,24 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 throw std::runtime_error("no CPU backend found");
             }
             buft = ggml_backend_dev_buffer_type(cpu_dev);
+        }
+
+        static const int64_t moe_pp_min_tokens = []() {
+            const char * value = getenv("GGML_CUDA_MOE_PP_MIN_TOKENS");
+            return value ? (int64_t) atoll(value) : (int64_t) 0;
+        }();
+        if (moe_pp_min_tokens > 0 && !buft_from_override && ggml_backend_buft_is_host(buft) &&
+                t_meta->ne[2] > 1 && strstr(t_meta->name, "_exps") != nullptr) {
+            auto * gpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+            ggml_backend_buffer_type_t host_buft = gpu_dev ? ggml_backend_dev_host_buffer_type(gpu_dev) : nullptr;
+            if (host_buft != nullptr && host_buft != buft) {
+                static std::once_flag once;
+                std::call_once(once, [host_buft] {
+                    LLAMA_LOG_INFO("%s: routing expert weights to %s for GPU MoE prefill streaming\n",
+                            __func__, ggml_backend_buft_name(host_buft));
+                });
+                buft = host_buft;
+            }
         }
 
         if (buft != buft_list->front().second) {

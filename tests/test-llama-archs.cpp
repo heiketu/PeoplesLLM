@@ -6,6 +6,7 @@
 #include "ggml-cpp.h"
 #include "llama.h"
 #include "llama-cpp.h"
+#include "../src/llama-ext.h"
 
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
@@ -303,6 +304,10 @@ static std::vector<float> get_logits(
             llama_batch_free(batch);
             throw std::runtime_error("failed to encode batch");
         }
+    }
+    if (!encode && llama_decode_layer_major(lctx, batch, llama_n_ubatch(lctx)) != -1) {
+        llama_batch_free(batch);
+        throw std::runtime_error("layer-major path accepted an unsupported architecture");
     }
     if (llama_decode(lctx, batch)) {
         llama_batch_free(batch);

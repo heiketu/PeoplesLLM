@@ -1292,6 +1292,10 @@ static void llama_numa_mirror_memcpy(void * dst, const void * src, size_t size) 
 #endif
 }
 
+static bool llama_buffer_is_pinned_host(ggml_backend_buffer_t buffer) {
+    return strstr(ggml_backend_buft_name(ggml_backend_buffer_get_type(buffer)), "_Host") != nullptr;
+}
+
 void llama_model::numa_mirror_weights_partial() {
     const int n_nodes = llama_numa_node_count();
 
@@ -1340,7 +1344,8 @@ void llama_model::numa_mirror_weights_partial() {
             std::vector<ggml_tensor *> exps;
             for (auto & [ctx, bufs] : pimpl->ctxs_bufs) {
                 for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
-                    if (!t->data || t->view_src || !t->buffer || !ggml_backend_buffer_is_host(t->buffer)) {
+                    if (!t->data || t->view_src || !t->buffer || !ggml_backend_buffer_is_host(t->buffer) ||
+                            llama_buffer_is_pinned_host(t->buffer)) {
                         continue;
                     }
                     const bool is_exps = strstr(t->name, "_exps") != nullptr;
@@ -1378,7 +1383,8 @@ void llama_model::numa_mirror_weights_partial() {
     std::vector<ggml_tensor *> cand;
     for (auto & [ctx, bufs] : pimpl->ctxs_bufs) {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
-            if (!t->data || t->view_src || !t->buffer || !ggml_backend_buffer_is_host(t->buffer)) {
+            if (!t->data || t->view_src || !t->buffer || !ggml_backend_buffer_is_host(t->buffer) ||
+                    llama_buffer_is_pinned_host(t->buffer)) {
                 continue;
             }
             const char * name = t->name;
@@ -1467,7 +1473,7 @@ void llama_model::numa_mirror_weights_partial() {
 // NUMA expert parallelism (GGML_NUMA_EP): bind the pages of each routed-expert tensor
 // (*_exps, [ff, embd, n_expert]) so that within EVERY expert plane, rows are split into
 // per-node windows ([n*win, min((n+1)*win, ne[1])) on node n) — the same row-window
-// mapping the compute side uses (repack.cpp forward_mul_mat_id, ep_chunk = 16 rows).
+// mapping the compute side uses (repack.cpp forward_mul_mat_id, 128-row-aligned windows).
 // Each node then holds a local slice of every expert, so both sockets stream every
 // selected expert from local memory regardless of the router's expert distribution.
 // Boundary pages go to the earlier node. Skipped when the model was loaded with mmap
@@ -1511,7 +1517,8 @@ void llama_model::numa_ep_place_experts(bool used_mmap) {
     for (auto & [ctx, bufs] : pimpl->ctxs_bufs) {
         GGML_UNUSED(bufs);
         for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
-            if (!t->data || t->view_src || !t->buffer || !ggml_backend_buffer_is_host(t->buffer)) {
+            if (!t->data || t->view_src || !t->buffer || !ggml_backend_buffer_is_host(t->buffer) ||
+                    llama_buffer_is_pinned_host(t->buffer)) {
                 continue;
             }
             if (t->ne[2] <= 1 || strstr(t->name, "_exps") == nullptr) {
@@ -1604,13 +1611,14 @@ void llama_model::numa_mirror_weights() {
     size_t total_ep = 0;
     for (auto & [ctx, bufs] : pimpl->ctxs_bufs) {
         for (auto & buf : bufs) {
-            if (buf && ggml_backend_buffer_is_host(buf.get())) {
+            if (buf && ggml_backend_buffer_is_host(buf.get()) && !llama_buffer_is_pinned_host(buf.get())) {
                 total_host += ggml_backend_buffer_get_size(buf.get());
             }
         }
         if (ep) {
             for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
                 if (t->data && !t->view_src && t->buffer && ggml_backend_buffer_is_host(t->buffer) &&
+                    !llama_buffer_is_pinned_host(t->buffer) &&
                     t->ne[2] > 1 && strstr(t->name, "_exps")) {
                     total_ep += ggml_nbytes(t);
                 }
@@ -1644,7 +1652,7 @@ void llama_model::numa_mirror_weights() {
         size_t mirrored_bytes = 0;
         for (auto & [ctx, bufs] : pimpl->ctxs_bufs) {
             for (auto & buf : bufs) {
-                if (!buf || !ggml_backend_buffer_is_host(buf.get())) {
+                if (!buf || !ggml_backend_buffer_is_host(buf.get()) || llama_buffer_is_pinned_host(buf.get())) {
                     continue;
                 }
                 // Check if this buffer contains any _exps tensors
@@ -1692,7 +1700,7 @@ void llama_model::numa_mirror_weights() {
     // allocate per-node copies of each host weight buffer
     for (auto & [ctx, bufs] : pimpl->ctxs_bufs) {
         for (auto & buf : bufs) {
-            if (!buf || !ggml_backend_buffer_is_host(buf.get())) {
+            if (!buf || !ggml_backend_buffer_is_host(buf.get()) || llama_buffer_is_pinned_host(buf.get())) {
                 continue;
             }
             impl::numa_mirror_buffer mb;
@@ -1770,7 +1778,8 @@ void llama_model::numa_mirror_weights() {
     int n_mirrored = 0;
     for (auto & [ctx, bufs] : pimpl->ctxs_bufs) {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
-            if (!t->data || t->view_src || !t->buffer || !ggml_backend_buffer_is_host(t->buffer)) {
+            if (!t->data || t->view_src || !t->buffer || !ggml_backend_buffer_is_host(t->buffer) ||
+                    llama_buffer_is_pinned_host(t->buffer)) {
                 continue;
             }
             if (ep && t->ne[2] > 1 && strstr(t->name, "_exps")) {

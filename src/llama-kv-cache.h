@@ -158,6 +158,10 @@ public:
     uint32_t get_size()     const;
     uint32_t get_n_stream() const;
 
+    // Pack one sequence's most recent SWA cells into a bounded decode ring.
+    // The backing tensors keep their original allocation for later reuse.
+    bool compact_decode_window(llama_seq_id seq_id, uint32_t n_keep, uint32_t capacity);
+
     bool get_has_shift() const;
 
     ggml_type type_k() const;
@@ -287,6 +291,10 @@ private:
     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method
     std::vector<uint32_t> v_heads;
+
+    // Per-stream cell search limit. This can be smaller than the backing
+    // allocation after a large prefill transitions to bounded SWA decode.
+    std::vector<uint32_t> v_cell_limits;
 
     // TODO: temporary until we refactor to be able to share the same cells between 2 kv caches [TAG_KV_CACHE_SHARE_CELLS]
     llama_kv_cache * other;

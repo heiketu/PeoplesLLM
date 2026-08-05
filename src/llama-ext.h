@@ -129,6 +129,17 @@ LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uin
 
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
+// Experimental weight-stationary prefill for an initial, causal, single-sequence
+// DeepSeek-V4 prompt. The batch must request only its final logit row and must
+// start at position zero in an empty sequence. Existing llama_decode() behavior
+// is unchanged; callers can retain the normal chunked path for ineligible input.
+// Returns 0 on success, -1 when ineligible, 1 when cache preparation cannot fit,
+// 2 when aborted, and a negative error code for allocation/compute failures.
+LLAMA_API int32_t llama_decode_layer_major(
+        struct llama_context * ctx,
+          struct llama_batch   batch,
+                   uint32_t   n_ubatch);
+
 //
 // model/context data extraction
 //

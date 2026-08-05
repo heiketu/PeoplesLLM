@@ -3567,6 +3567,12 @@ struct ggml_tensor * ggml_cast(
     return result;
 }
 
+void ggml_cpy_set_q8_0_nearest_even(struct ggml_tensor * a) {
+    GGML_ASSERT(a->op == GGML_OP_CPY);
+    GGML_ASSERT(a->src[0] && a->src[0]->type == GGML_TYPE_F32 && a->type == GGML_TYPE_Q8_0);
+    ggml_set_op_params_i32(a, 0, 1);
+}
+
 // ggml_cont
 
 static struct ggml_tensor * ggml_cont_impl(
@@ -5383,6 +5389,11 @@ struct ggml_tensor * ggml_top_k(
     return result;
 }
 
+void ggml_top_k_set_sorted_indices(struct ggml_tensor * a) {
+    GGML_ASSERT(a->op == GGML_OP_TOP_K);
+    ggml_set_op_params_i32(a, 0, 1);
+}
+
 // ggml_arange
 
 struct ggml_tensor * ggml_arange(
@@ -5447,6 +5458,90 @@ struct ggml_tensor * ggml_flash_attn_ext(
     result->src[1] = k;
     result->src[2] = v;
     result->src[3] = mask;
+
+    return result;
+}
+
+// ggml_flash_attn_ext_sparse
+
+struct ggml_tensor * ggml_flash_attn_ext_sparse(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * raw_mask,
+        struct ggml_tensor  * compressed_mask,
+        struct ggml_tensor  * top_k,
+        float                 scale,
+        float                 max_bias,
+        float                 logit_softcap) {
+    GGML_ASSERT(raw_mask);
+    GGML_ASSERT(compressed_mask);
+    GGML_ASSERT(top_k);
+    GGML_ASSERT(compressed_mask->type == GGML_TYPE_F16);
+    GGML_ASSERT(top_k->type == GGML_TYPE_I32);
+    GGML_ASSERT(compressed_mask->ne[1] == q->ne[1]);
+    GGML_ASSERT(compressed_mask->ne[2] == 1);
+    GGML_ASSERT(compressed_mask->ne[3] == q->ne[3]);
+    GGML_ASSERT(top_k->ne[1] == q->ne[1]);
+    GGML_ASSERT(top_k->ne[2] == 1);
+    GGML_ASSERT(top_k->ne[3] == q->ne[3]);
+    GGML_ASSERT(k->ne[1] == raw_mask->ne[0] + top_k->ne[0]);
+
+    struct ggml_tensor * result = ggml_flash_attn_ext(
+        ctx, q, k, v, raw_mask, scale, max_bias, logit_softcap);
+
+    // src[5] with no src[6] identifies the sparse row mapping. src[7] carries
+    // the causal/validity mask for the physical compressed rows. The two-KV
+    // variant uses src[5..7] with src[6] set, so the encodings stay unambiguous.
+    result->src[5] = top_k;
+    result->src[7] = compressed_mask;
+
+    return result;
+}
+
+// ggml_flash_attn_ext_sparse_2kv
+
+struct ggml_tensor * ggml_flash_attn_ext_sparse_2kv(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k1,
+        struct ggml_tensor  * v1,
+        struct ggml_tensor  * k2,
+        struct ggml_tensor  * v2,
+        struct ggml_tensor  * raw_mask,
+        struct ggml_tensor  * compressed_mask,
+        struct ggml_tensor  * top_k,
+        float                 scale,
+        float                 max_bias,
+        float                 logit_softcap) {
+    GGML_ASSERT(raw_mask);
+    GGML_ASSERT(compressed_mask);
+    GGML_ASSERT(top_k);
+    GGML_ASSERT(compressed_mask->type == GGML_TYPE_F16);
+    GGML_ASSERT(top_k->type == GGML_TYPE_I32);
+    GGML_ASSERT(k1->type == k2->type && v1->type == v2->type);
+    GGML_ASSERT(k1->ne[0] == k2->ne[0] && v1->ne[0] == v2->ne[0]);
+    GGML_ASSERT(k1->ne[1] == raw_mask->ne[0]);
+    GGML_ASSERT(k2->ne[1] == compressed_mask->ne[0]);
+    GGML_ASSERT(k1->ne[2] == k2->ne[2] && k1->ne[3] == k2->ne[3]);
+    GGML_ASSERT(v1->ne[2] == v2->ne[2] && v1->ne[3] == v2->ne[3]);
+    GGML_ASSERT(compressed_mask->ne[1] == q->ne[1]);
+    GGML_ASSERT(compressed_mask->ne[2] == 1);
+    GGML_ASSERT(compressed_mask->ne[3] == q->ne[3]);
+    GGML_ASSERT(top_k->ne[1] == q->ne[1]);
+    GGML_ASSERT(top_k->ne[2] == 1);
+    GGML_ASSERT(top_k->ne[3] == q->ne[3]);
+
+    struct ggml_tensor * result = ggml_flash_attn_ext(
+        ctx, q, k1, v1, raw_mask, scale, max_bias, logit_softcap);
+
+    // src[5] remains the sparse row map marker. src[8..9] carry the
+    // physically separate compressed K/V tensors; src[7] is its mask.
+    result->src[5] = top_k;
+    result->src[7] = compressed_mask;
+    result->src[8] = k2;
+    result->src[9] = v2;
 
     return result;
 }

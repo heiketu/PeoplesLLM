@@ -6,6 +6,7 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-layer-major.h"
 #include "llama-kv-cache-dsv4.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
@@ -437,12 +438,41 @@ llama_context::llama_context(
 
         // TODO: move these checks to ggml_backend_sched
         // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
+        const char * layer_major_sched_env = getenv("LLAMA_LAYER_MAJOR_SCHED_COPIES");
+        const bool layer_major_sched_copies_requested =
+            model.arch == LLM_ARCH_DEEPSEEK4 &&
+            layer_major_sched_env && atoi(layer_major_sched_env) > 0;
+
+        // The generic scheduler ring duplicates every graph and split input.
+        // That is useful for short prefill, but its memory cost grows too fast
+        // for the large ubatches used by the layer-major long-context path.
+        const bool layer_major_sched_copies =
+            layer_major_sched_copies_requested && cparams.n_ubatch <= 512;
+
+        if (layer_major_sched_copies_requested && !layer_major_sched_copies) {
+            LLAMA_LOG_WARN(
+                "%s: LLAMA_LAYER_MAJOR_SCHED_COPIES disabled for n_ubatch = %u; "
+                "the generic input ring is limited to 512 tokens\n",
+                __func__, cparams.n_ubatch);
+        }
+
         bool pipeline_parallel =
             model.n_devices() > 1 &&
             model.n_gpu_layers() > model.hparams.n_layer_all &&
             model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
             cparams.offload_kqv &&
             !model.has_tensor_overrides();
+
+        // Layer-major streamed experts intentionally use tensor overrides,
+        // which exclude the regular pipeline-parallel heuristic. Allow an
+        // explicit experiment to use the scheduler's proven multi-copy/event
+        // machinery without changing the default compatibility path.
+        if (layer_major_sched_copies && model.n_devices() > 1 &&
+                model.n_gpu_layers() > 0 &&
+                model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
+                cparams.offload_kqv) {
+            pipeline_parallel = true;
+        }
 
         // pipeline parallelism requires support for async compute and events in all devices
         if (pipeline_parallel) {
@@ -1431,11 +1461,80 @@ static bool llama_nan_dbg_eval_cb(ggml_tensor * t, bool ask, void * user_data) {
     return true;
 }
 
-llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+static void llama_layer_major_pin_cpu_moe_reduce(
+        ggml_backend_sched_t sched,
+        const std::vector<ggml_backend_t> & backends,
+        ggml_cgraph * gf) {
+    static const bool enabled = []() {
+        const char * value = getenv("LLAMA_LAYER_MAJOR_CPU_MOE_REDUCE");
+        return !value || atoi(value) != 0;
+    }();
+    if (!enabled || !gf) {
+        return;
+    }
+
+    ggml_backend_t backend_cpu = nullptr;
+    for (ggml_backend_t backend : backends) {
+        if (ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            backend_cpu = backend;
+        }
+    }
+    if (!backend_cpu) {
+        return;
+    }
+
+    int reduce_begin = -1;
+    int reduce_end = -1;
+    const int n_nodes = ggml_graph_n_nodes(gf);
+    for (int i = 0; i < n_nodes; ++i) {
+        ggml_tensor * node = ggml_graph_node(gf, i);
+        if (reduce_begin < 0 && node->op == GGML_OP_MUL_MAT_ID &&
+                strstr(node->name, "ffn_moe_down") != nullptr) {
+            ggml_tensor * weight = node->src[0];
+            ggml_backend_buffer_t buffer = weight && weight->view_src ? weight->view_src->buffer :
+                (weight ? weight->buffer : nullptr);
+            if (buffer && strcmp(ggml_backend_buffer_name(buffer), "CPU_REPACK") == 0) {
+                reduce_begin = i;
+            }
+        }
+        if (reduce_begin >= 0 && strstr(node->name, "ffn_moe_out") != nullptr) {
+            reduce_end = i;
+            break;
+        }
+    }
+    if (reduce_begin < 0 || reduce_end < reduce_begin) {
+        return;
+    }
+
+    // Keep weighting and top-k reduction next to the CPU expert down-projection.
+    // Otherwise backward GPU expansion pulls every expert-slot tensor across
+    // PCIe and reduces it on the GPU, transferring top_k times more data than
+    // the final reduced activation.
+    for (int i = reduce_begin; i <= reduce_end; ++i) {
+        ggml_backend_sched_set_tensor_backend(sched, ggml_graph_node(gf, i), backend_cpu);
+    }
+}
+
+llm_graph_result * llama_context::process_ubatch(
+        const llama_ubatch & ubatch,
+        llm_graph_type gtype,
+        llama_memory_context_i * mctx,
+        ggml_status & ret,
+        int32_t layer_begin,
+        int32_t layer_end,
+        const llama_layer_major_graph_input * layer_input) {
+    llama_layer_major_ubatch_profile * profile = layer_input ? layer_input->profile : nullptr;
+    int64_t profile_start_us = profile ? ggml_time_us() : 0;
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
+    }
+    if (profile) {
+        const int64_t now_us = ggml_time_us();
+        profile->memory_apply_us += now_us - profile_start_us;
+        profile_start_us = now_us;
     }
 
     auto * res = gf_res_prev.get();
@@ -1443,7 +1542,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
-    const auto gparams = graph_params(res, ubatch, mctx, gtype);
+    const auto gparams = graph_params(res, ubatch, mctx, gtype, layer_begin, layer_end);
 
     if (!graph_reuse_disable && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
@@ -1451,7 +1550,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // with pipeline parallelism, the previous graph_compute_async may still be running
         // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
         // that the previous compute is still reading.
-        if (cparams.pipeline_parallel) {
+        if (cparams.pipeline_parallel && !layer_input) {
             ggml_backend_sched_synchronize(sched.get());
         }
 
@@ -1474,11 +1573,41 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        if (layer_input && layer_input->hc_backend) {
+            if (ggml_tensor * h = res->get_h_input()) {
+                ggml_backend_sched_set_tensor_backend(sched.get(), h, layer_input->hc_backend);
+                if (layer_input->hc_tensor) {
+                    // The layer-major HC state is owned by this decode and is
+                    // not overwritten until the layer boundary synchronize.
+                    h->flags |= GGML_TENSOR_FLAG_INPUT_PERSISTENT;
+                }
+            }
+            if (ggml_tensor * h = res->get_h_pre_norm()) {
+                ggml_backend_sched_set_tensor_backend(sched.get(), h, layer_input->hc_backend);
+            }
+        }
+
+        if (layer_input && layer_input->raw_kq_mask_backend && layer_input->raw_kq_mask) {
+            if (ggml_tensor * mask = res->get_dsv4_raw_kq_mask()) {
+                ggml_backend_sched_set_tensor_backend(sched.get(), mask, layer_input->raw_kq_mask_backend);
+                mask->flags |= GGML_TENSOR_FLAG_INPUT_PERSISTENT;
+            }
+        }
+
+        if (layer_input && model.arch == LLM_ARCH_DEEPSEEK4) {
+            llama_layer_major_pin_cpu_moe_reduce(sched.get(), backend_ptrs, gf);
+        }
+
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
+    }
+    if (profile) {
+        const int64_t now_us = ggml_time_us();
+        profile->graph_prepare_us += now_us - profile_start_us;
+        profile_start_us = now_us;
     }
 
     // set the input data for the input tensors
@@ -1486,9 +1615,63 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //const auto t_start_us = ggml_time_us();
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
-        res->set_inputs(&ubatch);
+        if (layer_input && layer_input->hc_tensor) {
+            llama_ubatch ubatch_inputs = ubatch;
+            ubatch_inputs.embd = nullptr;
+            res->set_inputs(&ubatch_inputs);
+
+            ggml_tensor * h = res->get_h_input();
+            ggml_backend_t backend_h = llama_layer_major_buffer_backend(backend_ptrs, h);
+            if (!h || !layer_input->hc_backend || !backend_h || layer_input->hc_tensor->type != h->type ||
+                    !ggml_are_same_shape(layer_input->hc_tensor, h) ||
+                    !ggml_are_same_stride(layer_input->hc_tensor, h)) {
+                LLAMA_LOG_ERROR("%s: invalid device layer-major HC input\n", __func__);
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+            ggml_backend_tensor_copy_async(layer_input->hc_backend, backend_h, layer_input->hc_tensor, h);
+        } else if (model.arch == LLM_ARCH_DEEPSEEK4 && layer_begin > 0 && ubatch.embd) {
+            // The layer-major HC buffer remains alive through the layer
+            // boundary synchronization. Queue H2D on the tensor backend so
+            // consecutive tiles do not synchronize the per-thread CUDA stream.
+            llama_ubatch ubatch_inputs = ubatch;
+            ubatch_inputs.embd = nullptr;
+            res->set_inputs(&ubatch_inputs);
+
+            ggml_tensor * h = res->get_h_input();
+            ggml_backend_t backend_h = h ? ggml_backend_sched_get_tensor_backend(sched.get(), h) : nullptr;
+            if (!h || !backend_h) {
+                LLAMA_LOG_ERROR("%s: missing layer-major HC input/backend\n", __func__);
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+            ggml_backend_tensor_set_async(backend_h, h, ubatch.embd, 0, ggml_nbytes(h));
+        } else {
+            res->set_inputs(&ubatch);
+        }
+
+        if (layer_input && layer_input->raw_kq_mask) {
+            ggml_tensor * mask = res->get_dsv4_raw_kq_mask();
+            ggml_backend_t backend_mask = llama_layer_major_buffer_backend(backend_ptrs, mask);
+            if (!mask || !layer_input->raw_kq_mask_backend || !backend_mask ||
+                    layer_input->raw_kq_mask->type != mask->type ||
+                    !ggml_are_same_shape(layer_input->raw_kq_mask, mask) ||
+                    !ggml_are_same_stride(layer_input->raw_kq_mask, mask)) {
+                LLAMA_LOG_ERROR("%s: invalid device layer-major raw KQ mask\n", __func__);
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+            ggml_backend_tensor_copy_async(
+                    layer_input->raw_kq_mask_backend, backend_mask,
+                    layer_input->raw_kq_mask, mask);
+        }
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+    }
+    if (profile) {
+        const int64_t now_us = ggml_time_us();
+        profile->set_inputs_us += now_us - profile_start_us;
+        profile_start_us = now_us;
     }
 
     static const bool nan_dbg = []() {
@@ -1501,6 +1684,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (profile) {
+        profile->submit_us += ggml_time_us() - profile_start_us;
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -2615,7 +2801,9 @@ llm_graph_params llama_context::graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const {
+                          llm_graph_type   gtype,
+                              int32_t      layer_begin,
+                              int32_t      layer_end) const {
     return {
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
@@ -2630,6 +2818,8 @@ llm_graph_params llama_context::graph_params(
         /*.cross       =*/ &cross,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
+        /*.layer_begin =*/ layer_begin,
+        /*.layer_end   =*/ layer_end,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
     };
@@ -2672,16 +2862,41 @@ llm_graph_cb llama_context::graph_get_cb() const {
             ggml_set_name(cur, name);
         }
 
+        // The streamed expert weights live in a shared CUDA-host buffer, so
+        // buffer affinity cannot distinguish the two expert-axis ranks. Pin
+        // the explicit EP branches to separate CUDA backends; without this,
+        // both halves follow the owning layer and execute serially on one GPU.
+        int ep_rank = -1;
+        if (strncmp(name, "ffn_moe_ep0_", 12) == 0) {
+            ep_rank = 0;
+        } else if (strncmp(name, "ffn_moe_ep1_", 12) == 0) {
+            ep_rank = 1;
+        }
+        if (ep_rank >= 0) {
+            int cuda_rank = 0;
+            for (ggml_backend_t backend : backend_ptrs) {
+                ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+                if (ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_moe_prefetch") == nullptr) {
+                    continue;
+                }
+                if (cuda_rank++ == ep_rank && ggml_backend_supports_op(backend, cur)) {
+                    ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend);
+                    break;
+                }
+            }
+        }
+
         // norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
         // FIXME: fix in ggml_backend_sched
         const bool full_offload = model.n_gpu_layers() > model.hparams.n_layer_all;
         if (ubatch.n_tokens < 32 || full_offload) {
             if (il != -1 && strcmp(name, "norm") == 0) {
                 const auto & dev_layer = model.dev_layer(il);
-                for (const auto & backend : backends) {
-                    if (ggml_backend_get_device(backend.get()) == dev_layer) {
-                        if (ggml_backend_supports_op(backend.get(), cur)) {
-                            ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
+                for (ggml_backend_t backend : backend_ptrs) {
+                    if (ggml_backend_get_device(backend) == dev_layer) {
+                        if (ggml_backend_supports_op(backend, cur)) {
+                            ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend);
                         }
                     }
                 }
@@ -4289,6 +4504,18 @@ int32_t llama_decode(
           llama_batch   batch) {
     const int ret = ctx->decode(batch);
     if (ret != 0 && ret != 1) {
+        LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
+    }
+
+    return ret;
+}
+
+int32_t llama_decode_layer_major(
+        llama_context * ctx,
+          llama_batch   batch,
+               uint32_t n_ubatch) {
+    const int ret = ctx->decode_layer_major(batch, n_ubatch);
+    if (ret != 0 && ret != 1 && ret != -1) {
         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
     }
 
