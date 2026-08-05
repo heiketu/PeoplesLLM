@@ -85,7 +85,7 @@ DSV4 284B Q3_K 纯 CPU（72 线程 interleave）：**PP +38%、TG +17-18%**。20
 
 ![Multi-slot concurrency](docs/benchmarks/multislot_concurrency.png)
 
-llama-server 8 槽并发压测（每槽 512 tok）：1/2/4 槽聚合吞吐领先主线（+14%/+4%/持平），**8 槽主线反超 7%**——高并发调度是已知短板，在跟进。混合配置（14 层专家上双卡）同口径 llama-bench：EP pp512 **227.8 vs 主线 158.4（+44%）**、tg512 31.3 vs 29.1（+7.5%）；mirror pp512 200.2（+26%）。
+llama-server 8 槽并发压测（每槽 512 tok）：**EP（行窗）配置全并发档领先主线——1 槽 +22%、8 槽 +18%（74.5 vs 63.2 tok/s）**；mirror 作为兼容性选项在 8 槽被主线反超 7%（高并发下其每令牌权重流量摊薄、结构性带宽优势贬值），生产多并发请用 `GGML_NUMA_EP=1` 配置。混合配置（14 层专家上双卡）同口径 llama-bench：EP pp512 **227.8 vs 主线 158.4（+44%）**、tg512 31.3 vs 29.1（+7.5%）；mirror pp512 200.2（+26%）。
 
 ### 超长上下文：layer-major prefill（DSV4-Flash，16K）
 

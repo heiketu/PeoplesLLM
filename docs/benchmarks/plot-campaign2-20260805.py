@@ -57,11 +57,11 @@ def parse_slots():
     res = {}
     for f in glob.glob(os.path.join(LOGS, "slots-*-*.log")):
         base = os.path.basename(f)
-        m = re.match(r"slots-(ours|up|upstream)-(\d+)\.log", base)
+        m = re.match(r"slots-(ours|up|upstream|ep)-(\d+)\.log", base)
         if not m:
             continue
         impl, n = m.group(1), int(m.group(2))
-        impl = "upstream" if impl in ("up", "upstream") else "ours"
+        impl = "upstream" if impl in ("up", "upstream") else impl
         agg = None
         for line in open(f):
             mm = re.search(r"aggregate=([\d.]+) tok/s", line)
@@ -73,20 +73,21 @@ def parse_slots():
 
 slots = parse_slots()
 if slots:
-    fig, ax = plt.subplots(figsize=(8, 4.2))
+    fig, ax = plt.subplots(figsize=(8.5, 4.2))
     ns = sorted({n for v in slots.values() for n in v})
-    w = 0.36; x = np.arange(len(ns))
-    for k, (impl, color, label) in enumerate((("ours", C_OURS, "PeoplesLLM (mirror + row-pin)"),
-                                              ("upstream", C_BASE, "upstream llama.cpp"))):
-        if impl not in slots:
-            continue
+    series = [("ep", C_OURS2, "PeoplesLLM EP (row-window)"),
+              ("ours", C_OURS, "PeoplesLLM mirror (compat)"),
+              ("upstream", C_BASE, "upstream llama.cpp")]
+    series = [(i, c, l) for i, c, l in series if i in slots]
+    nser = len(series)
+    w = 0.8 / nser; x = np.arange(len(ns))
+    for k, (impl, color, label) in enumerate(series):
         vals = [slots[impl].get(n, 0) for n in ns]
-        ax.bar(x + (k - 0.5) * w if len(slots) > 1 else x, vals, w if len(slots) > 1 else 0.5,
-               label=label, color=color)
+        xpos = x + (k - (nser - 1) / 2) * w
+        ax.bar(xpos, vals, w * 0.92, label=label, color=color)
         for i, v in enumerate(vals):
             if v:
-                ax.text((x[i] + (k - 0.5) * w) if len(slots) > 1 else x[i], v + 0.3, f"{v:.1f}",
-                        ha="center", fontsize=9)
+                ax.text(xpos[i], v + 0.3, f"{v:.1f}", ha="center", fontsize=8)
     ax.set_xticks(x); ax.set_xticklabels([f"{n} slot{'s' if n>1 else ''}" for n in ns])
     ax.set_xlabel("concurrent requests (each 512 tok)")
     ax.set_ylabel("aggregate throughput (tok/s)")
