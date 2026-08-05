@@ -858,6 +858,10 @@ struct ggml_backend_sched {
     int debug_prev_graph_size;
 
     ggml_backend_sched_timing * timing;
+
+    // per-backend events guarding staged MoE weight copies against compute
+    // stream reuse [GGML_CUDA_MOE_PP_PIPE]
+    ggml_backend_event_t moe_pipe_events[GGML_SCHED_MAX_BACKENDS];
 };
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
@@ -1740,6 +1744,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     typedef bool (*moe_prefetch_t)(ggml_backend_t, int, const void *, size_t);
     typedef bool (*moe_prefetch_commit_t)(
         ggml_backend_t, int, ggml_tensor *, size_t, size_t, ggml_backend_event_t);
+    typedef int (*moe_prefetch_slot_t)(ggml_backend_t, const void *, size_t);
     typedef void (*cuda_graph_timing_input_begin_t)(ggml_backend_t, const ggml_cgraph *);
 
     static const int64_t moe_pp_min_tokens = []() {
@@ -1752,6 +1757,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     }();
     static const bool moe_defer_prefetch = []() {
         const char * value = getenv("GGML_CUDA_MOE_PP_DEFER_PREFETCH");
+        return value && atoi(value) > 0;
+    }();
+    // bounded copy-stream MoE pipeline: content-addressed staging slots and
+    // device-side commit events instead of host drains [opt-in]
+    static const bool moe_pipe = []() {
+        const char * value = getenv("GGML_CUDA_MOE_PP_PIPE");
         return value && atoi(value) > 0;
     }();
 
@@ -1774,9 +1785,30 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     std::array<size_t, GGML_SCHED_MAX_BACKENDS> moe_next_candidate = {};
     std::array<moe_prefetch_t, GGML_SCHED_MAX_BACKENDS> moe_prefetch_fns = {};
     std::array<moe_prefetch_commit_t, GGML_SCHED_MAX_BACKENDS> moe_commit_fns = {};
+    std::array<moe_prefetch_slot_t, GGML_SCHED_MAX_BACKENDS> moe_auto_fns = {};
+    std::array<moe_prefetch_slot_t, GGML_SCHED_MAX_BACKENDS> moe_find_fns = {};
     std::vector<int> moe_slot_by_split(sched->n_splits, -1);
     std::vector<int> moe_input_by_split(sched->n_splits, -1);
     std::array<cuda_graph_timing_input_begin_t, GGML_SCHED_MAX_BACKENDS> cuda_graph_timing_input_begin = {};
+
+    struct moe_pipe_assignment {
+        int split_id;
+        int input_id;
+        int slot;
+    };
+    std::vector<moe_pipe_assignment> moe_pipe_assignments;
+    auto moe_pipe_assigned_slot = [&](int split_id, int input_id) {
+        for (const auto & assignment : moe_pipe_assignments) {
+            if (assignment.split_id == split_id && assignment.input_id == input_id) {
+                return assignment.slot;
+            }
+        }
+        return -1;
+    };
+    auto moe_pipe_active = [&](int backend_id) {
+        return moe_pipe && moe_commit_fns[backend_id] != nullptr &&
+            moe_auto_fns[backend_id] != nullptr && moe_find_fns[backend_id] != nullptr;
+    };
 
     static const bool cuda_graph_timing_include_inputs = []() {
         const char * value = getenv("GGML_CUDA_GRAPH_TIMING_INCLUDE_INPUTS");
@@ -1806,7 +1838,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     ggml_backend_buffer_get_usage(input_buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
                     ggml_backend_buffer_is_host(input_buffer)) {
                     moe_candidates[split.backend_id].push_back({ split_id, input_id });
-                    break;
+                    if (!moe_pipe) {
+                        // the legacy path stages at most one candidate per split
+                        break;
+                    }
                 }
             }
         }
@@ -1821,8 +1856,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_moe_prefetch");
             moe_commit_fns[backend_id] = (moe_prefetch_commit_t)
                 ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_moe_prefetch_commit");
+            if (moe_pipe) {
+                moe_auto_fns[backend_id] = (moe_prefetch_slot_t)
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_moe_prefetch_auto");
+                moe_find_fns[backend_id] = (moe_prefetch_slot_t)
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_moe_prefetch_find");
+            }
             if (moe_prefetch_fns[backend_id] == nullptr || moe_commit_fns[backend_id] == nullptr) {
                 continue;
+            }
+            if (moe_pipe_active(backend_id) && sched->moe_pipe_events[backend_id] == nullptr) {
+                sched->moe_pipe_events[backend_id] =
+                    ggml_backend_event_new(ggml_backend_get_device(backend));
             }
         }
     }
@@ -1842,12 +1887,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             for (size_t pos = 0; pos < initial; ++pos) {
                 const auto candidate = moe_candidates[backend_id][pos];
                 ggml_tensor * input = splits[candidate.split_id].inputs[candidate.input_id];
-                const int slot = (int) pos;
-                if (!moe_prefetch_fns[backend_id](backend, slot, input->data, ggml_nbytes(input))) {
-                    break;
+                if (moe_pipe_active(backend_id)) {
+                    const int slot = moe_auto_fns[backend_id](backend, input->data, ggml_nbytes(input));
+                    if (slot < 0) {
+                        break;
+                    }
+                    moe_pipe_assignments.push_back({ candidate.split_id, candidate.input_id, slot });
+                } else {
+                    const int slot = (int) pos;
+                    if (!moe_prefetch_fns[backend_id](backend, slot, input->data, ggml_nbytes(input))) {
+                        break;
+                    }
+                    moe_slot_by_split[candidate.split_id] = slot;
+                    moe_input_by_split[candidate.split_id] = candidate.input_id;
                 }
-                moe_slot_by_split[candidate.split_id] = slot;
-                moe_input_by_split[candidate.split_id] = candidate.input_id;
                 moe_next_candidate[backend_id] = pos + 1;
             }
         }
@@ -1902,10 +1955,49 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
                 }
             } else {
+                // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
+                ggml_tensor * node = find_moe_weight_node(*split, input_cpy);
+                ggml_backend_buffer_t input_buffer = input->view_src ? input->view_src->buffer : input->buffer;
+                const bool moe_weight_input = node != nullptr && input_buffer != nullptr &&
+                    ggml_backend_buffer_get_usage(input_buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                    ggml_backend_buffer_is_host(input_buffer);
+
+                // pipe mode: commit the staged slot entirely on device streams,
+                // guarded by the per-backend reuse event instead of a host drain
+                if (moe_weight_input && moe_pp_min_tokens > 0 &&
+                        node->src[1]->ne[2] >= moe_pp_min_tokens &&
+                        moe_pipe_active(split_backend_id)) {
+                    const int64_t moe_pp_start_us = profile_enabled ? ggml_time_us() : 0;
+                    int slot = moe_pipe_assigned_slot(split_id, input_id);
+                    if (slot < 0) {
+                        slot = moe_find_fns[split_backend_id](split_backend, input->data, ggml_nbytes(input));
+                    }
+                    if (slot >= 0 &&
+                        moe_commit_fns[split_backend_id](
+                            split_backend, slot, input_cpy, 0, ggml_nbytes(input),
+                            sched->moe_pipe_events[split_backend_id])) {
+                        moe_slot_used = slot;
+                        if (profile_enabled) {
+                            moe_pp_us += ggml_time_us() - moe_pp_start_us;
+                        }
+                        continue;
+                    }
+                }
+
                 const int64_t input_wait_start_us = profile_enabled ? ggml_time_us() : 0;
                 // wait for the split backend to finish using the input before overwriting it
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
+                } else if (sched->moe_pipe_events[split_backend_id] != NULL) {
+                    // pipe mode: device-side reuse guard instead of a host drain,
+                    // so the host can run ahead and keep the copy streams busy
+                    ggml_backend_event_wait(split_backend, sched->moe_pipe_events[split_backend_id]);
+                    if (input_backend != split_backend && input_backend->iface.event_wait != NULL) {
+                        // cross-backend copies execute on the source stream, so
+                        // they must also wait for the destination buffer's
+                        // previous consumer on the destination compute stream
+                        ggml_backend_event_wait(input_backend, sched->moe_pipe_events[split_backend_id]);
+                    }
                 } else {
                     ggml_backend_synchronize(split_backend);
                 }
@@ -1919,12 +2011,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
                 }
 
-                // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
-                ggml_tensor * node = find_moe_weight_node(*split, input_cpy);
-                ggml_backend_buffer_t input_buffer = input->view_src ? input->view_src->buffer : input->buffer;
-                if (node != nullptr && input_buffer != nullptr &&
-                    ggml_backend_buffer_get_usage(input_buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
-                    ggml_backend_buffer_is_host(input_buffer)) {
+                if (moe_weight_input) {
 
                     if (moe_pp_min_tokens > 0 && node->src[1]->ne[2] >= moe_pp_min_tokens) {
                         const int64_t moe_pp_start_us = profile_enabled ? ggml_time_us() : 0;
@@ -2127,6 +2214,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
             }
         }
+        if (sched->moe_pipe_events[split_backend_id] != nullptr) {
+            ggml_backend_event_record(sched->moe_pipe_events[split_backend_id], split_backend);
+        }
 
         const int64_t refill_start_us = profile_enabled ? ggml_time_us() : 0;
         start_initial_prefetch();
@@ -2135,7 +2225,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             if (next < moe_candidates[split_backend_id].size()) {
                 const auto candidate = moe_candidates[split_backend_id][next];
                 ggml_tensor * input = splits[candidate.split_id].inputs[candidate.input_id];
-                if (moe_prefetch_fns[split_backend_id](
+                if (moe_pipe_active(split_backend_id)) {
+                    // reuse the just-consumed slot: an LRU victim could still
+                    // be assigned to a later split in this call
+                    if (moe_prefetch_fns[split_backend_id](
+                            split_backend, moe_slot_used, input->data, ggml_nbytes(input))) {
+                        moe_pipe_assignments.push_back({ candidate.split_id, candidate.input_id, moe_slot_used });
+                        ++next;
+                    }
+                } else if (moe_prefetch_fns[split_backend_id](
                         split_backend, moe_slot_used, input->data, ggml_nbytes(input))) {
                     moe_slot_by_split[candidate.split_id] = moe_slot_used;
                     moe_input_by_split[candidate.split_id] = candidate.input_id;
@@ -2267,6 +2365,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);
         }
+        ggml_backend_event_free(sched->moe_pipe_events[b]);
     }
     ggml_gallocr_free(sched->galloc);
     ggml_free(sched->ctx);

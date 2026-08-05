@@ -1435,6 +1435,8 @@ struct ggml_backend_cuda_context {
     size_t       moe_prefetch_src_size[GGML_CUDA_MOE_PP_MAX_PREFETCH] = {};
     cudaEvent_t  moe_prefetch_ready[GGML_CUDA_MOE_PP_MAX_PREFETCH] = {};
     cudaEvent_t  moe_prefetch_done[GGML_CUDA_MOE_PP_MAX_PREFETCH] = {};
+    uint64_t     moe_prefetch_age[GGML_CUDA_MOE_PP_MAX_PREFETCH] = {};
+    uint64_t     moe_prefetch_clock = 0;
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};

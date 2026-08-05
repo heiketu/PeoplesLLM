@@ -2583,7 +2583,41 @@ static bool ggml_backend_cuda_moe_prefetch(
     CUDA_CHECK(cudaEventRecord(cuda_ctx->moe_prefetch_ready[slot], cuda_ctx->moe_h2d_stream));
     cuda_ctx->moe_prefetch_src[slot] = data;
     cuda_ctx->moe_prefetch_src_size[slot] = size;
+    cuda_ctx->moe_prefetch_age[slot] = ++cuda_ctx->moe_prefetch_clock;
     return true;
+}
+
+static int ggml_backend_cuda_moe_prefetch_find(
+        ggml_backend_t backend, const void * data, size_t size) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    for (int slot = 0; slot < GGML_CUDA_MOE_PP_MAX_PREFETCH; ++slot) {
+        if (cuda_ctx->moe_prefetch_src[slot] == data &&
+            cuda_ctx->moe_prefetch_src_size[slot] == size) {
+            return slot;
+        }
+    }
+    return -1;
+}
+
+// Content-addressed staging: adopt the slot that already holds this tensor or
+// stage it into the least recently used slot. Returns the slot or -1.
+static int ggml_backend_cuda_moe_prefetch_auto(
+        ggml_backend_t backend, const void * data, size_t size) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    int slot = ggml_backend_cuda_moe_prefetch_find(backend, data, size);
+    if (slot < 0) {
+        slot = 0;
+        for (int i = 1; i < GGML_CUDA_MOE_PP_MAX_PREFETCH; ++i) {
+            if (cuda_ctx->moe_prefetch_age[i] < cuda_ctx->moe_prefetch_age[slot]) {
+                slot = i;
+            }
+        }
+        if (!ggml_backend_cuda_moe_prefetch(backend, slot, data, size)) {
+            return -1;
+        }
+    }
+    cuda_ctx->moe_prefetch_age[slot] = ++cuda_ctx->moe_prefetch_clock;
+    return slot;
 }
 
 static bool ggml_backend_cuda_moe_prefetch_commit(
@@ -5884,6 +5918,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_moe_prefetch_commit") == 0) {
         return (void *)ggml_backend_cuda_moe_prefetch_commit;
+    }
+    if (strcmp(name, "ggml_backend_cuda_moe_prefetch_find") == 0) {
+        return (void *)ggml_backend_cuda_moe_prefetch_find;
+    }
+    if (strcmp(name, "ggml_backend_cuda_moe_prefetch_auto") == 0) {
+        return (void *)ggml_backend_cuda_moe_prefetch_auto;
     }
 #if defined(USE_CUDA_GRAPH) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     if (strcmp(name, "ggml_backend_cuda_graph_timing_input_begin") == 0) {

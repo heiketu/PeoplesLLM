@@ -150,6 +150,116 @@ private:
 
 } // namespace
 
+namespace {
+
+// Staging hint for the bounded MoE copy-stream pipeline
+// [GGML_CUDA_MOE_PP_PIPE]: stage the next layer's expert views into the
+// per-GPU prefetch slots so their H2D overlaps the current layer's compute.
+class moe_pipe_hint {
+public:
+    bool init(const std::vector<ggml_backend_t> & backends, int64_t n_tokens) {
+        static const bool enabled = []() {
+            const char * value = getenv("GGML_CUDA_MOE_PP_PIPE");
+            return value && atoi(value) > 0;
+        }();
+        if (!enabled) {
+            return false;
+        }
+        static const int64_t pp_min = []() {
+            const char * value = getenv("GGML_CUDA_MOE_PP_MIN_TOKENS");
+            return value ? (int64_t) atoll(value) : (int64_t) 0;
+        }();
+        static const int64_t ep_min = []() {
+            const char * value = getenv("GGML_CUDA_MOE_PP_EP_MIN_TOKENS");
+            return value ? std::max<int64_t>(0, atoll(value)) : (int64_t) 0;
+        }();
+        static const bool ep_env = []() {
+            const char * value = getenv("GGML_CUDA_MOE_PP_EP");
+            return value && atoi(value) > 0;
+        }();
+        ep_ = ep_env && pp_min > 0 && n_tokens >= std::max(ep_min, pp_min);
+        // mirror of the scheduler's candidate gate: below this token count no
+        // MoE weight is staged or committed, so hinting would only burn PCIe
+        active_ = pp_min > 0 && n_tokens >= pp_min;
+        if (!active_) {
+            return false;
+        }
+
+        for (ggml_backend_t backend : backends) {
+            if (ggml_backend_dev_type(ggml_backend_get_device(backend)) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                continue;
+            }
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+            auto fn = (moe_prefetch_auto_t)
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_moe_prefetch_auto");
+            if (fn != nullptr) {
+                backends_.push_back(backend);
+                fns_.push_back(fn);
+            }
+        }
+        return !backends_.empty();
+    }
+
+    // Mirror of the scheduler's staged size for the EP rank views of w.
+    static size_t rank_view_nbytes(const ggml_tensor * w, int64_t half) {
+        const size_t blck_size = ggml_blck_size(w->type);
+        size_t nbytes = blck_size == 1 ?
+            (size_t) ggml_type_size(w->type) + (w->ne[0] - 1)*w->nb[0] :
+            (size_t) w->ne[0]*w->nb[0]/blck_size;
+        nbytes += (w->ne[1] - 1)*w->nb[1] + (half - 1)*w->nb[2];
+        return nbytes;
+    }
+
+    void hint(const llama_model & model, const std::vector<ggml_backend_t> & backends, int32_t il) const {
+        if (backends_.empty()) {
+            return;
+        }
+        const llama_layer & layer = model.layers[il];
+        const bool ep = ep_ && backends_.size() >= 2 &&
+            layer.ffn_gate_exps && layer.ffn_up_exps && layer.ffn_down_exps &&
+            !layer.ffn_gate_up_exps &&
+            layer.ffn_gate_exps->type == GGML_TYPE_MXFP4 &&
+            layer.ffn_up_exps->type   == GGML_TYPE_MXFP4 &&
+            layer.ffn_down_exps->type == GGML_TYPE_MXFP4;
+        const ggml_tensor * weights[] = { layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps };
+        for (const ggml_tensor * w : weights) {
+            if (w == nullptr || w->data == nullptr) {
+                continue;
+            }
+            ggml_backend_buffer_t buf = w->view_src ? w->view_src->buffer : w->buffer;
+            if (buf == nullptr || !ggml_backend_buffer_is_host(buf) ||
+                    ggml_backend_buffer_get_usage(buf) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                continue;
+            }
+            if (ep && w->ne[2] % 2 == 0) {
+                const int64_t half = w->ne[2]/2;
+                for (int rank = 0; rank < 2; ++rank) {
+                    fns_[rank](backends_[rank],
+                        (const char *) w->data + rank*half*w->nb[2], rank_view_nbytes(w, half));
+                }
+            } else {
+                ggml_backend_t backend = backend_for_device(backends, model.dev_layer(il));
+                for (size_t i = 0; i < backends_.size(); ++i) {
+                    if (backends_[i] == backend) {
+                        fns_[i](backend, w->data, ggml_nbytes(w));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+private:
+    typedef int (*moe_prefetch_auto_t)(ggml_backend_t, const void *, size_t);
+
+    bool active_ = false;
+    bool ep_ = false;
+    std::vector<ggml_backend_t> backends_;
+    std::vector<moe_prefetch_auto_t> fns_;
+};
+
+} // namespace
+
 ggml_backend_t llama_layer_major_buffer_backend(
         const std::vector<ggml_backend_t> & backends,
         const ggml_tensor * tensor) {
@@ -480,6 +590,11 @@ int llama_context::decode_layer_major(const llama_batch & batch_inp, uint32_t n_
         return rc;
     };
 
+    moe_pipe_hint pipe_hint;
+    if (pipe_hint.init(backend_ptrs, n_tokens_all)) {
+        pipe_hint.hint(model, backend_ptrs, 0);
+    }
+
     for (int32_t il = 0; il < n_layer; ++il) {
         ggml_backend_t layer_backend = backend_for_device(backend_ptrs, model.dev_layer(il));
         if (hc_state.is_device_resident() && layer_backend &&
@@ -567,6 +682,12 @@ int llama_context::decode_layer_major(const llama_batch & batch_inp, uint32_t n_
             ++tile_index;
             ++tile_count;
         } while (mctx->next());
+
+        // stage the next layer's expert weights before the boundary sync so
+        // the slot H2D overlaps this layer's remaining compute
+        if (il + 1 < n_layer) {
+            pipe_hint.hint(model, backend_ptrs, il + 1);
+        }
 
         const int64_t sync_start_us = profile_enabled ? ggml_time_us() : 0;
         ggml_backend_sched_synchronize(sched.get());
