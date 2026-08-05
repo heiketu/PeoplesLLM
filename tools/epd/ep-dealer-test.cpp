@@ -172,6 +172,18 @@ static void test_determinism() {
           "split %zu/%zu", a.eps[0].slot.size(), a.eps[1].slot.size());
 }
 
+static void test_invalid_endpoint_count() {
+    int32_t ids[1] = {0};
+    uint64_t holders[1] = {1};
+    llama_ep_dealer_input in;
+    in.n_tokens = 1; in.k = 1; in.n_endpoints = 64; in.m_star = 1;
+    in.ids = ids; in.holders = holders;
+    llama_ep_dealer_plan p;
+    CHECK(!llama_ep_dealer_plan_build(in, p), "more than 63 endpoints must fail");
+    in.n_endpoints = -1;
+    CHECK(!llama_ep_dealer_plan_build(in, p), "negative endpoint count must fail");
+}
+
 int main() {
     test_full_replica_1ep();
     test_partitioned_2ep();
@@ -180,6 +192,7 @@ int main() {
     test_two_tokens();
     test_infeasible_local();
     test_determinism();
+    test_invalid_endpoint_count();
     if (failures == 0) {
         printf("ep-dealer-test: PASS (all cases)\n");
         return 0;

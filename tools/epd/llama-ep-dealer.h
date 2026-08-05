@@ -48,7 +48,8 @@ static inline bool llama_ep_dealer_plan_build(
         const llama_ep_dealer_input & in,
         llama_ep_dealer_plan        & out) {
 
-    if (in.n_tokens < 1 || in.k < 1 || in.m_star < 0 || in.ids == nullptr || in.holders == nullptr) {
+    if (in.n_tokens < 1 || in.k < 1 || in.n_endpoints < 0 || in.n_endpoints > 63 ||
+            in.m_star < 0 || in.ids == nullptr || in.holders == nullptr) {
         return false;
     }
     const int m_local = in.m_star > in.k ? in.k : in.m_star;
@@ -145,6 +146,9 @@ static inline bool llama_ep_dealer_plan_build(
                     best_score = score;
                     best = j;
                 }
+            }
+            if (best < 0) {
+                return false;
             }
             is_local[(size_t) best] = 1;
             ++n_picked;
