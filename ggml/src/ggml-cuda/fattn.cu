@@ -425,7 +425,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 Q->ne[1] != top_k->ne[1] || Q->ne[3] != top_k->ne[3] || top_k->ne[2] != 1 ||
                 Q->ne[1] != compressed_mask->ne[1] || Q->ne[3] != compressed_mask->ne[3] || compressed_mask->ne[2] != 1 ||
                 (!sparse_2kv && K->ne[1] != mask->ne[0] + top_k->ne[0]) ||
-                (sparse_2kv && (Q->ne[1] != 1 || K->ne[1] != mask->ne[0] ||
+                (sparse_2kv && (K->ne[1] != mask->ne[0] ||
                     !K2 || !V2 || K2->type != GGML_TYPE_F16 || V2->type != GGML_TYPE_F16 ||
                     K2->ne[0] != K->ne[0] || V2->ne[0] != V->ne[0] ||
                     K2->ne[1] != compressed_mask->ne[0] || V2->ne[1] != compressed_mask->ne[0] ||

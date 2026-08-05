@@ -260,6 +260,17 @@ static bool dsv4_fused_indexed_fa_enabled() {
     return enabled;
 }
 
+// HCA layers attend over the full compressed state and the raw SWA window. With
+// indexed FA the raw mask bounds compact the raw segment and an identity row map
+// covers the compressed blocks, so no full-width concat or raw scan is needed.
+static bool dsv4_hca_indexed_fa_enabled() {
+    static const bool enabled = []() {
+        const char * value = getenv("LLAMA_DSV4_HCA_INDEXED_FA");
+        return value && atoi(value) > 0;
+    }();
+    return enabled;
+}
+
 static ggml_tensor * dsv4_hc_affine(
         ggml_context * ctx,
         ggml_tensor  * x,
@@ -745,7 +756,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_attn_mha_2kv(
         ggml_tensor * top_k,
         ggml_tensor * sinks,
         float kq_scale,
-        int il) const {
+        int il,
+        bool indexed_2kv) const {
     // split the batch into streams if needed
     const auto n_stream = k1->ne[3];
 
@@ -783,7 +795,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_attn_mha_2kv(
             return value && atoi(value) > 0;
         }();
 
-        if (dsv4_fused_indexed_fa_enabled() && q->ne[1] == 1) {
+        if (indexed_2kv && (q->ne[1] == 1 || q->ne[1] >= 256)) {
             ggml_tensor * cur = ggml_flash_attn_ext_sparse_2kv(
                     ctx0, q, k1, k1, k2, k2, mask1, mask2, top_k, kq_scale,
                     hparams.f_max_alibi_bias,
@@ -920,7 +932,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
     const int sparse_fa_mode = sparse_fa_env ? atoi(sparse_fa_env) : 0;
     const char * compact_kv_env = getenv("LLAMA_DSV4_COMPACT_KV");
     const bool compact_kv = compact_kv_env && atoi(compact_kv_env) > 0 && inp_pos->ne[0] == 1;
-    const bool fused_indexed_fa = dsv4_fused_indexed_fa_enabled() && inp_pos->ne[0] == 1;
+    const bool fused_indexed_fa = dsv4_fused_indexed_fa_enabled() &&
+        (inp_pos->ne[0] == 1 || inp_pos->ne[0] >= 256);
     // Mode 2 exposes the single-query specialization for decode A/B. Mode 1
     // retains the current prefill-only behavior until the long-KV gate is set.
     const bool sparse_fa = sparse_fa_mode > 0 &&
@@ -930,7 +943,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
 
     ggml_tensor * out = build_attn_mha_2kv(
         q, raw_k, csa_k, raw_mask, csa_mask,
-        (sparse_fa || compact_kv || fused_indexed_fa) ? top_k : nullptr, sinks, kq_scale, il);
+        (sparse_fa || compact_kv || fused_indexed_fa) ? top_k : nullptr, sinks, kq_scale, il,
+        fused_indexed_fa);
     if (k_rot) {
         out = llama_mul_mat_hadamard(ctx0, out, k_rot);
     }
@@ -979,7 +993,28 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_attention(
     ggml_tensor * raw_mask = inp_attn->get_kq_mask();
     ggml_tensor * hca_mask = inp_hca.kq_mask;
 
-    ggml_tensor * out = build_attn_mha_2kv(q, raw_k, hca_k, raw_mask, hca_mask, nullptr, sinks, kq_scale, il);
+    // Indexed FA: the raw SWA mask bounds compact the raw segment while an
+    // identity row map keeps every causal compressed block, so neither the
+    // full-width concat nor the dense scan of the masked raw rows is needed.
+    static const int sparse_raw_compact = []() {
+        const char * value = getenv("GGML_CUDA_DSV4_SPARSE_RAW_COMPACT");
+        return value ? atoi(value) : 0;
+    }();
+    const bool hca_indexed = dsv4_hca_indexed_fa_enabled() && sparse_raw_compact > 0 && q->ne[2] >= 256;
+
+    ggml_tensor * top_k = nullptr;
+    if (hca_indexed) {
+        const int64_t n_stream = raw_k->ne[3];
+        GGML_ASSERT(q->ne[2] % n_stream == 0);
+
+        ggml_tensor * idx = ggml_arange(ctx0, 0.0f, (float) n_hca, 1.0f);
+        idx = ggml_reshape_4d(ctx0, idx, n_hca, 1, 1, 1);
+        idx = ggml_repeat_4d(ctx0, idx, n_hca, q->ne[2]/n_stream, 1, n_stream);
+        top_k = ggml_cast(ctx0, idx, GGML_TYPE_I32);
+        cb(top_k, "hca_index_top_k", il);
+    }
+
+    ggml_tensor * out = build_attn_mha_2kv(q, raw_k, hca_k, raw_mask, hca_mask, top_k, sinks, kq_scale, il, hca_indexed);
     if (k_rot) {
         out = llama_mul_mat_hadamard(ctx0, out, k_rot);
     }

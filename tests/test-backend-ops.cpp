@@ -10078,6 +10078,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_sparse(1, false, true));
     test_cases.emplace_back(new test_flash_attn_ext_sparse(1, true, true));
     test_cases.emplace_back(new test_flash_attn_ext_sparse(1, true, true, 256, 512, 4096));
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(8, false, true));
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(8, true, true));
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(8, true, true, 256, 512, 4096));
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(256, true, true, 256, 512, 4096));
 
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
@@ -10441,6 +10445,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext_sparse(1, true, false));
     test_cases.emplace_back(new test_flash_attn_ext_sparse(1, true, true));
     test_cases.emplace_back(new test_flash_attn_ext_sparse(1, true, true, 256, 512, 4096));
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(8, true, true));
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(8, true, true, 256, 512, 4096));
 
     // DeepSeek V4 long-prefill tile: 64 query heads share one aliased K/V
     // head. The masked prefix activates the exact lower-bound skip used by
