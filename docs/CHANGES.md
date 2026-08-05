@@ -86,6 +86,30 @@
 | GLM-5.2 PP | EP | 33.7 t/s（+12.6% vs 无 EP） |
 | Q5_K repack gemm nr=16 | 微基准 | ~4× vs legacy |
 
+### NUMA 带宽矩阵（membw2，2026-08-05，双路 Xeon 8360Y，DDR4-3200 8ch×2）
+
+| 访问模式 | 线程 | read GB/s | write GB/s | triad GB/s |
+|---|---|---|---|---|
+| local0（本路） | 76 | 136.4 | 92.4 | 120.9 |
+| local1（本路） | 76 | 142.8 | 96.8 | 125.8 |
+| cross01（跨 UPI） | 76 | 54.6 | 34.3 | 71.2 |
+| cross10（跨 UPI） | 76 | 53.7 | 33.0 | 70.1 |
+| interleave（主线 distribute 模式） | 152 | 177.6 | 85.4 | 164.6 |
+| EP/mirror 模式（两路本地合计） | 152 | 279.2 | 189.2 | 246.7 |
+| 单线程 local / cross | 1 | 9.2 / 6.9 | 10.3 / 7.6 | 14.6 / 11.8 |
+
+跨路读 = 本地 ~38%；EP/mirror 本地读模式比主线 interleave 模式有效读带宽 +57%。perf 在 Ice Lake 无 UPI uncore PMU，跨路数字即 UPI 有效带宽口径。
+
+### 纯 CPU vs 主线（DSV4 284B Q3_K，-ngl 0，72 线程 interleave，2026-08-05 负载环境）
+
+| 实现 | pp512 | tg512 | tg64 |
+|---|---|---|---|
+| upstream b10173 | 73.83 | 10.29 | 11.03 |
+| PeoplesLLM | 101.90 | 12.19 | 12.95 |
+| 提升 | **+38%** | **+18%** | **+17%** |
+
+注：本轮 upstream 因 `--mmap 0` deprecated 实际 mmap 运行（对主线略不利），下一轮用 `--load-mode` 对齐后在安静窗口复测定稿。
+
 ## 八、关键环境变量速查
 
 | 变量 | 作用 | 默认 |

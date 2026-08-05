@@ -130,3 +130,36 @@ fig.tight_layout()
 fig.savefig(os.path.join(OUT, "dual_machine_ep.png"))
 plt.close(fig)
 print("dual_machine_ep.png done")
+
+# ---- Fig 6: NUMA locality — EP local-read vs upstream distribute ----
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4.2))
+# A: access origin structure
+impl = ["upstream\ndistribute", "PeoplesLLM\nrow-window EP", "PeoplesLLM\nNUMA mirror"]
+local = [50, 100, 100]
+cross = [50, 0, 0]
+ax1.bar(range(3), local, color=C_OURS2, label="local-node read")
+ax1.bar(range(3), cross, bottom=local, color="#d32f2f", label="cross-UPI read")
+for i in range(3):
+    ax1.text(i, 50, f"{local[i]}% local", ha="center", fontsize=11, fontweight="bold",
+             color="white" if local[i] >= 50 else "#333")
+ax1.set_xticks(range(3)); ax1.set_xticklabels(impl, fontsize=9)
+ax1.set_ylabel("share of MoE weight reads (%)")
+ax1.set_title("Weight-read locality (structural)")
+ax1.legend(fontsize=8, loc="upper center", bbox_to_anchor=(0.5, -0.12), ncol=2)
+ax1.set_ylim(0, 105)
+# B: measured effective bandwidth per access pattern
+pats = ["cross-socket\n(UPI path)", "upstream pattern\n(interleave, 152 thr)", "EP/mirror pattern\n(local x2 sockets)"]
+bw = [54.1, 177.6, 279.2]
+bars = ax2.bar(range(3), bw, color=["#d32f2f", C_BASE, C_OURS2])
+for i, v in enumerate(bw):
+    ax2.text(i, v + 5, f"{v:.0f}", ha="center", fontsize=11, fontweight="bold")
+ax2.text(2, 140, "+57%", ha="center", fontsize=14, fontweight="bold", color="white")
+ax2.set_xticks(range(3)); ax2.set_xticklabels(pats, fontsize=8.5)
+ax2.set_ylabel("aggregate read bandwidth (GB/s)")
+ax2.set_title("Measured effective read bandwidth\n(membw2, 76 thr/socket, 2026-08-05)")
+ax2.set_ylim(0, 320)
+fig.suptitle("NUMA locality: why row-window EP/mirror beat upstream distribute — dual Xeon 8360Y", fontsize=11)
+fig.tight_layout()
+fig.savefig(os.path.join(OUT, "numa_locality.png"))
+plt.close(fig)
+print("numa_locality.png done")

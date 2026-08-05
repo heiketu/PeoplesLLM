@@ -69,6 +69,18 @@ Both row-window EP and mirror beat upstream: **PP 2.1-2.2×, TG +9%**; row-windo
 
 gemv (decode) ≈1× is the physical memory-bandwidth ceiling; the prefill gemm gains come from amortizing weight-read bandwidth via 8×8 repacking. Full 300-cell dataset reproducible via `tests/test-repack-kernels --perf`.
 
+### NUMA locality: why EP/mirror structurally beat upstream distribute
+
+![NUMA locality](docs/benchmarks/numa_locality.png)
+
+Upstream `--numa distribute` interleaves weight pages across both sockets, so ~50% of every weight read crosses UPI; measured cross-socket read bandwidth is only ~38% of local (53.7-54.6 vs 136-143 GB/s, membw2, 76 threads/socket). Row-window EP and mirror achieve ~100% local reads structurally: 279.2 GB/s combined effective bandwidth vs 177.6 GB/s for the upstream interleave pattern — **+57%**. Full bandwidth matrix in `docs/CHANGES.md`.
+
+### Pure-CPU inference (-ngl 0, same-machine A/B)
+
+![Pure CPU vs upstream](docs/benchmarks/pure_cpu_vs_upstream.png)
+
+DSV4 284B Q3_K on pure CPU (72 threads, interleave): **PP +38%, TG +17-18%**. Re-measured 2026-08-05 under loaded environment; to be finalized in a quiet window.
+
 ### Long context: layer-major prefill (DSV4-Flash, 16K)
 
 ![16K PP progression](docs/benchmarks/longctx_pp_progression.png)

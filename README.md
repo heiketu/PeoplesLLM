@@ -69,6 +69,18 @@ DeepSeek-V4 284B（Q3_K），GPU 卸载 14 层专家，72 线程：
 
 gemv（decode）≈1× 是内存带宽物理上限；prefill gemm 提升来自 8×8 重排摊销权重读带宽。完整 300 格数据可用 `tests/test-repack-kernels --perf` 复现。
 
+### NUMA 局部性：为什么 EP/mirror 必然赢过主线 distribute
+
+![NUMA locality](docs/benchmarks/numa_locality.png)
+
+主线 `--numa distribute` 把权重页 interleave 摊到两路，每次权重读约 50% 跨 UPI；实测跨路读带宽只有本地的 ~38%（53.7-54.6 vs 136-143 GB/s，membw2 76 线程/路）。行窗 EP 与 mirror 结构性做到 ~100% 本地读，双路合计有效带宽 279.2 GB/s，比主线 interleave 模式（177.6 GB/s）高 **57%**。带宽矩阵全表见 `docs/CHANGES.md`。
+
+### 纯 CPU 推理（-ngl 0，同机 A/B）
+
+![Pure CPU vs upstream](docs/benchmarks/pure_cpu_vs_upstream.png)
+
+DSV4 284B Q3_K 纯 CPU（72 线程 interleave）：**PP +38%、TG +17-18%**。2026-08-05 负载环境复测，安静窗口定稿后更新。
+
 ### 超长上下文：layer-major prefill（DSV4-Flash，16K）
 
 ![16K PP 演进](docs/benchmarks/longctx_pp_progression.png)
