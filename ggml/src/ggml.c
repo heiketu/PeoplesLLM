@@ -1102,9 +1102,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "MOE_WREDUCE",
 };
 
-static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1221,9 +1223,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "moe_wreduce(x,w,ids)",
 };
 
-static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3355,6 +3359,42 @@ struct ggml_tensor * ggml_mul_mat_id(
     result->op     = GGML_OP_MUL_MAT_ID;
     result->src[0] = as;
     result->src[1] = b;
+    result->src[2] = ids;
+
+    return result;
+}
+
+// ggml_moe_wreduce
+
+struct ggml_tensor * ggml_moe_wreduce(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * experts,
+        struct ggml_tensor  * weights,
+        struct ggml_tensor  * ids,
+        int32_t               expert_id_offset,
+        int32_t               expert_id_count) {
+    GGML_ASSERT(experts->type == GGML_TYPE_F32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(ids->type     == GGML_TYPE_I32);
+
+    GGML_ASSERT(experts->ne[3] == 1); // experts is 3d [ne0, n_expert_used, n_tokens]
+    GGML_ASSERT(ids->ne[2] == 1 && ids->ne[3] == 1); // ids is 2d
+    GGML_ASSERT(ids->ne[0] == experts->ne[1]);
+    GGML_ASSERT(ids->ne[1] == experts->ne[2]);
+    GGML_ASSERT(weights->ne[0] == 1 && weights->ne[1] == experts->ne[1]);
+    // weights is [1, n_expert_used, n_tokens] or [1, n_expert_used, 1, n_tokens]
+    GGML_ASSERT((weights->ne[2] == experts->ne[2] && weights->ne[3] == 1) ||
+                (weights->ne[2] == 1 && weights->ne[3] == experts->ne[2]));
+    GGML_ASSERT(expert_id_offset >= 0 && expert_id_count >= 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, experts->ne[0], experts->ne[2]);
+
+    ggml_set_op_params_i32(result, 0, expert_id_offset);
+    ggml_set_op_params_i32(result, 1, expert_id_count);
+
+    result->op     = GGML_OP_MOE_WREDUCE;
+    result->src[0] = experts;
+    result->src[1] = weights;
     result->src[2] = ids;
 
     return result;

@@ -594,6 +594,8 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_MOE_WREDUCE,
+
         GGML_OP_COUNT,
     };
 
@@ -1457,6 +1459,24 @@ extern "C" {
             struct ggml_tensor  * as,
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
+
+    // weighted slot reduction of MUL_MAT_ID expert outputs: for each token,
+    // accumulate the n_expert_used slots in ascending slot order, weighting
+    // each slot whose expert id lies in [expert_id_offset, expert_id_offset +
+    // expert_id_count) and contributing an exact +0.0f for all other slots.
+    // Slots outside the expert range are never read, so they may hold
+    // undefined values (e.g. from a zero-fill-free expert-sliced MUL_MAT_ID).
+    // experts: [ne0, n_expert_used, n_tokens] f32
+    // weights: [1, n_expert_used, n_tokens] or [1, n_expert_used, 1, n_tokens] f32 (broadcast strides allowed)
+    // ids:     [n_expert_used, n_tokens] i32
+    // result:  [ne0, n_tokens] f32
+    GGML_API struct ggml_tensor * ggml_moe_wreduce(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * experts,
+            struct ggml_tensor  * weights,
+            struct ggml_tensor  * ids,
+            int32_t               expert_id_offset,
+            int32_t               expert_id_count);
 
     // A: m columns, n rows,
     // B: p columns, n rows,

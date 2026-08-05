@@ -29,6 +29,7 @@
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
+#include "ggml-cuda/mmid.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
@@ -2315,6 +2316,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_MUL_MAT_ID:
             ggml_cuda_mul_mat_id(ctx, dst);
+            break;
+        case GGML_OP_MOE_WREDUCE:
+            ggml_cuda_moe_wreduce(ctx, dst);
             break;
         case GGML_OP_OUT_PROD:
             ggml_cuda_out_prod(ctx, dst);
@@ -5281,6 +5285,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     return false;
             }
             break;
+        case GGML_OP_MOE_WREDUCE:
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_I32 &&
+                op->src[0]->nb[0] == sizeof(float) && op->src[1]->nb[0] == sizeof(float) && op->src[2]->nb[0] == sizeof(int32_t);
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
             {

@@ -124,9 +124,14 @@ void ggml_cuda_mul_mat_q(
     const bool expert_slice = ids && expert_id_total > ne02;
     if (expert_slice) {
         GGML_ASSERT(expert_id_offset >= 0 && expert_id_offset + ne02 <= expert_id_total);
-        ggml_cuda_launch_mm_id_zero_invalid((const int32_t *) ids->data, dst_d, ne0, ids->ne[0], ne2,
-            ids->nb[1] / sizeof(int32_t), s1, s2, expert_id_offset, ne02, stream);
-        CUDA_CHECK(cudaGetLastError());
+        // op_params[4]: the caller guarantees that slots outside this expert
+        // slice are never read (e.g. the sole consumer is GGML_OP_MOE_WREDUCE),
+        // making the zero-fill of those slots dead work.
+        if (ggml_get_op_params_i32(dst, 4) == 0) {
+            ggml_cuda_launch_mm_id_zero_invalid((const int32_t *) ids->data, dst_d, ne0, ids->ne[0], ne2,
+                ids->nb[1] / sizeof(int32_t), s1, s2, expert_id_offset, ne02, stream);
+            CUDA_CHECK(cudaGetLastError());
+        }
     }
 
     const bool fallback = ne01 % 128 != 0;
@@ -167,7 +172,7 @@ void ggml_cuda_mul_mat_q(
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
-            ne1};
+            ne1, 0};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
         return;
     }
@@ -244,12 +249,18 @@ void ggml_cuda_mul_mat_q(
     const int64_t s13 = ne12*s12;
 
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
+    // For J selection use the typical number of compact rows per expert; for an
+    // expert slice the rows spread over expert_id_total experts, not just ne02.
+    // Inflate by 25% (router variance) and round up to a multiple of 16 so the
+    // chosen tile keeps the wide MMA warp layout for most experts.
+    const int64_t rows_typ = ne_get_rows / (expert_slice ? expert_id_total : ne02);
+    const int64_t ncols_j = std::min<int64_t>(128, GGML_PAD(rows_typ + rows_typ/4, 16));
     const mmq_args args = {
         src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), dst_d,
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
-        ne12};
+        ne12, ncols_j};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 }

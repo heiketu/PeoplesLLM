@@ -2419,6 +2419,57 @@ static void ggml_compute_forward_mul_mat_id(
     }
 }
 
+// ggml_compute_forward_moe_wreduce
+
+static void ggml_compute_forward_moe_wreduce(
+        const struct ggml_compute_params * params,
+              struct ggml_tensor * dst) {
+
+    const struct ggml_tensor * experts = dst->src[0];
+    const struct ggml_tensor * weights = dst->src[1];
+    const struct ggml_tensor * ids     = dst->src[2];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t ne0 = experts->ne[0]; // rows per slot
+    const int64_t neu = experts->ne[1]; // n_expert_used
+    const int64_t nt  = experts->ne[2]; // n_tokens
+
+    const int32_t expert_id_offset = ggml_get_op_params_i32(dst, 0);
+    const int32_t expert_id_count  = ggml_get_op_params_i32(dst, 1);
+
+    GGML_ASSERT(dst->nb[0] == sizeof(float));
+
+    const size_t wb_token = weights->ne[2] == 1 ? weights->nb[3] : weights->nb[2];
+
+    const int64_t total = ne0*nt;
+    const int64_t dr    = (total + nth - 1)/nth;
+    const int64_t ir0   = dr*ith;
+    const int64_t ir1   = MIN(ir0 + dr, total);
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t row   = ir % ne0;
+        const int64_t token = ir / ne0;
+
+        const char * experts_row = (const char *) experts->data + row*experts->nb[0] + token*experts->nb[2];
+        const char * weights_tok = (const char *) weights->data + token*wb_token;
+        const char * ids_tok     = (const char *) ids->data     + token*ids->nb[1];
+
+        // ascending slot order, matching the unfused weighted add chain
+        float acc = 0.0f;
+        for (int64_t slot = 0; slot < neu; ++slot) {
+            const int32_t expert = *(const int32_t *) (ids_tok + slot*ids->nb[0]);
+            if (expert >= expert_id_offset && expert < expert_id_offset + expert_id_count) {
+                const float e = *(const float *) (experts_row + slot*experts->nb[1]);
+                const float w = *(const float *) (weights_tok + slot*weights->nb[1]);
+                acc += e*w;
+            }
+        }
+        *(float *) ((char *) dst->data + row*dst->nb[0] + token*dst->nb[1]) = acc;
+    }
+}
+
 /////////////////////////////////
 
 static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
@@ -2553,6 +2604,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_MUL_MAT_ID:
             {
                 ggml_compute_forward_mul_mat_id(params, tensor);
+            } break;
+        case GGML_OP_MOE_WREDUCE:
+            {
+                ggml_compute_forward_moe_wreduce(params, tensor);
             } break;
         case GGML_OP_OUT_PROD:
             {
@@ -3097,6 +3152,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_CONCAT:
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
+        case GGML_OP_MOE_WREDUCE:
         case GGML_OP_OUT_PROD:
             {
                 n_tasks = n_threads;

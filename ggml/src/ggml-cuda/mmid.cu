@@ -201,3 +201,72 @@ void ggml_cuda_launch_mm_id_zero_invalid(
         ids, dst, nrows, n_expert_used, nelements, ids_stride_token, stride_slot, stride_token,
         expert_id_offset, expert_id_count);
 }
+
+// Weighted slot reduction of expert-sliced MUL_MAT_ID outputs. For each
+// (row, token) accumulate the n_expert_used slots in ascending slot order,
+// keeping only slots whose expert id lies in the rank's expert range. Slots
+// outside the range contribute nothing and are never read.
+static __global__ void moe_wreduce(
+        const float * __restrict__ experts, const float * __restrict__ weights, const int32_t * __restrict__ ids,
+        float * __restrict__ dst, int64_t nrows, int64_t n_expert_used, int64_t n_tokens,
+        int64_t experts_stride_slot, int64_t experts_stride_token,
+        int64_t weights_stride_slot, int64_t weights_stride_token,
+        int64_t ids_stride_token, int64_t dst_stride_token,
+        int expert_id_offset, int expert_id_count) {
+    const int64_t nelements = nrows * n_tokens;
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+            i < nelements; i += (int64_t) blockDim.x * gridDim.x) {
+        const int64_t row   = i % nrows;
+        const int64_t token = i / nrows;
+
+        const float * __restrict__ experts_row = experts + row + token * experts_stride_token;
+        const float * __restrict__ weights_tok = weights + token * weights_stride_token;
+        const int32_t * __restrict__ ids_tok   = ids     + token * ids_stride_token;
+
+        float acc = 0.0f;
+        for (int64_t slot = 0; slot < n_expert_used; ++slot) {
+            const int32_t expert = ids_tok[slot];
+            if (expert >= expert_id_offset && expert < expert_id_offset + expert_id_count) {
+                acc += experts_row[slot * experts_stride_slot] * weights_tok[slot * weights_stride_slot];
+            }
+        }
+        dst[token * dst_stride_token + row] = acc;
+    }
+}
+
+void ggml_cuda_moe_wreduce(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * experts = dst->src[0];
+    const ggml_tensor * weights = dst->src[1];
+    const ggml_tensor * ids     = dst->src[2];
+
+    GGML_ASSERT(experts->type == GGML_TYPE_F32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(ids->type     == GGML_TYPE_I32);
+    GGML_ASSERT(experts->nb[0] == sizeof(float));
+    GGML_ASSERT(weights->nb[0] == sizeof(float));
+    GGML_ASSERT(ids->nb[0]     == sizeof(int32_t));
+    GGML_ASSERT(dst->nb[0]     == sizeof(float));
+
+    const int64_t nrows         = experts->ne[0];
+    const int64_t n_expert_used = experts->ne[1];
+    const int64_t n_tokens      = experts->ne[2];
+
+    const int expert_id_offset = ggml_get_op_params_i32(dst, 0);
+    const int expert_id_count  = ggml_get_op_params_i32(dst, 1);
+
+    const size_t weights_stride_token = weights->ne[2] == 1 ? weights->nb[3] : weights->nb[2];
+
+    cudaStream_t stream = ctx.stream();
+
+    const int64_t nelements = nrows * n_tokens;
+    const int block_size = 256;
+    const int num_blocks = (int) std::min<int64_t>((nelements + block_size - 1) / block_size, 65535);
+    moe_wreduce<<<num_blocks, block_size, 0, stream>>>(
+        (const float *) experts->data, (const float *) weights->data, (const int32_t *) ids->data,
+        (float *) dst->data, nrows, n_expert_used, n_tokens,
+        experts->nb[1] / sizeof(float), experts->nb[2] / sizeof(float),
+        weights->nb[1] / sizeof(float), weights_stride_token / sizeof(float),
+        ids->nb[1] / sizeof(int32_t), dst->nb[1] / sizeof(float),
+        expert_id_offset, expert_id_count);
+    CUDA_CHECK(cudaGetLastError());
+}

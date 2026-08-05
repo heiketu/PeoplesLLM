@@ -2245,6 +2245,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 (int32_t) n_expert,
             };
             memcpy(node->op_params + 2, expert_range, sizeof(expert_range));
+            // slots outside this rank are consumed only by ggml_moe_wreduce,
+            // which never reads them: skip the zero-fill of the full dst
+            const int32_t skip_zero_invalid = 1;
+            memcpy(node->op_params + 4, &skip_zero_invalid, sizeof(skip_zero_invalid));
             return node;
         };
 
@@ -2268,22 +2272,17 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
             ggml_tensor * experts_ep = mul_mat_id_ep(down_exps, act_ep, rank);
             cb(experts_ep, rank == 0 ? "ffn_moe_ep0_down" : "ffn_moe_ep1_down", il);
-            experts_ep = ggml_mul(ctx0, experts_ep, weights);
-            cb(experts_ep, rank == 0 ? "ffn_moe_ep0_weighted" : "ffn_moe_ep1_weighted", il);
             ggml_build_forward_expand(gf, experts_ep);
 
-            // Reduce the six routed slots on their owner before the cross-device
-            // merge. This cuts the NVLink transfer and the live merge tensor by
+            // Fused weighted slot reduction on the owning rank: accumulate the
+            // slots in ascending order, keeping only those owned by this rank.
+            // Bit-identical to the previous mul-by-weights + ascending adds,
+            // but reads each local slot once and skips the others entirely.
+            // This cuts the NVLink transfer and the live merge tensor by
             // n_expert_used, which is required for long-context streaming.
-            ggml_tensor * partial = ggml_view_2d(ctx0, experts_ep, n_embd, n_tokens,
-                experts_ep->nb[2], 0);
+            ggml_tensor * partial = ggml_moe_wreduce(ctx0, experts_ep, weights, selected_experts,
+                (int32_t) (rank * experts_per_rank), (int32_t) experts_per_rank);
             ggml_build_forward_expand(gf, partial);
-            for (uint32_t i = 1; i < hparams.n_expert_used; ++i) {
-                ggml_tensor * slot = ggml_view_2d(ctx0, experts_ep, n_embd, n_tokens,
-                    experts_ep->nb[2], i * experts_ep->nb[1]);
-                partial = ggml_add(ctx0, partial, slot);
-                ggml_build_forward_expand(gf, partial);
-            }
             cb(partial, rank == 0 ? "ffn_moe_ep0_partial" : "ffn_moe_ep1_partial", il);
             return partial;
         };

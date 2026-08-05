@@ -1278,6 +1278,7 @@ struct mmq_args {
     int64_t nchannels_x; int64_t nchannels_y; int64_t stride_channel_x; int64_t stride_channel_y; int64_t stride_channel_dst;
     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
     int64_t ncols_max;
+    int64_t ncols_j; // column count for tile-width (J) selection only; 0 = use ncols_max
 };
 
 static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const int cc) {
@@ -1378,6 +1379,22 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
     int J_best        = 0;
     int ntiles_J_best = INT_MAX;
 
+    // For MoE the columns are grouped by expert; ncols_j holds the typical
+    // number of rows per expert so J is chosen for per-expert utilization
+    // rather than for the (much larger) global column count.
+    const int64_t ncols_j = args.ncols_j > 0 ? args.ncols_j : args.ncols_max;
+
+    // experimental override for A/B measurements of the MoE tile width
+    static const int moe_j_env = []() {
+        const char * value = getenv("GGML_CUDA_MMQ_MOE_J");
+        return value ? atoi(value) : 0;
+    }();
+    if (args.ids_dst != nullptr && moe_j_env >= 8 && moe_j_env <= 128 && moe_j_env % 8 == 0 &&
+            ggml_cuda_mmq_get_config(type, moe_j_env, fallback, cc).type != GGML_TYPE_COUNT) {
+        J_best = moe_j_env;
+        ntiles_J_best = 1;
+    }
+
     for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
         const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
         if (config.type == GGML_TYPE_COUNT) {
@@ -1388,7 +1405,7 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
             continue;
         }
 
-        const int ntiles_x = (args.ncols_max + config.J - 1) / config.J;
+        const int ntiles_x = (ncols_j + config.J - 1) / config.J;
 
         if (ntiles_x < ntiles_J_best) {
             J_best = J;

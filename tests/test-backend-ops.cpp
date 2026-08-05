@@ -33,6 +33,7 @@
 #include <ctime>
 #include <future>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -4700,6 +4701,68 @@ struct test_mul_mat_id_ep : public test_case {
                         data[i] = (int32_t) ((row + i * 7) % n_mats);
                     }
                     ggml_backend_tensor_set(t, data.data(), row * t->nb[1], data.size() * sizeof(int32_t));
+                }
+            } else if (!ggml_is_view_op(t->op)) {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// GGML_OP_MOE_WREDUCE
+struct test_moe_wreduce : public test_case {
+    const int n_mats;
+    const int n_used;
+    const int64_t m; // rows per slot
+    const int64_t n; // tokens
+    const int expert_id_offset;
+    const int expert_id_count;
+
+    std::string vars() override {
+        return VARS_TO_STR6(n_mats, n_used, m, n, expert_id_offset, expert_id_count);
+    }
+
+    test_moe_wreduce(int n_mats, int n_used, int64_t m, int64_t n, int expert_id_offset, int expert_id_count)
+        : n_mats(n_mats), n_used(n_used), m(m), n(n), expert_id_offset(expert_id_offset), expert_id_count(expert_id_count) {
+        GGML_ASSERT(expert_id_offset >= 0 && expert_id_offset + expert_id_count <= n_mats);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * experts = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, m, n_used, n);
+        ggml_set_name(experts, "experts_wr");
+
+        ggml_tensor * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, n);
+        ggml_set_name(weights, "weights_wr");
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n);
+        ggml_set_name(ids, "ids_wr");
+
+        ggml_tensor * out = ggml_moe_wreduce(ctx, experts, weights, ids, expert_id_offset, expert_id_count);
+        ggml_set_name(out, "out_wr");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "ids_wr") == 0) {
+                std::vector<int32_t> data(n_used);
+                for (int64_t row = 0; row < n; ++row) {
+                    for (int i = 0; i < n_used; ++i) {
+                        data[i] = (int32_t) ((row + i * 7) % n_mats);
+                    }
+                    ggml_backend_tensor_set(t, data.data(), row * t->nb[1], data.size() * sizeof(int32_t));
+                }
+            } else if (strcmp(t->name, "experts_wr") == 0) {
+                init_tensor_uniform(t);
+                // poison out-of-range slots: implementations must never read them
+                std::vector<float> slice(m, std::numeric_limits<float>::quiet_NaN());
+                for (int64_t row = 0; row < n; ++row) {
+                    for (int i = 0; i < n_used; ++i) {
+                        const int32_t expert = (int32_t) ((row + i * 7) % n_mats);
+                        if (expert < expert_id_offset || expert >= expert_id_offset + expert_id_count) {
+                            ggml_backend_tensor_set(t, slice.data(), row * t->nb[2] + i * t->nb[1], m * sizeof(float));
+                        }
+                    }
                 }
             } else if (!ggml_is_view_op(t->op)) {
                 init_tensor_uniform(t);
@@ -9425,6 +9488,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id_ep(GGML_TYPE_MXFP4, 256, 6, false, 128, 2048, 128));
     test_cases.emplace_back(new test_mul_mat_id_ep(GGML_TYPE_MXFP4, 256, 6, true, 128, 2048, 128));
 
+    // DSV4-style dual-rank EP slot reduction: both rank slices and the full range
+    test_cases.emplace_back(new test_moe_wreduce(256, 6, 128, 129, 0,   128));
+    test_cases.emplace_back(new test_moe_wreduce(256, 6, 128, 129, 128, 128));
+    test_cases.emplace_back(new test_moe_wreduce(256, 6, 512, 2048, 0,   128));
+    test_cases.emplace_back(new test_moe_wreduce(256, 6, 512, 2048, 128, 128));
+    test_cases.emplace_back(new test_moe_wreduce(256, 6, 64, 5, 0, 256));
+    test_cases.emplace_back(new test_moe_wreduce(32,  4, 96, 17, 16, 8));
+
     for (ggml_type type_a : all_types) {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 64, 16, 3*ggml_blck_size(type_a)));
     }
@@ -10303,6 +10374,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 GGML_TYPE_Q3_K, GGML_TYPE_F32, 256, 6, false, 2048, bs, 4096));
         test_cases.emplace_back(new test_mul_mat_id(
                 GGML_TYPE_Q3_K, GGML_TYPE_F32, 256, 6, false, 4096, bs, 2048));
+    }
+
+    // DSV4 MXFP4 routed experts: gate/up (broadcast and per-slot) and down projections,
+    // plus the dual-rank EP expert-slice form.
+    for (int bs : {128, 512, 1024, 2048, 4096, 8192, 16384}) {
+        test_cases.emplace_back(new test_mul_mat_id(
+                GGML_TYPE_MXFP4, GGML_TYPE_F32, 256, 6, false, 2048, bs, 4096));
+        test_cases.emplace_back(new test_mul_mat_id(
+                GGML_TYPE_MXFP4, GGML_TYPE_F32, 256, 6, true,  2048, bs, 4096));
+        test_cases.emplace_back(new test_mul_mat_id(
+                GGML_TYPE_MXFP4, GGML_TYPE_F32, 256, 6, false, 4096, bs, 2048));
+        test_cases.emplace_back(new test_mul_mat_id(
+                GGML_TYPE_Q8_0,  GGML_TYPE_F32, 256, 6, false, 2048, bs, 4096));
+    }
+    for (int bs : {2048, 4096, 8192}) {
+        test_cases.emplace_back(new test_mul_mat_id_ep(GGML_TYPE_MXFP4, 256, 6, false, 2048, bs, 4096));
+        test_cases.emplace_back(new test_mul_mat_id_ep(GGML_TYPE_MXFP4, 256, 6, true,  2048, bs, 4096));
+        test_cases.emplace_back(new test_mul_mat_id_ep(GGML_TYPE_MXFP4, 256, 6, false, 4096, bs, 2048));
     }
 
     // qwen3-30b-a3b
