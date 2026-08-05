@@ -20,6 +20,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <array>
+#include <string>
 #include <vector>
 
 #ifdef __APPLE__
@@ -787,6 +789,19 @@ struct ggml_backend_sched_split {
     struct ggml_cgraph graph;
 };
 
+struct ggml_backend_sched_timing {
+    int n_splits = 0;
+    uint64_t seen = 0;
+    uint64_t count = 0;
+    double total_us = 0.0;
+    std::vector<double> input_us;
+    std::vector<double> graph_us;
+    std::vector<double> post_us;
+    std::vector<std::string> backend_names;
+    std::vector<int> n_inputs;
+    std::vector<std::string> labels;
+};
+
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
@@ -841,12 +856,144 @@ struct ggml_backend_sched {
     int debug_realloc;
     int debug_graph_size;
     int debug_prev_graph_size;
+
+    ggml_backend_sched_timing * timing;
 };
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
 #define tensor_backend_id(tensor) sched->hv_tensor_backend_ids[hash_id(tensor)]
 #define tensor_id_copy(id, backend_id, copy_id) sched->hv_tensor_copies[(id) * sched->n_backends * sched->n_copies + (backend_id) * sched->n_copies + (copy_id)]
 #define tensor_copy(tensor, backend_id, copy_id) tensor_id_copy(hash_id(tensor), backend_id, copy_id)
+
+static uint64_t ggml_sched_timing_env_u64(const char * name, uint64_t default_value) {
+    const char * value = getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return default_value;
+    }
+
+    char * end = nullptr;
+    const unsigned long long parsed = strtoull(value, &end, 10);
+    return end != value && *end == '\0' ? (uint64_t) parsed : default_value;
+}
+
+static bool ggml_sched_timing_enabled() {
+    static const bool enabled = [] {
+        const char * value = getenv("GGML_SCHED_TIMING");
+        return value != nullptr && atoi(value) != 0;
+    }();
+    return enabled;
+}
+
+static int ggml_sched_timing_split_filter() {
+    static const int filter = (int) ggml_sched_timing_env_u64("GGML_SCHED_TIMING_SPLITS", 0);
+    return filter;
+}
+
+static uint64_t ggml_sched_timing_skip() {
+    static const uint64_t skip = ggml_sched_timing_env_u64("GGML_SCHED_TIMING_SKIP", 0);
+    return skip;
+}
+
+static uint64_t ggml_sched_timing_min_samples() {
+    static const uint64_t min_samples = ggml_sched_timing_env_u64("GGML_SCHED_TIMING_MIN_SAMPLES", 1);
+    return min_samples;
+}
+
+static std::string ggml_sched_timing_split_label(const ggml_backend_sched_split & split) {
+    const ggml_tensor * first = nullptr;
+    const ggml_tensor * last = nullptr;
+    for (int i = 0; i < split.graph.n_nodes; ++i) {
+        const ggml_tensor * node = split.graph.nodes[i];
+        if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+        if (first == nullptr) {
+            first = node;
+        }
+        last = node;
+    }
+
+    if (first == nullptr) {
+        return "empty";
+    }
+
+    const char * first_name = first->name[0] != '\0' ? first->name : ggml_op_name(first->op);
+    const char * last_name = last->name[0] != '\0' ? last->name : ggml_op_name(last->op);
+    return std::string(first_name) + ".." + last_name;
+}
+
+static ggml_backend_sched_timing * ggml_sched_timing_begin(
+        ggml_backend_sched_t sched,
+        bool * record) {
+    *record = false;
+    if (!ggml_sched_timing_enabled()) {
+        return nullptr;
+    }
+
+    const int split_filter = ggml_sched_timing_split_filter();
+    if (split_filter > 0 && sched->n_splits != split_filter) {
+        return nullptr;
+    }
+
+    if (sched->timing == nullptr || sched->timing->n_splits != sched->n_splits) {
+        delete sched->timing;
+        sched->timing = new ggml_backend_sched_timing;
+        sched->timing->n_splits = sched->n_splits;
+        sched->timing->input_us.resize(sched->n_splits);
+        sched->timing->graph_us.resize(sched->n_splits);
+        sched->timing->post_us.resize(sched->n_splits);
+        sched->timing->backend_names.resize(sched->n_splits);
+        sched->timing->n_inputs.resize(sched->n_splits);
+        sched->timing->labels.resize(sched->n_splits);
+        for (int i = 0; i < sched->n_splits; ++i) {
+            sched->timing->backend_names[i] = ggml_backend_name(
+                sched->backends[sched->splits[i].backend_id]);
+            sched->timing->n_inputs[i] = sched->splits[i].n_inputs;
+            sched->timing->labels[i] = ggml_sched_timing_split_label(sched->splits[i]);
+        }
+    }
+
+    ++sched->timing->seen;
+    *record = sched->timing->seen > ggml_sched_timing_skip();
+    return sched->timing;
+}
+
+static void ggml_sched_timing_report(const ggml_backend_sched_t sched) {
+    const ggml_backend_sched_timing * timing = sched->timing;
+    if (timing == nullptr || timing->count < ggml_sched_timing_min_samples()) {
+        return;
+    }
+
+    double input_sum_us = 0.0;
+    double graph_sum_us = 0.0;
+    double post_sum_us = 0.0;
+    for (int i = 0; i < timing->n_splits; ++i) {
+        input_sum_us += timing->input_us[i];
+        graph_sum_us += timing->graph_us[i];
+        post_sum_us += timing->post_us[i];
+    }
+
+    GGML_LOG_INFO(
+        "sched_timing_summary: splits=%d samples=%llu avg_total=%.4f ms avg_input=%.4f ms "
+        "avg_graph_submit=%.4f ms avg_post=%.4f ms skip=%llu\n",
+        timing->n_splits, (unsigned long long) timing->count,
+        timing->total_us/timing->count/1000.0,
+        input_sum_us/timing->count/1000.0,
+        graph_sum_us/timing->count/1000.0,
+        post_sum_us/timing->count/1000.0,
+        (unsigned long long) ggml_sched_timing_skip());
+
+    for (int i = 0; i < timing->n_splits; ++i) {
+        GGML_LOG_INFO(
+            "sched_timing_split: split=%d backend=%s inputs=%d avg_input=%.4f ms "
+            "avg_graph_submit=%.4f ms avg_post=%.4f ms label=%s\n",
+            i, timing->backend_names[i].c_str(), timing->n_inputs[i],
+            timing->input_us[i]/timing->count/1000.0,
+            timing->graph_us[i]/timing->count/1000.0,
+            timing->post_us[i]/timing->count/1000.0,
+            timing->labels[i].c_str());
+    }
+}
 
 // returns the priority of the backend, lower id is higher priority
 static int ggml_backend_sched_backend_id(ggml_backend_sched_t sched, ggml_backend_t backend) {
@@ -1295,7 +1442,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     }
                     // check if a weight is on a different and incompatible backend
                     // by starting a new split, the memory of the previously offloaded weights can be reused
-                    if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                    ggml_backend_buffer_t src_buffer = src->view_src ? src->view_src->buffer : src->buffer;
+                    if (src_buffer != NULL && src_buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
                         int src_backend_id = tensor_backend_id(src);
                         if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
                             need_new_split = true;
@@ -1558,14 +1706,175 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
+    static const bool profile_enabled = []() {
+        const char * env = getenv("GGML_SCHED_PROFILE");
+        return env && atoi(env) > 0;
+    }();
+    static const bool profile_inputs = []() {
+        const char * env = getenv("GGML_SCHED_PROFILE_INPUTS");
+        return env && atoi(env) > 0;
+    }();
+    bool timing_record = false;
+    ggml_backend_sched_timing * timing = ggml_sched_timing_begin(sched, &timing_record);
+    const bool measure_phases = profile_enabled || timing_record;
+    const int64_t timing_start_us = timing_record ? ggml_time_us() : 0;
+    const int64_t profile_start_us = profile_enabled ? ggml_time_us() : 0;
+    int64_t input_us = 0;
+    int64_t graph_us = 0;
+    int64_t refill_us = 0;
+    int64_t user_input_us = 0;
+    int64_t input_wait_us = 0;
+    int64_t moe_pp_us = 0;
+    int64_t moe_legacy_us = 0;
+    int64_t other_input_us = 0;
+    std::array<int64_t, GGML_SCHED_MAX_BACKENDS> backend_input_us = {};
+    std::array<int64_t, GGML_SCHED_MAX_BACKENDS> backend_graph_us = {};
+    std::array<int, GGML_SCHED_MAX_BACKENDS> backend_splits = {};
+    std::array<std::array<int64_t, GGML_SCHED_MAX_BACKENDS>, GGML_SCHED_MAX_BACKENDS> transfer_us = {};
+    std::array<std::array<size_t, GGML_SCHED_MAX_BACKENDS>, GGML_SCHED_MAX_BACKENDS> transfer_bytes = {};
+
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
+
+    typedef bool (*moe_prefetch_t)(ggml_backend_t, int, const void *, size_t);
+    typedef bool (*moe_prefetch_commit_t)(
+        ggml_backend_t, int, ggml_tensor *, size_t, size_t, ggml_backend_event_t);
+    typedef void (*cuda_graph_timing_input_begin_t)(ggml_backend_t, const ggml_cgraph *);
+
+    static const int64_t moe_pp_min_tokens = []() {
+        const char * value = getenv("GGML_CUDA_MOE_PP_MIN_TOKENS");
+        return value ? (int64_t) atoll(value) : (int64_t) 0;
+    }();
+    static const int moe_prefetch_depth = []() {
+        const char * value = getenv("GGML_CUDA_MOE_PP_PREFETCH");
+        return value ? std::max(0, std::min(4, atoi(value))) : 0;
+    }();
+    static const bool moe_defer_prefetch = []() {
+        const char * value = getenv("GGML_CUDA_MOE_PP_DEFER_PREFETCH");
+        return value && atoi(value) > 0;
+    }();
+
+    auto find_moe_weight_node = [&](const ggml_backend_sched_split & split, const ggml_tensor * input_cpy) {
+        for (int i = 0; i < split.graph.n_nodes; ++i) {
+            ggml_tensor * node = split.graph.nodes[i];
+            if (node->op == GGML_OP_MUL_MAT_ID && node->src[0] == input_cpy &&
+                    node->src[1]->ne[2] >= moe_pp_min_tokens) {
+                return node;
+            }
+        }
+        return (ggml_tensor *) nullptr;
+    };
+
+    struct moe_prefetch_candidate {
+        int split_id;
+        int input_id;
+    };
+    std::array<std::vector<moe_prefetch_candidate>, GGML_SCHED_MAX_BACKENDS> moe_candidates;
+    std::array<size_t, GGML_SCHED_MAX_BACKENDS> moe_next_candidate = {};
+    std::array<moe_prefetch_t, GGML_SCHED_MAX_BACKENDS> moe_prefetch_fns = {};
+    std::array<moe_prefetch_commit_t, GGML_SCHED_MAX_BACKENDS> moe_commit_fns = {};
+    std::vector<int> moe_slot_by_split(sched->n_splits, -1);
+    std::vector<int> moe_input_by_split(sched->n_splits, -1);
+    std::array<cuda_graph_timing_input_begin_t, GGML_SCHED_MAX_BACKENDS> cuda_graph_timing_input_begin = {};
+
+    static const bool cuda_graph_timing_include_inputs = []() {
+        const char * value = getenv("GGML_CUDA_GRAPH_TIMING_INCLUDE_INPUTS");
+        return value != nullptr && atoi(value) != 0;
+    }();
+    if (cuda_graph_timing_include_inputs) {
+        for (int backend_id = 0; backend_id < sched->n_backends; ++backend_id) {
+            ggml_backend_t backend = sched->backends[backend_id];
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+            cuda_graph_timing_input_begin[backend_id] = (cuda_graph_timing_input_begin_t)
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_graph_timing_input_begin");
+        }
+    }
+
+    if (moe_pp_min_tokens > 0 && moe_prefetch_depth > 0) {
+        for (int split_id = 0; split_id < sched->n_splits; ++split_id) {
+            ggml_backend_sched_split & split = splits[split_id];
+            if (split.graph.n_nodes == 0) {
+                continue;
+            }
+            for (int input_id = 0; input_id < split.n_inputs; ++input_id) {
+                ggml_tensor * input = split.inputs[input_id];
+                ggml_tensor * input_cpy = tensor_copy(input, split.backend_id, sched->cur_copy);
+                ggml_backend_buffer_t input_buffer = input->view_src ? input->view_src->buffer : input->buffer;
+                if (find_moe_weight_node(split, input_cpy) != nullptr &&
+                    input_buffer != nullptr &&
+                    ggml_backend_buffer_get_usage(input_buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                    ggml_backend_buffer_is_host(input_buffer)) {
+                    moe_candidates[split.backend_id].push_back({ split_id, input_id });
+                    break;
+                }
+            }
+        }
+
+        for (int backend_id = 0; backend_id < sched->n_backends; ++backend_id) {
+            if (moe_candidates[backend_id].empty()) {
+                continue;
+            }
+            ggml_backend_t backend = sched->backends[backend_id];
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+            moe_prefetch_fns[backend_id] = (moe_prefetch_t)
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_moe_prefetch");
+            moe_commit_fns[backend_id] = (moe_prefetch_commit_t)
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_moe_prefetch_commit");
+            if (moe_prefetch_fns[backend_id] == nullptr || moe_commit_fns[backend_id] == nullptr) {
+                continue;
+            }
+        }
+    }
+
+    bool prefetch_started = false;
+    auto start_initial_prefetch = [&]() {
+        if (prefetch_started) {
+            return;
+        }
+        prefetch_started = true;
+        for (int backend_id = 0; backend_id < sched->n_backends; ++backend_id) {
+            if (moe_candidates[backend_id].empty() || moe_prefetch_fns[backend_id] == nullptr) {
+                continue;
+            }
+            ggml_backend_t backend = sched->backends[backend_id];
+            const size_t initial = std::min<size_t>(moe_prefetch_depth, moe_candidates[backend_id].size());
+            for (size_t pos = 0; pos < initial; ++pos) {
+                const auto candidate = moe_candidates[backend_id][pos];
+                ggml_tensor * input = splits[candidate.split_id].inputs[candidate.input_id];
+                const int slot = (int) pos;
+                if (!moe_prefetch_fns[backend_id](backend, slot, input->data, ggml_nbytes(input))) {
+                    break;
+                }
+                moe_slot_by_split[candidate.split_id] = slot;
+                moe_input_by_split[candidate.split_id] = candidate.input_id;
+                moe_next_candidate[backend_id] = pos + 1;
+            }
+        }
+    };
+
+    bool defer_initial_prefetch = moe_defer_prefetch;
+    for (int backend_id = 0; backend_id < sched->n_backends; ++backend_id) {
+        if (!moe_candidates[backend_id].empty() && moe_candidates[backend_id][0].split_id == 0) {
+            defer_initial_prefetch = false;
+            break;
+        }
+    }
+    if (!defer_initial_prefetch) {
+        start_initial_prefetch();
+    }
+
+    const int64_t setup_us = profile_enabled ? ggml_time_us() - profile_start_us : 0;
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        int moe_slot_used = -1;
+        if (cuda_graph_timing_input_begin[split_backend_id] != nullptr) {
+            cuda_graph_timing_input_begin[split_backend_id](split_backend, &split->graph);
+        }
+        const int64_t input_start_us = measure_phases ? ggml_time_us() : 0;
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
@@ -1573,7 +1882,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
-            if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+            if ((input->flags & GGML_TENSOR_FLAG_INPUT) &&
+                    !(input->flags & GGML_TENSOR_FLAG_INPUT_PERSISTENT)) {
+                const int64_t user_input_start_us = profile_enabled ? ggml_time_us() : 0;
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
@@ -1581,22 +1892,60 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     ggml_backend_synchronize(split_backend);
                 }
                 ggml_backend_tensor_copy(input, input_cpy);
+                if (profile_enabled) {
+                    const int64_t elapsed_us = ggml_time_us() - user_input_start_us;
+                    user_input_us += elapsed_us;
+                    if (profile_inputs && elapsed_us >= 1000) {
+                        GGML_LOG_INFO("sched_profile_input: split %d backend %s user %s %.3f ms %.3f MiB\n",
+                            split_id, ggml_backend_name(split_backend), input->name,
+                            elapsed_us/1000.0, ggml_nbytes(input)/(1024.0*1024.0));
+                    }
+                }
             } else {
+                const int64_t input_wait_start_us = profile_enabled ? ggml_time_us() : 0;
                 // wait for the split backend to finish using the input before overwriting it
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
                 } else {
                     ggml_backend_synchronize(split_backend);
                 }
+                if (profile_enabled) {
+                    const int64_t elapsed_us = ggml_time_us() - input_wait_start_us;
+                    input_wait_us += elapsed_us;
+                    if (profile_inputs && elapsed_us >= 1000) {
+                        GGML_LOG_INFO("sched_profile_input: split %d backend %s wait %s %.3f ms %.3f MiB\n",
+                            split_id, ggml_backend_name(split_backend), input->name,
+                            elapsed_us/1000.0, ggml_nbytes(input)/(1024.0*1024.0));
+                    }
+                }
 
                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
-                ggml_tensor * node = split->graph.nodes[0];
-                if (split->graph.n_nodes > 0 &&
-                    ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
-                    ggml_backend_buffer_is_host(input->buffer) && (
-                    (node->src[0] == input_cpy && node->op == GGML_OP_MUL_MAT_ID)
-                    //|| (node->src[1] == input_cpy && node->op == GGML_OP_ADD_ID) /* GGML_OP_ADD_ID weights are small and not worth splitting */
-                    )) {
+                ggml_tensor * node = find_moe_weight_node(*split, input_cpy);
+                ggml_backend_buffer_t input_buffer = input->view_src ? input->view_src->buffer : input->buffer;
+                if (node != nullptr && input_buffer != nullptr &&
+                    ggml_backend_buffer_get_usage(input_buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                    ggml_backend_buffer_is_host(input_buffer)) {
+
+                    if (moe_pp_min_tokens > 0 && node->src[1]->ne[2] >= moe_pp_min_tokens) {
+                        const int64_t moe_pp_start_us = profile_enabled ? ggml_time_us() : 0;
+                        const int slot = moe_slot_by_split[split_id];
+                        const ggml_backend_event_t reuse_event =
+                            sched->events[split_backend_id][sched->cur_copy];
+                        if (slot >= 0 && moe_input_by_split[split_id] == input_id &&
+                            moe_commit_fns[split_backend_id] != nullptr &&
+                            moe_commit_fns[split_backend_id](
+                                split_backend, slot, input_cpy, 0, ggml_nbytes(input), reuse_event)) {
+                            moe_slot_used = slot;
+                        } else {
+                            ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                        }
+                        if (profile_enabled) {
+                            moe_pp_us += ggml_time_us() - moe_pp_start_us;
+                        }
+                        continue;
+                    }
+
+                    const int64_t moe_legacy_start_us = profile_enabled ? ggml_time_us() : 0;
 
                     const int64_t n_expert   = node->op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1];
                     const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
@@ -1674,7 +2023,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         last_id = id;
                     }
                     copy_experts(first_id, last_id);
+                    if (profile_enabled) {
+                        moe_legacy_us += ggml_time_us() - moe_legacy_start_us;
+                    }
                 } else {
+                    const int64_t other_input_start_us = profile_enabled ? ggml_time_us() : 0;
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
                     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
@@ -1686,10 +2039,36 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         }
                         ggml_backend_tensor_copy(input, input_cpy);
                     }
+                    if (profile_enabled) {
+                        const int64_t elapsed_us = ggml_time_us() - other_input_start_us;
+                        other_input_us += elapsed_us;
+                        const int input_backend_id = ggml_backend_sched_backend_id(sched, input_backend);
+                        if (input_backend_id >= 0) {
+                            transfer_us[input_backend_id][split_backend_id] += elapsed_us;
+                            transfer_bytes[input_backend_id][split_backend_id] += ggml_nbytes(input);
+                            if (profile_inputs && elapsed_us >= 1000) {
+                                GGML_LOG_INFO("sched_profile_input: split %d transfer %s -> %s %s %.3f ms %.3f MiB\n",
+                                        split_id, ggml_backend_name(input_backend),
+                                        ggml_backend_name(split_backend), input->name,
+                                        elapsed_us/1000.0, ggml_nbytes(input)/(1024.0*1024.0));
+                            }
+                        }
+                    }
                 }
             }
         }
+        if (measure_phases) {
+            const int64_t elapsed_us = ggml_time_us() - input_start_us;
+            if (profile_enabled) {
+                input_us += elapsed_us;
+                backend_input_us[split_backend_id] += elapsed_us;
+            }
+            if (timing_record) {
+                timing->input_us[split_id] += elapsed_us;
+            }
+        }
 
+        const int64_t graph_start_us = measure_phases ? ggml_time_us() : 0;
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
@@ -1728,11 +2107,80 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 j0 = j1;
             }
         }
+        if (measure_phases) {
+            const int64_t elapsed_us = ggml_time_us() - graph_start_us;
+            if (profile_enabled) {
+                graph_us += elapsed_us;
+                backend_graph_us[split_backend_id] += elapsed_us;
+                backend_splits[split_backend_id]++;
+            }
+            if (timing_record) {
+                timing->graph_us[split_id] += elapsed_us;
+            }
+        }
+
+        const int64_t post_start_us = timing_record ? ggml_time_us() : 0;
 
         // record the event of this copy
         if (split->n_inputs > 0) {
             if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
+            }
+        }
+
+        const int64_t refill_start_us = profile_enabled ? ggml_time_us() : 0;
+        start_initial_prefetch();
+        if (moe_slot_used >= 0 && moe_prefetch_fns[split_backend_id] != nullptr) {
+            size_t & next = moe_next_candidate[split_backend_id];
+            if (next < moe_candidates[split_backend_id].size()) {
+                const auto candidate = moe_candidates[split_backend_id][next];
+                ggml_tensor * input = splits[candidate.split_id].inputs[candidate.input_id];
+                if (moe_prefetch_fns[split_backend_id](
+                        split_backend, moe_slot_used, input->data, ggml_nbytes(input))) {
+                    moe_slot_by_split[candidate.split_id] = moe_slot_used;
+                    moe_input_by_split[candidate.split_id] = candidate.input_id;
+                    ++next;
+                }
+            }
+        }
+        if (profile_enabled) {
+            refill_us += ggml_time_us() - refill_start_us;
+        }
+        if (timing_record) {
+            timing->post_us[split_id] += ggml_time_us() - post_start_us;
+        }
+    }
+
+    if (timing_record) {
+        timing->total_us += ggml_time_us() - timing_start_us;
+        ++timing->count;
+    }
+
+    if (profile_enabled) {
+        const int64_t total_us = ggml_time_us() - profile_start_us;
+        GGML_LOG_INFO("sched_profile: splits %d, total %.3f ms, setup %.3f ms, inputs %.3f ms, graph %.3f ms, refill %.3f ms, user %.3f ms, wait %.3f ms, moe_pp %.3f ms, moe_legacy %.3f ms, other %.3f ms\n",
+                sched->n_splits, total_us/1000.0, setup_us/1000.0,
+                input_us/1000.0, graph_us/1000.0, refill_us/1000.0,
+                user_input_us/1000.0, input_wait_us/1000.0, moe_pp_us/1000.0,
+                moe_legacy_us/1000.0, other_input_us/1000.0);
+        for (int backend_id = 0; backend_id < sched->n_backends; ++backend_id) {
+            if (backend_splits[backend_id] == 0 && backend_input_us[backend_id] == 0) {
+                continue;
+            }
+            GGML_LOG_INFO("sched_profile_backend: backend %s, splits %d, inputs %.3f ms, graph %.3f ms\n",
+                    ggml_backend_name(sched->backends[backend_id]), backend_splits[backend_id],
+                    backend_input_us[backend_id]/1000.0, backend_graph_us[backend_id]/1000.0);
+        }
+        for (int src_id = 0; src_id < sched->n_backends; ++src_id) {
+            for (int dst_id = 0; dst_id < sched->n_backends; ++dst_id) {
+                if (transfer_bytes[src_id][dst_id] == 0) {
+                    continue;
+                }
+                GGML_LOG_INFO("sched_profile_transfer: src %s, dst %s, time %.3f ms, bytes %.3f MiB\n",
+                        ggml_backend_name(sched->backends[src_id]),
+                        ggml_backend_name(sched->backends[dst_id]),
+                        transfer_us[src_id][dst_id]/1000.0,
+                        transfer_bytes[src_id][dst_id]/(1024.0*1024.0));
             }
         }
     }
@@ -1813,6 +2261,8 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
     }
+    ggml_sched_timing_report(sched);
+    delete sched->timing;
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);

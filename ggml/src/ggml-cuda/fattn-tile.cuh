@@ -798,6 +798,13 @@ static __global__ void flash_attn_tile(
         const char * mask_ptr,
         const char * sinks_ptr,
         const int  * KV_max_ptr,
+        const int32_t * sparse_idx_ptr,
+        const int32_t sparse_n_raw,
+        const int32_t sparse_nb1,
+        const int64_t sparse_nb3,
+        const char * sparse_mask_ptr,
+        const int32_t sparse_mask_nb1,
+        const int64_t sparse_mask_nb3,
         float      * dst_ptr,
         float2     * dst_meta_ptr,
         const float scale,
@@ -813,6 +820,8 @@ static __global__ void flash_attn_tile(
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
                             const int32_t nb31, const int32_t nb32, const int64_t nb33) {
+    GGML_UNUSED_VARS(sparse_idx_ptr, sparse_n_raw, sparse_nb1, sparse_nb3,
+        sparse_mask_ptr, sparse_mask_nb1, sparse_mask_nb3);
 #ifdef FLASH_ATTN_AVAILABLE
     const char * GGML_CUDA_RESTRICT Q        = Q_ptr;
     const char * GGML_CUDA_RESTRICT K        = K_ptr;

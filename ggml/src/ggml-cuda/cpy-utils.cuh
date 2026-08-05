@@ -153,6 +153,23 @@ static __device__ void quantize_f32_q8_0_block(const float * __restrict__ x, blo
     }
 }
 
+static __device__ void quantize_f32_q8_0_block_nearest_even(
+        const float * __restrict__ x, block_q8_0 * __restrict__ y) {
+    float amax = 0.0f;
+    for (int j = 0; j < QK8_0; ++j) {
+        amax = fmaxf(amax, fabsf(x[j]));
+    }
+
+    // This path is used at a CPU_REPACK boundary and must match the x86
+    // quantizer even when the CUDA translation unit uses -use_fast_math.
+    const float d = __fdiv_rn(amax, 127.0f);
+    const float id = amax != 0.0f ? __fdiv_rn(127.0f, amax) : 0.0f;
+    y->d = __float2half_rn(d);
+    for (int j = 0; j < QK8_0; ++j) {
+        y->qs[j] = (int8_t) __float2int_rn(__fmul_rn(x[j], id));
+    }
+}
+
 static __device__ void quantize_f32_iq4_nl_block(const float * __restrict__ x, block_iq4_nl * __restrict__ y) {
     float amax = 0.0f;
     float vmax = 0.0f;
@@ -205,6 +222,10 @@ static __device__ void cpy_blck_f32_q5_1(const char * cxi, char * cdsti) {
 
 static __device__ void cpy_blck_f32_q8_0(const char * cxi, char * cdsti) {
     quantize_f32_q8_0_block((const float *)cxi, (block_q8_0 *)cdsti);
+}
+
+static __device__ void cpy_blck_f32_q8_0_nearest_even(const char * cxi, char * cdsti) {
+    quantize_f32_q8_0_block_nearest_even((const float *)cxi, (block_q8_0 *)cdsti);
 }
 
 static __device__ void cpy_blck_f32_iq4_nl(const char * cxi, char * cdsti) {

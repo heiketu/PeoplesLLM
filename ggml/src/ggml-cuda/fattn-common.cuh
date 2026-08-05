@@ -25,6 +25,13 @@ typedef void (* fattn_kernel_t)(
         const char * __restrict__ mask,
         const char * __restrict__ sinks,
         const int  * __restrict__ KV_max,
+        const int32_t * __restrict__ sparse_idx,
+        const int32_t sparse_n_raw,
+        const int32_t sparse_nb1,
+        const int64_t sparse_nb3,
+        const char * __restrict__ sparse_mask,
+        const int32_t sparse_mask_nb1,
+        const int64_t sparse_mask_nb3,
         float      * __restrict__ dst,
         float2     * __restrict__ dst_meta,
         const float scale,
@@ -711,11 +718,42 @@ static __global__ void flash_attn_mask_to_KV_max(
     // In either case, walk back the decrementation by FATTN_KQ_STRIDE.
     KV_max_sj += FATTN_KQ_STRIDE;
 
+    // Also record the first tile with any finite mask value. The max bounds
+    // occupy the first gridDim.x*gridDim.y entries and the min bounds the
+    // second half. Kernels that do not support lower-bound skipping simply
+    // continue reading the first half as before.
+    int KV_min_sj = 0;
+    for (; KV_min_sj < ne30 * FATTN_KQ_STRIDE; KV_min_sj += FATTN_KQ_STRIDE) {
+        int all_inf = 1;
+
+#pragma unroll
+        for (int j = 0; j < ncols1; ++j) {
+            const float2 tmp = __half22float2(mask[j*s31 + KV_min_sj/2 + tid]);
+            all_inf = all_inf && int(isinf(tmp.x)) && int(isinf(tmp.y));
+        }
+
+        all_inf = warp_reduce_all(all_inf);
+        if (tid % WARP_SIZE == 0) {
+            buf_iw[tid / WARP_SIZE] = all_inf;
+        }
+        __syncthreads();
+        all_inf = buf_iw[tid % WARP_SIZE];
+        __syncthreads();
+        all_inf = warp_reduce_all(all_inf);
+
+        if (!all_inf) {
+            break;
+        }
+    }
+
     if (threadIdx.x != 0) {
         return;
     }
 
-    KV_max[sequence*ne31 + jt] = KV_max_sj;
+    const int bounds_index = sequence*ne31 + jt;
+    const int bounds_count = gridDim.x*gridDim.y;
+    KV_max[bounds_index] = KV_max_sj;
+    KV_max[bounds_count + bounds_index] = KV_min_sj;
 }
 
 template<int D, int ncols1, int ncols2> // D == head size
@@ -969,6 +1007,280 @@ static __global__ void flash_attn_combine_results(
     dst[tid] = VKQ_numerator / VKQ_denominator;
 }
 
+struct alignas(16) fattn_sparse_2kv_meta {
+    uint64_t k2;
+    uint64_t v2;
+    int64_t  nb_k2_2;
+    int64_t  nb_k2_3;
+    int64_t  nb_v2_2;
+    int64_t  nb_v2_3;
+    int32_t  stride_k2;
+    int32_t  stride_v2;
+};
+
+static_assert(sizeof(fattn_sparse_2kv_meta) % sizeof(int32_t) == 0, "bad sparse 2KV metadata size");
+static constexpr int FATTN_SPARSE_2KV_META_I32 = sizeof(fattn_sparse_2kv_meta)/sizeof(int32_t);
+
+template <int ncols1>
+static __global__ void flash_attn_sparse_group_prepare(
+        const int32_t * __restrict__ top_k,
+        const half    * __restrict__ raw_mask,
+        const half    * __restrict__ compressed_mask,
+        int32_t       * __restrict__ group_rows,
+        half          * __restrict__ group_mask,
+        int           * __restrict__ kv_bounds,
+        const char    * __restrict__ k2,
+        const char    * __restrict__ v2,
+        const int64_t nb_k2_2,
+        const int64_t nb_k2_3,
+        const int64_t nb_v2_2,
+        const int64_t nb_v2_3,
+        const int stride_k2,
+        const int stride_v2,
+        const int n_query,
+        const int n_compressed,
+        const int k,
+        const int max_union,
+        const int raw_capacity,
+        const int group_capacity,
+        const int top_k_nb1,
+        const int64_t top_k_nb3,
+        const int raw_mask_nb1,
+        const int64_t raw_mask_nb3,
+        const int compressed_mask_nb1,
+        const int64_t compressed_mask_nb3,
+        const int n_raw,
+        const int bounds_count,
+        const bool initialize_min_bound,
+        const bool compact_raw) {
+    static_assert(ncols1 <= 8, "sparse query group mask uses one byte");
+
+    if (threadIdx.x != 0) {
+        return;
+    }
+
+    if (blockIdx.x == 0 && blockIdx.y == 0) {
+        fattn_sparse_2kv_meta * meta = reinterpret_cast<fattn_sparse_2kv_meta *>(
+            group_rows - FATTN_SPARSE_2KV_META_I32);
+        meta->k2 = reinterpret_cast<uint64_t>(k2);
+        meta->v2 = reinterpret_cast<uint64_t>(v2);
+        meta->nb_k2_2 = nb_k2_2;
+        meta->nb_k2_3 = nb_k2_3;
+        meta->nb_v2_2 = nb_v2_2;
+        meta->nb_v2_3 = nb_v2_3;
+        meta->stride_k2 = stride_k2;
+        meta->stride_v2 = stride_v2;
+    }
+
+    const int group = blockIdx.x;
+    const int sequence = blockIdx.y;
+    const int query0 = group*ncols1;
+    const int n_group_query = min(ncols1, n_query - query0);
+    const int group_stride = gridDim.x*(group_capacity + 2);
+    const int mask_group_stride = ncols1*group_capacity;
+
+    const int32_t * top_k_sequence = top_k + int64_t(sequence)*top_k_nb3;
+    const half * raw_mask_sequence = raw_mask + int64_t(sequence)*raw_mask_nb3;
+    const half * compressed_mask_sequence = compressed_mask + int64_t(sequence)*compressed_mask_nb3;
+    int32_t * rows_out = group_rows + int64_t(sequence)*group_stride + int64_t(group)*(group_capacity + 2);
+    half * mask_out = group_mask +
+        (int64_t(sequence)*gridDim.x + group)*mask_group_stride;
+
+    const int bounds_index = sequence*gridDim.x + group;
+    const int raw_begin = min(n_raw, max(0, kv_bounds[bounds_count + bounds_index]));
+    const int raw_end   = min(n_raw, max(0, kv_bounds[bounds_index]));
+    const int raw_span  = max(0, raw_end - raw_begin);
+    const bool use_compact_raw = compact_raw && raw_span <= raw_capacity;
+    rows_out[0] = use_compact_raw ? 1 : 0;
+    rows_out += 2;
+
+    int n_group_rows = 0;
+    if (use_compact_raw) {
+        for (int i = 0; i < raw_span; ++i) {
+            const int physical_row = raw_begin + i;
+            rows_out[n_group_rows] = physical_row;
+#pragma unroll
+            for (int j = 0; j < ncols1; ++j) {
+                mask_out[int64_t(j)*group_capacity + n_group_rows] = j < n_group_query ?
+                    raw_mask_sequence[int64_t(query0 + j)*raw_mask_nb1 + physical_row] :
+                    __float2half(-INFINITY);
+            }
+            ++n_group_rows;
+        }
+    }
+
+    int cursor[ncols1] = {};
+    int n_union = 0;
+
+    // The DSV4 producer marks top-k indices as sorted. Merge the adjacent
+    // query rows so each physical K/V row is loaded once by the ncols1=8 FA
+    // tile, while a compact mask preserves each query's exact selection.
+    while (n_union < max_union) {
+        int physical_row = INT_MAX;
+#pragma unroll
+        for (int j = 0; j < ncols1; ++j) {
+            if (j < n_group_query && cursor[j] < k) {
+                physical_row = min(physical_row,
+                    top_k_sequence[int64_t(query0 + j)*top_k_nb1 + cursor[j]]);
+            }
+        }
+        if (physical_row == INT_MAX) {
+            break;
+        }
+
+        const int compressed_row = physical_row >= 0 && physical_row < n_compressed ? physical_row : 0;
+        rows_out[n_group_rows + n_union] = use_compact_raw ? n_raw + compressed_row : compressed_row;
+#pragma unroll
+        for (int j = 0; j < ncols1; ++j) {
+            bool selected = false;
+            if (j < n_group_query && cursor[j] < k) {
+                const int32_t current = top_k_sequence[int64_t(query0 + j)*top_k_nb1 + cursor[j]];
+                selected = current == physical_row && physical_row >= 0 && physical_row < n_compressed;
+                if (current == physical_row) {
+                    ++cursor[j];
+                }
+            }
+            mask_out[int64_t(j)*group_capacity + n_group_rows + n_union] = selected ?
+                compressed_mask_sequence[int64_t(query0 + j)*compressed_mask_nb1 + physical_row] :
+                __float2half(-INFINITY);
+        }
+        ++n_union;
+    }
+
+    // The last MMA tile can extend past the group union. Valid row zero plus
+    // an all-masked value keeps those padded lanes harmless.
+    for (int i = n_group_rows + n_union; i < group_capacity; ++i) {
+        rows_out[i] = 0;
+#pragma unroll
+        for (int j = 0; j < ncols1; ++j) {
+            mask_out[int64_t(j)*group_capacity + i] = __float2half(-INFINITY);
+        }
+    }
+
+    const int n_logical_rows = use_compact_raw ? n_group_rows + n_union : n_raw + n_union;
+    rows_out[-1] = n_logical_rows;
+    kv_bounds[bounds_index] = n_logical_rows;
+    if (use_compact_raw || initialize_min_bound) {
+        kv_bounds[bounds_count + bounds_index] = 0;
+    }
+}
+
+static __global__ void flash_attn_sparse_query_prepare(
+        const int32_t * __restrict__ top_k,
+        const half    * __restrict__ raw_mask,
+        const half    * __restrict__ compressed_mask,
+        int32_t       * __restrict__ group_rows,
+        half          * __restrict__ group_mask,
+        int           * __restrict__ kv_bounds,
+        const char    * __restrict__ k2,
+        const char    * __restrict__ v2,
+        const int64_t nb_k2_2,
+        const int64_t nb_k2_3,
+        const int64_t nb_v2_2,
+        const int64_t nb_v2_3,
+        const int stride_k2,
+        const int stride_v2,
+        const int n_compressed,
+        const int k,
+        const int max_union,
+        const int raw_capacity,
+        const int group_capacity,
+        const int top_k_nb1,
+        const int64_t top_k_nb3,
+        const int raw_mask_nb1,
+        const int64_t raw_mask_nb3,
+        const int compressed_mask_nb1,
+        const int64_t compressed_mask_nb3,
+        const int n_raw,
+        const int bounds_count,
+        const bool compact_raw) {
+    const int query = blockIdx.x;
+    const int sequence = blockIdx.y;
+    const int group_stride = gridDim.x*(group_capacity + 2);
+
+    if (query == 0 && sequence == 0 && threadIdx.x == 0) {
+        fattn_sparse_2kv_meta * meta = reinterpret_cast<fattn_sparse_2kv_meta *>(
+            group_rows - FATTN_SPARSE_2KV_META_I32);
+        meta->k2 = reinterpret_cast<uint64_t>(k2);
+        meta->v2 = reinterpret_cast<uint64_t>(v2);
+        meta->nb_k2_2 = nb_k2_2;
+        meta->nb_k2_3 = nb_k2_3;
+        meta->nb_v2_2 = nb_v2_2;
+        meta->nb_v2_3 = nb_v2_3;
+        meta->stride_k2 = stride_k2;
+        meta->stride_v2 = stride_v2;
+    }
+
+    const int32_t * top_k_query = top_k + int64_t(sequence)*top_k_nb3 + int64_t(query)*top_k_nb1;
+    const half * raw_mask_query = raw_mask + int64_t(sequence)*raw_mask_nb3 + int64_t(query)*raw_mask_nb1;
+    const half * compressed_mask_query =
+        compressed_mask + int64_t(sequence)*compressed_mask_nb3 + int64_t(query)*compressed_mask_nb1;
+    int32_t * rows_header = group_rows + int64_t(sequence)*group_stride + int64_t(query)*(group_capacity + 2);
+    int32_t * rows_out = rows_header + 2;
+    half * mask_out = group_mask + (int64_t(sequence)*gridDim.x + query)*group_capacity;
+
+    __shared__ int raw_bounds[2];
+    if (compact_raw) {
+        if (threadIdx.x == 0) {
+            raw_bounds[0] = n_raw;
+            raw_bounds[1] = -1;
+        }
+        __syncthreads();
+
+        int local_begin = n_raw;
+        int local_end = -1;
+        for (int i = threadIdx.x; i < n_raw; i += blockDim.x) {
+            if (!isinf(__half2float(raw_mask_query[i]))) {
+                local_begin = min(local_begin, i);
+                local_end = max(local_end, i);
+            }
+        }
+        if (local_begin < n_raw) {
+            atomicMin(raw_bounds + 0, local_begin);
+            atomicMax(raw_bounds + 1, local_end);
+        }
+        __syncthreads();
+    }
+
+    const int bounds_index = sequence*gridDim.x + query;
+    const int raw_begin = compact_raw && raw_bounds[1] >= 0 ?
+        (raw_bounds[0]/FATTN_KQ_STRIDE)*FATTN_KQ_STRIDE : n_raw;
+    const int raw_end = compact_raw && raw_bounds[1] >= 0 ?
+        min(n_raw, ((raw_bounds[1] + 1 + FATTN_KQ_STRIDE - 1)/FATTN_KQ_STRIDE)*FATTN_KQ_STRIDE) : 0;
+    const int raw_span = max(0, raw_end - raw_begin);
+    const bool use_compact_raw = compact_raw && raw_span <= raw_capacity;
+    const int raw_rows = use_compact_raw ? raw_span : 0;
+
+    for (int i = threadIdx.x; i < raw_rows; i += blockDim.x) {
+        const int physical_row = raw_begin + i;
+        rows_out[i] = physical_row;
+        mask_out[i] = raw_mask_query[physical_row];
+    }
+
+    for (int i = threadIdx.x; i < max_union; i += blockDim.x) {
+        const bool selected = i < k;
+        const int physical_row = selected ? top_k_query[i] : -1;
+        const bool valid = physical_row >= 0 && physical_row < n_compressed;
+        const int compressed_row = valid ? physical_row : 0;
+        rows_out[raw_rows + i] = use_compact_raw ? n_raw + compressed_row : compressed_row;
+        mask_out[raw_rows + i] = selected && valid ?
+            compressed_mask_query[physical_row] : __float2half(-INFINITY);
+    }
+
+    for (int i = threadIdx.x + raw_rows + max_union; i < group_capacity; i += blockDim.x) {
+        rows_out[i] = 0;
+        mask_out[i] = __float2half(-INFINITY);
+    }
+
+    if (threadIdx.x == 0) {
+        const int n_logical_rows = use_compact_raw ? raw_rows + max_union : n_raw + max_union;
+        rows_header[0] = use_compact_raw ? 1 : 0;
+        rows_header[1] = n_logical_rows;
+        kv_bounds[bounds_index] = n_logical_rows;
+        kv_bounds[bounds_count + bounds_index] = 0;
+    }
+}
+
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
@@ -984,6 +1296,11 @@ void launch_fattn(
 
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
+    const ggml_tensor * sparse_idx = dst->src[5] && !dst->src[6] ? dst->src[5] : nullptr;
+    const ggml_tensor * sparse_mask = sparse_idx ? dst->src[7] : nullptr;
+    const ggml_tensor * K2 = sparse_idx ? dst->src[8] : nullptr;
+    const ggml_tensor * V2 = sparse_idx ? dst->src[9] : nullptr;
+    GGML_ASSERT((K2 == nullptr) == (V2 == nullptr));
 
     ggml_tensor * KQV = dst;
 
@@ -1005,9 +1322,13 @@ void launch_fattn(
     const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
         ggml_cuda_flash_attn_ext_get_f16_extra_data(KQV, need_f16_K, need_f16_V);
 
-    ggml_cuda_pool_alloc<int>    KV_max(pool);
-    ggml_cuda_pool_alloc<float>  dst_tmp(pool);
-    ggml_cuda_pool_alloc<float2> dst_tmp_meta(pool);
+    // The VMM pool frees in strict reverse allocation order. Sparse staging is
+    // allocated before any optional stream-k fixup buffers below.
+    ggml_cuda_pool_alloc<int>     KV_max(pool);
+    ggml_cuda_pool_alloc<int32_t> sparse_group_rows(pool);
+    ggml_cuda_pool_alloc<half>    sparse_group_mask(pool);
+    ggml_cuda_pool_alloc<float>   dst_tmp(pool);
+    ggml_cuda_pool_alloc<float2>  dst_tmp_meta(pool);
 
     const char * K_data = (const char *) K->data;
     size_t nb11 = K->nb[1];
@@ -1018,6 +1339,15 @@ void launch_fattn(
     size_t nb21 = V->nb[1];
     size_t nb22 = V->nb[2];
     size_t nb23 = V->nb[3];
+
+    const char * K2_data = K2 ? (const char *) K2->data : nullptr;
+    const char * V2_data = V2 ? (const char *) V2->data : nullptr;
+    const size_t nbK2_1 = K2 ? K2->nb[1] : 0;
+    const size_t nbK2_2 = K2 ? K2->nb[2] : 0;
+    const size_t nbK2_3 = K2 ? K2->nb[3] : 0;
+    const size_t nbV2_1 = V2 ? V2->nb[1] : 0;
+    const size_t nbV2_2 = V2 ? V2->nb[2] : 0;
+    const size_t nbV2_3 = V2 ? V2->nb[3] : 0;
 
     if (need_f16_K && K->type != GGML_TYPE_F16) {
         const size_t bs = ggml_blck_size(K->type);
@@ -1083,6 +1413,12 @@ void launch_fattn(
         }
     }
 
+    // Sparse grouping addresses the full F16 concat backing through a compact
+    // logical view. Converting only that view would omit physical rows beyond
+    // it, so non-F16 sparse K/V are intentionally left to the CPU fallback.
+    GGML_ASSERT(!sparse_idx || (K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16));
+    GGML_ASSERT(!K2 || (K2->type == GGML_TYPE_F16 && V2->type == GGML_TYPE_F16));
+
     const int ntiles_x     = ((Q->ne[1] + ncols1 - 1) / ncols1);
     const int gqa_ratio    = Q->ne[2] / K->ne[2];
     const int ntiles_z_gqa = ((gqa_ratio + ncols2 - 1) / ncols2);
@@ -1091,21 +1427,145 @@ void launch_fattn(
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
-    if (mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
+    const int64_t n_kv_masked = sparse_idx ? mask->ne[0] : K->ne[1];
+    const bool scan_mask_bounds = mask && n_kv_masked % FATTN_KQ_STRIDE == 0 &&
+        (sparse_idx || Q->ne[1] >= 1024 || Q->ne[3] > 1);
+    const bool query_prepare_bounds = sparse_idx && ncols1 == 1;
+    const int ne_KV_max = ntiles_x*Q->ne[3];
+    if (scan_mask_bounds || sparse_idx) {
+        KV_max.alloc(2*ne_KV_max);
+    }
+    if (scan_mask_bounds && !query_prepare_bounds) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
         const int64_t s33 = mask->nb[3] / sizeof(half2);
 
         const dim3 blocks_num_KV_max(ntiles_x, Q->ne[3], 1);
         const dim3 block_dim_KV_max(FATTN_KQ_STRIDE/2, 1, 1);
 
-        const int ne_KV_max = blocks_num_KV_max.x*blocks_num_KV_max.y;
-        const int iter_k = K->ne[1] / FATTN_KQ_STRIDE;
+        const int iter_k = n_kv_masked / FATTN_KQ_STRIDE;
 
-        KV_max.alloc(ne_KV_max);
         ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_KV_max, block_dim_KV_max, 0, main_stream);
         ggml_cuda_kernel_launch(flash_attn_mask_to_KV_max<ncols1>, launch_params,
             (const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33);
         CUDA_CHECK(cudaGetLastError());
+    }
+
+    int64_t ne11_effective = K->ne[1];
+    const int32_t * sparse_idx_data = nullptr;
+    const half * sparse_mask_data = nullptr;
+    int32_t sparse_idx_nb1 = 0;
+    int64_t sparse_idx_nb3 = 0;
+    int32_t sparse_mask_nb1 = 0;
+    int64_t sparse_mask_nb3 = 0;
+
+    if (sparse_idx) {
+        if constexpr (ncols1 != 1 && ncols1 != 8) {
+            GGML_ABORT("sparse flash attention requires 1- or 8-query groups");
+        } else {
+        GGML_ASSERT(sparse_mask);
+        GGML_ASSERT(sparse_idx->type == GGML_TYPE_I32 && sparse_mask->type == GGML_TYPE_F16);
+        GGML_ASSERT(sparse_idx->ne[1] == Q->ne[1] && sparse_idx->ne[3] == Q->ne[3]);
+        GGML_ASSERT(sparse_mask->ne[1] == Q->ne[1] && sparse_mask->ne[3] == Q->ne[3]);
+
+        const int n_raw = mask->ne[0];
+        const int max_union = std::min<int64_t>(sparse_mask->ne[0], sparse_idx->ne[0]*ncols1);
+        GGML_ASSERT(max_union >= sparse_idx->ne[0]);
+
+        static const int sparse_raw_compact = []() {
+            const char * value = getenv("GGML_CUDA_DSV4_SPARSE_RAW_COMPACT");
+            return value ? atoi(value) : 0;
+        }();
+        // Value 2 forces compact staging for small unit-test shapes and the
+        // opt-in decode experiment. Value 1 remains prefill-only here.
+        const bool sparse_raw_compact_active = sparse_raw_compact > 0 &&
+            (Q->ne[1] >= FATTN_KQ_STRIDE || sparse_raw_compact > 1);
+        constexpr int raw_capacity = 2*FATTN_KQ_STRIDE;
+        const int group_capacity = max_union + (sparse_raw_compact_active ? raw_capacity : 0);
+
+        const size_t n_group_rows = FATTN_SPARSE_2KV_META_I32 +
+            (size_t) Q->ne[3]*ntiles_x*(group_capacity + 2);
+        const size_t n_group_mask = (size_t) Q->ne[3]*ntiles_x*group_capacity*ncols1;
+        sparse_group_rows.alloc(n_group_rows);
+        sparse_group_mask.alloc(n_group_mask);
+        int32_t * const sparse_group_rows_data = sparse_group_rows.ptr + FATTN_SPARSE_2KV_META_I32;
+
+        const dim3 blocks_num_sparse(ntiles_x, Q->ne[3], 1);
+        const dim3 block_dim_sparse(ncols1 == 1 ? 256 : 1, 1, 1);
+        ggml_cuda_kernel_launch_params launch_params =
+            ggml_cuda_kernel_launch_params(blocks_num_sparse, block_dim_sparse, 0, main_stream);
+        if constexpr (ncols1 == 1) {
+            ggml_cuda_kernel_launch(flash_attn_sparse_query_prepare, launch_params,
+                (const int32_t *) sparse_idx->data,
+                (const half *) mask->data,
+                (const half *) sparse_mask->data,
+                sparse_group_rows_data,
+                sparse_group_mask.ptr,
+                KV_max.ptr,
+                K2_data,
+                V2_data,
+                (int64_t) nbK2_2,
+                (int64_t) nbK2_3,
+                (int64_t) nbV2_2,
+                (int64_t) nbV2_3,
+                K2 ? (int) (nbK2_1/sizeof(half2)) : 0,
+                V2 ? (int) (nbV2_1/sizeof(half2)) : 0,
+                (int) sparse_mask->ne[0],
+                (int) sparse_idx->ne[0],
+                max_union,
+                sparse_raw_compact_active ? raw_capacity : 0,
+                group_capacity,
+                (int) (sparse_idx->nb[1]/sizeof(int32_t)),
+                (int64_t) (sparse_idx->nb[3]/sizeof(int32_t)),
+                (int) (mask->nb[1]/sizeof(half)),
+                (int64_t) (mask->nb[3]/sizeof(half)),
+                (int) (sparse_mask->nb[1]/sizeof(half)),
+                (int64_t) (sparse_mask->nb[3]/sizeof(half)),
+                n_raw,
+                ne_KV_max,
+                sparse_raw_compact_active && scan_mask_bounds);
+        } else {
+            ggml_cuda_kernel_launch(flash_attn_sparse_group_prepare<ncols1>, launch_params,
+                (const int32_t *) sparse_idx->data,
+                (const half *) mask->data,
+                (const half *) sparse_mask->data,
+                sparse_group_rows_data,
+                sparse_group_mask.ptr,
+                KV_max.ptr,
+                K2_data,
+                V2_data,
+                (int64_t) nbK2_2,
+                (int64_t) nbK2_3,
+                (int64_t) nbV2_2,
+                (int64_t) nbV2_3,
+                K2 ? (int) (nbK2_1/sizeof(half2)) : 0,
+                V2 ? (int) (nbV2_1/sizeof(half2)) : 0,
+                (int) Q->ne[1],
+                (int) sparse_mask->ne[0],
+                (int) sparse_idx->ne[0],
+                max_union,
+                sparse_raw_compact_active ? raw_capacity : 0,
+                group_capacity,
+                (int) (sparse_idx->nb[1]/sizeof(int32_t)),
+                (int64_t) (sparse_idx->nb[3]/sizeof(int32_t)),
+                (int) (mask->nb[1]/sizeof(half)),
+                (int64_t) (mask->nb[3]/sizeof(half)),
+                (int) (sparse_mask->nb[1]/sizeof(half)),
+                (int64_t) (sparse_mask->nb[3]/sizeof(half)),
+                n_raw,
+                ne_KV_max,
+                !scan_mask_bounds,
+                sparse_raw_compact_active && scan_mask_bounds);
+        }
+        CUDA_CHECK(cudaGetLastError());
+
+        ne11_effective = n_raw + max_union;
+        sparse_idx_data = sparse_group_rows_data;
+        sparse_mask_data = sparse_group_mask.ptr;
+        sparse_idx_nb1 = group_capacity + 2;
+        sparse_idx_nb3 = int64_t(ntiles_x)*(group_capacity + 2);
+        sparse_mask_nb1 = group_capacity;
+        sparse_mask_nb3 = int64_t(ntiles_x)*ncols1*group_capacity;
+        }
     }
 
     const dim3 block_dim(warp_size, nwarps, 1);
@@ -1114,7 +1574,7 @@ void launch_fattn(
     GGML_ASSERT(max_blocks_per_sm > 0);
     int parallel_blocks = max_blocks_per_sm;
 
-    const int ntiles_KV = (K->ne[1] + nbatch_fa - 1) / nbatch_fa; // Max. number of parallel blocks limited by KV cache length.
+    const int ntiles_KV = (ne11_effective + nbatch_fa - 1) / nbatch_fa; // Max. number of parallel blocks limited by KV cache length.
 
     dim3 blocks_num;
     if (stream_k) {
@@ -1215,10 +1675,17 @@ void launch_fattn(
         mask ? ((const char *) mask->data) : nullptr,
         sinks ? ((const char *) sinks->data) : nullptr,
         KV_max.ptr,
+        sparse_idx_data,
+        sparse_idx ? (int32_t) mask->ne[0] : 0,
+        sparse_idx_nb1,
+        sparse_idx_nb3,
+        sparse_mask_data ? (const char *) sparse_mask_data : nullptr,
+        sparse_mask_nb1,
+        sparse_mask_nb3,
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
-        K->ne[0], K->ne[1], K->ne[2], K->ne[3], nb11, nb12, nb13,
+        K->ne[0], ne11_effective, K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
         mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0

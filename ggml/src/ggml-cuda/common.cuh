@@ -176,6 +176,7 @@ static int ggml_cuda_highest_compiled_arch(const int arch) {
 #define MATRIX_ROW_PADDING 512 // last row of quant. matrices is a multiple of this to avoid out-of-bounds memory accesses
 
 #define GGML_CUDA_MAX_STREAMS 8
+#define GGML_CUDA_MOE_PP_MAX_PREFETCH 4
 
 [[noreturn]]
 void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg);
@@ -1211,6 +1212,17 @@ struct ggml_tensor_extra_gpu {
 struct ggml_cuda_graph {
 #ifdef USE_CUDA_GRAPH
     ~ggml_cuda_graph() {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        if (timing_full_start != nullptr) {
+            CUDA_CHECK(cudaEventDestroy(timing_full_start));
+        }
+        if (timing_start != nullptr) {
+            CUDA_CHECK(cudaEventDestroy(timing_start));
+        }
+        if (timing_end != nullptr) {
+            CUDA_CHECK(cudaEventDestroy(timing_end));
+        }
+#endif
         if (instance != nullptr) {
             CUDA_CHECK(cudaGraphExecDestroy(instance));
         }
@@ -1226,6 +1238,24 @@ struct ggml_cuda_graph {
     bool warmup_complete = false;
     uint64_t uid = 0;
     int64_t last_used_time = 0;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    cudaEvent_t timing_full_start = nullptr;
+    cudaEvent_t timing_start = nullptr;
+    cudaEvent_t timing_end = nullptr;
+    bool timing_pending = false;
+    bool timing_full_started = false;
+    bool timing_full_pending = false;
+    uint64_t timing_seen = 0;
+    uint64_t timing_count = 0;
+    double timing_sum_ms = 0.0;
+    double timing_min_ms = 0.0;
+    double timing_max_ms = 0.0;
+    double timing_full_sum_ms = 0.0;
+    double timing_full_min_ms = 0.0;
+    double timing_full_max_ms = 0.0;
+    int timing_n_nodes = 0;
+    std::string timing_label;
+#endif
     struct node_properties {
         ggml_tensor node;
         void *   node_src_data_ptrs[GGML_MAX_SRC];
@@ -1396,6 +1426,15 @@ struct ggml_backend_cuda_context {
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
+
+    cudaStream_t moe_h2d_stream    = nullptr;
+    cudaStream_t moe_commit_stream = nullptr;
+    void *       moe_prefetch_data[GGML_CUDA_MOE_PP_MAX_PREFETCH] = {};
+    size_t       moe_prefetch_size[GGML_CUDA_MOE_PP_MAX_PREFETCH] = {};
+    const void * moe_prefetch_src[GGML_CUDA_MOE_PP_MAX_PREFETCH] = {};
+    size_t       moe_prefetch_src_size[GGML_CUDA_MOE_PP_MAX_PREFETCH] = {};
+    cudaEvent_t  moe_prefetch_ready[GGML_CUDA_MOE_PP_MAX_PREFETCH] = {};
+    cudaEvent_t  moe_prefetch_done[GGML_CUDA_MOE_PP_MAX_PREFETCH] = {};
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};
@@ -1646,4 +1685,3 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
     kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
     CUDA_CHECK(cudaGetLastError());
 }
-

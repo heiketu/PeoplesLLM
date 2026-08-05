@@ -92,7 +92,7 @@ for ncols in [8, 16, 32, 64]:
                     continue
                 if head_size_kq == 320 and ncols2 != 32: # Mistral Small 4
                     continue
-                if head_size_kq == 512 and ncols2 not in (2, 4, 8): # Gemma 4 (+ MTP)
+                if head_size_kq == 512 and ncols2 not in (2, 4, 8, 16, 32): # Gemma 4 (+ MTP), DSV4 q1
                     continue
                 if head_size_kq == 576 and ncols2 not in (4, 16, 32): # Deepseek, GLM 4.7 Flash
                     continue

@@ -6,6 +6,10 @@
 #include "fattn-wmma-f16.cuh"
 #include "fattn.cuh"
 
+static bool ggml_cuda_fattn_is_sparse_2kv(const ggml_tensor * dst) {
+    return dst->src[5] && !dst->src[6] && dst->src[8] && dst->src[9];
+}
+
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -118,6 +122,18 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * V    = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
+    const bool sparse = dst->src[5] && !dst->src[6];
+
+    if (sparse) {
+        GGML_ASSERT(Q->ne[0] == 512 && V->ne[0] == 512);
+        GGML_ASSERT(Q->ne[2] / K->ne[2] % 8 == 0);
+        if (Q->ne[1] == 1) {
+            ggml_cuda_flash_attn_ext_mma_f16_case<512, 512, 1, 8>(ctx, dst);
+            return;
+        }
+        ggml_cuda_flash_attn_ext_mma_f16_case<512, 512, 8, 8>(ctx, dst);
+        return;
+    }
 
     switch (Q->ne[0]) {
         case 64:
@@ -176,10 +192,31 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
                 ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<320, 256, 32>(ctx, dst);
             }
             break;
-        case 512:
+        case 512: {
             GGML_ASSERT(V->ne[0] == 512);
+            float max_bias_512;
+            memcpy(&max_bias_512, (const float *) KQV->op_params + 1, sizeof(float));
+            if (Q->ne[1] == 1 && mask && max_bias_512 == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0 &&
+                    Q->ne[2] / K->ne[2] % 16 == 0) {
+                static const int dsv4_q1_heads_override = []() {
+                    const char * value = getenv("GGML_CUDA_DSV4_Q1_HEADS");
+                    return value ? atoi(value) : 0;
+                }();
+                // Larger head groups reuse the single DSV4 K/V head and win
+                // once a q1 attention tile spans at least 1K cache rows.
+                const int dsv4_q1_heads = dsv4_q1_heads_override > 0 ?
+                    dsv4_q1_heads_override : (ampere_mma_available(cc) && K->ne[1] >= 1024 ? 32 : 8);
+                if (dsv4_q1_heads >= 32 && Q->ne[2] / K->ne[2] % 32 == 0) {
+                    ggml_cuda_flash_attn_ext_mma_f16_case<512, 512, 1, 32>(ctx, dst);
+                    break;
+                }
+                if (dsv4_q1_heads >= 16) {
+                    ggml_cuda_flash_attn_ext_mma_f16_case<512, 512, 1, 16>(ctx, dst);
+                    break;
+                }
+            }
             ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<512, 512>(ctx, dst);
-            break;
+        } break;
         case 576: {
             // For Deepseek, go straight to the ncols1 switch to avoid compiling unnecessary kernels.
             GGML_ASSERT(V->ne[0] == 512);
@@ -369,10 +406,45 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     const ggml_tensor * V     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
 
+    const bool sparse = dst->src[5] && !dst->src[6];
+
     // ggml_flash_attn_ext_2kv: the CUDA kernels do not read the second KV segment
     // (src[5..7]); running them would silently drop it. Fall back to the CPU path.
-    if (dst->src[5] != nullptr) {
+    if (dst->src[5] != nullptr && !sparse) {
         return BEST_FATTN_KERNEL_NONE;
+    }
+
+    if (sparse) {
+        const ggml_tensor * top_k = dst->src[5];
+        const ggml_tensor * compressed_mask = dst->src[7];
+        const bool sparse_2kv = ggml_cuda_fattn_is_sparse_2kv(dst);
+        const ggml_tensor * K2 = sparse_2kv ? dst->src[8] : nullptr;
+        const ggml_tensor * V2 = sparse_2kv ? dst->src[9] : nullptr;
+        if (!mask || !compressed_mask || top_k->type != GGML_TYPE_I32 || compressed_mask->type != GGML_TYPE_F16 ||
+                Q->ne[0] != 512 || V->ne[0] != 512 || K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16 ||
+                Q->ne[1] != top_k->ne[1] || Q->ne[3] != top_k->ne[3] || top_k->ne[2] != 1 ||
+                Q->ne[1] != compressed_mask->ne[1] || Q->ne[3] != compressed_mask->ne[3] || compressed_mask->ne[2] != 1 ||
+                (!sparse_2kv && K->ne[1] != mask->ne[0] + top_k->ne[0]) ||
+                (sparse_2kv && (Q->ne[1] != 1 || K->ne[1] != mask->ne[0] ||
+                    !K2 || !V2 || K2->type != GGML_TYPE_F16 || V2->type != GGML_TYPE_F16 ||
+                    K2->ne[0] != K->ne[0] || V2->ne[0] != V->ne[0] ||
+                    K2->ne[1] != compressed_mask->ne[0] || V2->ne[1] != compressed_mask->ne[0] ||
+                    K2->ne[2] != K->ne[2] || K2->ne[3] != K->ne[3] ||
+                    V2->ne[2] != V->ne[2] || V2->ne[3] != V->ne[3]))) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
+        if (sparse_2kv) {
+            for (const ggml_tensor * tensor : {K2, V2}) {
+                if (tensor->nb[0] != sizeof(half)) {
+                    return BEST_FATTN_KERNEL_NONE;
+                }
+                for (size_t dim = 1; dim < GGML_MAX_DIMS; ++dim) {
+                    if (tensor->nb[dim] % 16 != 0) {
+                        return BEST_FATTN_KERNEL_NONE;
+                    }
+                }
+            }
+        }
     }
 
     const int gqa_ratio = Q->ne[2] / K->ne[2];

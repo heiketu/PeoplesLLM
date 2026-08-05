@@ -77,7 +77,8 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
 }
 
 void ggml_cuda_mul_mat_q(
-        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
+        ggml_tensor * dst, int expert_id_offset, int expert_id_total) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
@@ -119,6 +120,14 @@ void ggml_cuda_mul_mat_q(
     const int64_t s2  =  dst->nb[2] / ts_dst;
     const int64_t s03 = src0->nb[3] / ts_src0;
     const int64_t s3  =  dst->nb[3] / ts_dst;
+
+    const bool expert_slice = ids && expert_id_total > ne02;
+    if (expert_slice) {
+        GGML_ASSERT(expert_id_offset >= 0 && expert_id_offset + ne02 <= expert_id_total);
+        ggml_cuda_launch_mm_id_zero_invalid((const int32_t *) ids->data, dst_d, ne0, ids->ne[0], ne2,
+            ids->nb[1] / sizeof(int32_t), s1, s2, expert_id_offset, ne02, stream);
+        CUDA_CHECK(cudaGetLastError());
+    }
 
     const bool fallback = ne01 % 128 != 0;
 
@@ -184,8 +193,16 @@ void ggml_cuda_mul_mat_q(
         const int si1  = ids->nb[1] / ggml_element_size(ids);
         const int sis1 = nb12 / nb11;
 
+        if (expert_slice) {
+            // The helper compacts only rows owned by this expert slice. The
+            // non-broadcast quantizer still traverses the full slot capacity,
+            // so make its unused tail map to a valid source row. Broadcast
+            // scatter instead uses -1 as an explicit skip marker.
+            CUDA_CHECK(cudaMemsetAsync(ids_src1.get(), dedup_bcast ? 0xFF : 0,
+                ne_get_rows * sizeof(int32_t), stream));
+        }
         ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
-            ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
+            ne02, ne12, n_expert_used, ne11, si1, sis1, expert_id_offset, /*write_inverse =*/ dedup_bcast, stream);
         CUDA_CHECK(cudaGetLastError());
     }
 
