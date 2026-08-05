@@ -135,15 +135,16 @@
 | `GGML_CUDA_MOE_PP_PREFETCH` | `0`（关） | `0..4` 个私有设备槽跨 split 预取专家权重；独立 H2D/commit stream 用 event 与计算流衔接 | 双 RTX 3090、ub4096 实测深度 1/2/3 相对关闭约 `+12.8%/+14.0%/+20.1%`。建议目标 `3`；每次分配保留至少 2GiB/卡，空间不足自动缩为 2/1/0，不能替代 1M 的 ubatch 预算 |
 | `GGML_CUDA_MOE_PP_DUAL` | 关 | 流式模式下按层号在多张 GPU 间轮转专家计算 | 无独立预取时曾回归 1%-7%；配合 `PREFETCH=3` 后可利用两条 PCIe/NUMA H2D 路径。仍为显式开关，单卡勿设 |
 
-### 2.8 CUDA / DSV4 执行实验（10 个）
+### 2.8 CUDA / DSV4 执行实验（11 个）
 
 | 变量 | 默认 | 作用 | 何时用 / 注意 |
 |---|---|---|---|
 | `GGML_CUDA_BATCHED_TOPK` | `0`（关） | `=1` 时对 NVIDIA CUDA 的 `k=512,nrows>=32` 使用每行一个 block 的 stable batched radix top-k；边界 ties 按较低索引稳定选择，其他形状和后端保持原实现 | 面向 DSV4 Lightning Indexer launch storm。`16384x4096,k=512` 单 op 21.59x，16K PP +8.24%，CUDA 456/456、非 CUDA 构建和重复 logits 已通过；补齐 8K/32K、生成文本和更多架构前仍不得设为全局默认 |
 | `LLAMA_LAYER_MAJOR_DEVICE_HC` | `0`（关） | `=1` 时把 DSV4 layer-major 的完整 F32 HC layer-boundary state 保存在首个 GPU backend，层间用 D2D/P2P 传递；分配前保留至少 4 GiB 或 20% 显存，不满足时自动使用原 host HC | 16K/tile4096 需要 1 GiB device state；配合 stable top-k 和 FA KV lower bound，实测 209.00 -> 269.12 tok/s。当前使用每 tile 同步保证 split-copy 顺序，8K/32K/生成验收前保持显式实验开关 |
-| `GGML_CUDA_MOE_PP_EP` | `0`（关） | 将同层 routed experts 沿 expert 轴拆到 CUDA0/CUDA1，两支各自在所属 backend 计算后归并 | 双 3090/NVLink true-EP；必须配 `_EP_MIN_TOKENS`，单卡/P2P/OOM fallback 产品验收前保持显式开启 |
+| `GGML_CUDA_MOE_PP_EP` | `0`（关） | 将同层 routed experts 沿 expert 轴拆到 CUDA0/CUDA1，两支各自在所属 backend 计算后归并；每 rank 用融合的 `MOE_WREDUCE` 按升序 slot 归并本地专家（跳过越界 slot 的 zero-fill 与读取），只跨卡传 `[n_embd,n_tokens]` partial | 双 3090/NVLink true-EP；必须配 `_EP_MIN_TOKENS`，单卡/P2P/OOM fallback 产品验收前保持显式开启 |
 | `GGML_CUDA_MOE_PP_EP_MIN_TOKENS` | `2048` | true-EP 的最小 query batch | q1 decode 不进入 GPU EP；长 prefill 建议从 2048 起测 |
 | `GGML_CUDA_MOE_PP_DEFER_PREFETCH` | `0`（关） | 将 expert slot 预取延后到 scheduler 已解析真实 view 权重后启动 | 当前 3-slot true-EP 基准使用；必须保留 slot 生命周期和失败回退 |
+| `GGML_CUDA_MMQ_MOE_J` | `0`（自动） | 强制 MoE `MUL_MAT_ID` MMQ 的 tile 宽度 J（8..128 步进 8），仅用于 A/B 测量；自动模式按每专家典型行数（+25% 方差余量，向上取 16 倍）选择，n<=2048 的 MoE 调用单 op 快 1.1--2.3 倍 | 实验开关，不保证跨版本保留；n=4096 以上自动选择与原 J=128 一致 |
 | `GGML_CUDA_P2P` | `0`（关） | 允许双卡 backend 使用 peer/NVLink copy | 本机 RTX3090 间为 NVLink；没有 P2P 能力时不得假定可用 |
 | `GGML_CUDA_DSV4_KV_REUSE` | `0`（关） | 对 DSV4 `K=V` alias、512 维、64 列 FA specialization 保留完整 K shared tile供 V 阶段复用 | 16K true-EP 581.47 -> 604.23 tok/s，保持原 KQ 运算顺序与精确 logits；约需 100480 bytes dynamic shared memory |
 | `LLAMA_DSV4_SPARSE_FA` | `0`（关） | 用 8-query union 组装 raw/compressed sparse physical rows 和逐 query mask | 只在 query batch `>=256` 建图，q1 自动 dense；会改变浮点归约分组，不能当作 bit-exact 优化 |
@@ -251,8 +252,8 @@ llama-epd -m model.gguf --selftest [--selftest-layer N] [--selftest-tokens N]
 | EPD worker 系 env | 6 | `GGML_EPD_AUTOTUNE`、`GGML_EPD_NUMA`、`GGML_EPD_NUMA_WEIGHT`、`GGML_EPD_REPACK`、`GGML_EP_PREFAULT`、`GGML_EP_PREFAULT_THREADS` |
 | 融合与链式系 env | 13 | `LLAMA_FUSED_GDN_AR/GDN_CH/LID/DSV4_HC_PRE/DSV4_HC_COMB/DSV4_HC_POST/DSV4_MOE_ROUTER`、`GGML_CHAIN_MAX_DST/MATH/COPY/GATHER/SRC/ROPE_ELEMS` |
 | 调试观测系 env | 7 | `GGML_OP_TIMING`、`GGML_MM_PHASE`、`GGML_COPY_TRACE`、`LLAMA_DECODE_TIMING`、`LLAMA_NAN_DEBUG`、`LLAMA_DSV4_STATE_DEBUG`、`LLAMA_DSV4_2KV` |
-| GPU CUDA 实验 env | 12 | `GGML_CUDA_MOE_PP_MIN_TOKENS`、`GGML_CUDA_MOE_PP_PREFETCH`、`GGML_CUDA_MOE_PP_DUAL`、`GGML_CUDA_MOE_PP_EP`、`GGML_CUDA_MOE_PP_EP_MIN_TOKENS`、`GGML_CUDA_MOE_PP_DEFER_PREFETCH`、`GGML_CUDA_P2P`、`GGML_CUDA_BATCHED_TOPK`、`GGML_CUDA_DSV4_KV_REUSE`、`LLAMA_DSV4_SPARSE_FA`、`GGML_CUDA_DSV4_SPARSE_RAW_COMPACT`、`LLAMA_LAYER_MAJOR_DEVICE_HC` |
-| **env 合计** | **71** | |
+| GPU CUDA 实验 env | 13 | `GGML_CUDA_MOE_PP_MIN_TOKENS`、`GGML_CUDA_MOE_PP_PREFETCH`、`GGML_CUDA_MOE_PP_DUAL`、`GGML_CUDA_MOE_PP_EP`、`GGML_CUDA_MOE_PP_EP_MIN_TOKENS`、`GGML_CUDA_MOE_PP_DEFER_PREFETCH`、`GGML_CUDA_MMQ_MOE_J`、`GGML_CUDA_P2P`、`GGML_CUDA_BATCHED_TOPK`、`GGML_CUDA_DSV4_KV_REUSE`、`LLAMA_DSV4_SPARSE_FA`、`GGML_CUDA_DSV4_SPARSE_RAW_COMPACT`、`LLAMA_LAYER_MAJOR_DEVICE_HC` |
+| **env 合计** | **72** | |
 | common CLI | 2 | `--numa mirror`（新取值）、`--numa-mirror` |
 | llama-bench CLI | 2 | `--no-repack`、`--numa mirror`（新取值） |
 | llama-epd CLI | 10 | `-m/--model`、`--port`、`--layers`、`--experts`、`-t/--threads`、`--no-autotune`、`--no-mmap`、`--selftest`、`--selftest-layer`、`--selftest-tokens` |

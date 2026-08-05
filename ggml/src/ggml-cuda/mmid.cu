@@ -227,7 +227,9 @@ static __global__ void moe_wreduce(
         for (int64_t slot = 0; slot < n_expert_used; ++slot) {
             const int32_t expert = ids_tok[slot];
             if (expert >= expert_id_offset && expert < expert_id_offset + expert_id_count) {
-                acc += experts_row[slot * experts_stride_slot] * weights_tok[slot * weights_stride_slot];
+                // explicit rounding intrinsics: the unfused reference path rounds
+                // the product before the add, FMA contraction would change logits
+                acc = __fadd_rn(acc, __fmul_rn(experts_row[slot * experts_stride_slot], weights_tok[slot * weights_stride_slot]));
             }
         }
         dst[token * dst_stride_token + row] = acc;

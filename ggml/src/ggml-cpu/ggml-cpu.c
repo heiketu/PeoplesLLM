@@ -2463,7 +2463,10 @@ static void ggml_compute_forward_moe_wreduce(
             if (expert >= expert_id_offset && expert < expert_id_offset + expert_id_count) {
                 const float e = *(const float *) (experts_row + slot*experts->nb[1]);
                 const float w = *(const float *) (weights_tok + slot*weights->nb[1]);
-                acc += e*w;
+                // rounded product before the add (as in the unfused reference
+                // path); the volatile barrier blocks FMA contraction
+                const volatile float p = e*w;
+                acc += p;
             }
         }
         *(float *) ((char *) dst->data + row*dst->nb[0] + token*dst->nb[1]) = acc;
