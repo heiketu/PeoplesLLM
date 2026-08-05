@@ -44,6 +44,34 @@ GLM-5.2 745B（UD-Q2_K_MXFP4，单机 + 2×3090，9 层专家 GPU 卸载，2026-
 - GLM-5.2 专家主力量化 **IQ2_XS/IQ3_XXS 补齐 8×8 交错 repack traits**（布局 + 转换 + generic/AVX512(VNNI+VBMI 门禁) gemv/gemm 全套）：微基准 gemm **2.3-2.5×** vec_dot、native==generic 位级一致、test-backend-ops 1996/1996 PASS。
 - **mul_mat_id gemm 分流**：repack 的 MoE 批量路径此前全部逐行 gemv（Q2_K 同病），现 4 行一组 gather+量化进交错 tile 走 gemm——GLM 单机 **PP1020 99→406（4.1×）、tg512 +6%**，EP 与 mirror 逐 token 一致。
 
+### 超长上下文 layer-major prefill + 双卡 MoE EP（2026-08-04，DSV4-Flash 0731）
+
+新增实验接口 `llama_decode_layer_major()`：外层按层、内层按 token tile 执行，当前层专家权重驻留私有 CUDA slot、同层后续 tile 不重复 H2D，把长 prompt 的"每 ubatch 重复上传全模型权重"压到"每层上传一次"。16K prefill 从初版 161 tok/s 提升到 **604 tok/s**（精确 dense 基线，最终 logits 指纹逐位一致），稀疏 raw-KV 紧凑化（opt-in）达 **752 tok/s**：
+
+![16K PP 演进](docs/benchmarks/longctx_pp_progression.png)
+
+- **真双卡同层 expert-axis EP**（`GGML_CUDA_MOE_PP_EP`，opt-in）：同层专家沿专家轴切到 CUDA0/CUDA1 并行，2K 从串行正确基线 277 → **452 tok/s（+63%）**，16K 581 tok/s，输出逐位一致。
+- **完整有序 K/V tile reuse**：FA 保持原 128+128 KQ 运算顺序扩大 shared-memory row stride 复用完整 tile，16K PP +3.9%，logits 指纹完全一致（改变归约分组的 256 合并变体已否决回退）。
+- **batched top-k**（`GGML_CUDA_BATCHED_TOPK`）：DSA indexer 的 16384×4096 k=512 top-k 从 65.5ms → **3.03ms（21.6×）**，launch 数 139 万 → 1.9 万，e2e PP +8.2%。
+- **稀疏 raw-KV 紧凑化**（opt-in，query batch ≥256）：raw KV 有效区间紧凑到 ≤512 行再追加 compressed top-k 并集，16K PP 596→**752 tok/s**；浮点归约分组变化故默认关闭，q1 decode 自动回 dense FA。
+
+原生 MXFP4 版 DSV4-Flash（155GB，137GiB 专家单份 CPU_REPACK + 双路 NUMA EP，dense/attention/KV 在双 3090）经 CPU 审计（NUMA claim false sharing / 行窗错位 / 大 chunk scratch 越界三连修 + MXFP4 scale SIMD + Q8 流式 interleave）后：
+
+![MXFP4 Hybrid CPU 审计与双卡 EP](docs/benchmarks/mxfp4_hybrid_cpu_audit.png)
+
+长上下文 decode 的衰减根因已定位为 GPU attention/KV 的物理 dense 扫描（41 层 concat 全量处理），逐项修复中：
+
+![16K TG 改进](docs/benchmarks/longctx_tg_improvements.png)
+
+- **q1 FA 32-head MMA 实例**：DSV4 64 个 Q 头共享一个 512 维 K/V 头，K≥1024 自动选 32-head，16K 微基准 185.6→73.9µs，fixed TG64 **+17.0%**。
+- **raw-SWA decode ring**（opt-in 验收中）：prefill 后仅搬最新 128 个 raw SWA cell，decode 物理宽度限 256，fixed TG512 11.30→**12.18（+7.8%）**，CUDA graph warmup reset 130→48 次。
+
+16K GPU 侧时间分解（Nsight，604 tok/s 路径）——FA 与权重 H2D 是下一主战场：
+
+![16K 热点分解](docs/benchmarks/longctx_hotspots.png)
+
+> 复现与口径：`tests/test-layer-major.cpp`（`BENCH_GPU_STREAM` PP+TG 同次加载统一口径、`LLAMA_BENCH_FIXED_TG=1` 固定路由 A/B）；full tensor split 与跨 tile 双 scheduler 两条路线已实测否决（PP -44% / CPU threadpool 语义冲突），记录见 `docs/CHANGES.md`。
+
 ### CPU 内核完整基准（AVX512/VNNI/VBMI 8×8 重排 vs 主线 legacy vec_dot）
 
 Ice Lake 8360Y 实测，shape nc=16384 k=8192（超 L3 容量，真实 DRAM 带宽视角），数值为加速比（复现：`tests/test-repack-kernels --perf [线程数]`；* = 本分支新增/补全的 x86 内核）：
@@ -134,7 +162,7 @@ NUMA-EP + mirror、72 线程、fa=1、batch 4096/ubatch 1024；`--no-repack` 为
 
 ## 当前状态
 
-早期开发阶段。`main` 分支 = 生产可用；双机 expert-parallel 已上线（DSV4 追平单机 + master 内存省 26%；GLM-5.2 见上方数据表），EPD worker / RDMA 后端 / 层镜像 / 规划器均在 `tools/epd`。2026-08-01：行窗 EP + 亲和修复、IQ2_XS/IQ3_XXS traits + mul_mat_id gemm 分流已合入（GLM PP 4.1×）；GPU 侧评估过上游 meta-backend 张量并行（`-sm tensor`），2×3090+NVLink 实测 **-20% 负收益**（MIRRORED 复制计算+allreduce 边界+launch 开销为结构性，数值正确性 KL=0 验证通过），不合入、保留在实验分支。
+早期开发阶段。`main` 分支 = 生产可用；双机 expert-parallel 已上线（DSV4 追平单机 + master 内存省 26%；GLM-5.2 见上方数据表），EPD worker / RDMA 后端 / 层镜像 / 规划器均在 `tools/epd`。2026-08-01：行窗 EP + 亲和修复、IQ2_XS/IQ3_XXS traits + mul_mat_id gemm 分流已合入（GLM PP 4.1×）；GPU 侧评估过上游 meta-backend 张量并行（`-sm tensor`），2×3090+NVLink 实测 **-20% 负收益**（MIRRORED 复制计算+allreduce 边界+launch 开销为结构性，数值正确性 KL=0 验证通过），不合入、保留在实验分支。2026-08-04：超长上下文 layer-major prefill（16K **604 tok/s** 精确基线 / **752 tok/s** 稀疏 opt-in，较初版 4.7×）、真双卡同层 MoE EP（+63%）、batched top-k（21.6×）、CPU repack/NUMA 审计（MXFP4 Hybrid 4K +144%）、CPU_REPACK offload 正确性修复已合入，见上方长上下文专节与 `docs/CHANGES.md`。
 
 工程入口：
 

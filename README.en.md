@@ -44,6 +44,34 @@ GLM-5.2 745B (UD-Q2_K_MXFP4, single machine + 2× 3090, 9 expert layers on GPU; 
 - GLM-5.2's dominant expert quants **IQ2_XS/IQ3_XXS got full 8×8 interleaved repack traits** (layouts + conversion + generic & AVX512 (VNNI+VBMI gated) gemv/gemm): micro-bench gemm **2.3-2.5×** vs vec_dot, native==generic bit-exact, test-backend-ops 1996/1996 PASS.
 - **mul_mat_id gemm dispatch**: repacked MoE batch paths previously ran row-by-row gemv (Q2_K had the same gap); now 4-row tiles are gathered + quantized into interleaved tiles for gemm — GLM single-machine **PP1020 99→406 (4.1×), tg512 +6%**, EP and mirror token-identical.
 
+### Long-context layer-major prefill + dual-GPU MoE EP (2026-08-04, DSV4-Flash 0731)
+
+New experimental API `llama_decode_layer_major()`: layer-outer / token-tile-inner execution; the current layer's expert weights stay resident in private CUDA slots and are not re-uploaded for later tiles of the same layer — cutting "re-upload all model weights per ubatch" down to "one upload per layer". 16K prefill went from 161 tok/s (first version) to **604 tok/s** (exact dense baseline, bit-identical final logits fingerprint), and **752 tok/s** with sparse raw-KV compaction (opt-in):
+
+![16K PP progression](docs/benchmarks/longctx_pp_progression.png)
+
+- **True dual-GPU same-layer expert-axis EP** (`GGML_CUDA_MOE_PP_EP`, opt-in): experts of the same layer split across CUDA0/CUDA1 in parallel — 2K 277 → **452 tok/s (+63%)** vs the serial correct baseline, 581 tok/s @16K, bit-identical output.
+- **Fully ordered K/V tile reuse**: FA keeps the original 128+128 KQ order while widening the shared-memory row stride to reuse the full tile — 16K PP +3.9%, identical logits fingerprint (a 256-merge variant that changed reduction grouping was rejected and reverted).
+- **Batched top-k** (`GGML_CUDA_BATCHED_TOPK`): the DSA indexer's 16384×4096 k=512 top-k went from 65.5ms to **3.03ms (21.6×)**; kernel launches 1.39M → 19.5k; e2e PP +8.2%.
+- **Sparse raw-KV compaction** (opt-in, query batch ≥256): compacts the valid raw-KV range to ≤512 rows plus the compressed top-k union — 16K PP 596→**752 tok/s**; floating-point reduction grouping differs, so it stays off by default and q1 decode falls back to dense FA.
+
+The native MXFP4 DSV4-Flash build (155GB; 137GiB experts as a single CPU_REPACK copy on dual-socket NUMA EP; dense/attention/KV on two 3090s) after a CPU audit (three fixes: NUMA claim false sharing / row-window misalignment / large-chunk scratch overrun, plus MXFP4 scale SIMD and Q8 streaming interleave):
+
+![MXFP4 Hybrid CPU audit and dual-GPU EP](docs/benchmarks/mxfp4_hybrid_cpu_audit.png)
+
+Long-context decode degradation was root-caused to the physical dense scan of GPU attention/KV (41 layers of full-width concat), being fixed item by item:
+
+![16K TG improvements](docs/benchmarks/longctx_tg_improvements.png)
+
+- **q1 FA 32-head MMA instances**: DSV4's 64 Q heads share one 512-dim K/V head; 32-head is auto-selected at K≥1024 — 16K micro-bench 185.6→73.9µs, fixed TG64 **+17.0%**.
+- **raw-SWA decode ring** (opt-in, in validation): after prefill only the newest 128 raw SWA cells are kept, bounding decode physical width to 256 — fixed TG512 11.30→**12.18 (+7.8%)**, CUDA graph warmup resets 130→48.
+
+16K GPU-side time breakdown (Nsight, 604 tok/s path) — FA and weight H2D are the next battlegrounds:
+
+![16K hotspot breakdown](docs/benchmarks/longctx_hotspots.png)
+
+> Reproduction & methodology: `tests/test-layer-major.cpp` (`BENCH_GPU_STREAM` unified PP+TG in one load, `LLAMA_BENCH_FIXED_TG=1` fixed-route A/B); full tensor split and cross-tile dual-scheduler were both measured and rejected (PP -44% / CPU threadpool semantics), see `docs/CHANGES.md`.
+
 ### CPU kernel full benchmark (AVX512/VNNI/VBMI 8×8 repack vs upstream legacy vec_dot)
 
 Measured on Ice Lake 8360Y, shape nc=16384 k=8192 (exceeds L3 — the real DRAM-bandwidth view); values are speedups (reproduce: `tests/test-repack-kernels --perf [threads]`; * = x86 kernels new/completed in this fork):
@@ -134,7 +162,7 @@ Setup guide and full env reference: [tools/epd/README.md](tools/epd/README.md); 
 
 ## Status
 
-Early development. `main` branch = production-ready; two-machine expert-parallel is live (DSV4 matches single-machine speed with 26% lower master RAM; GLM-5.2 numbers in the table above), with the EPD worker / RDMA transport / layer mirroring / planner in `tools/epd`. 2026-08-01: row-window EP + affinity fix and IQ2_XS/IQ3_XXS traits + mul_mat_id gemm dispatch merged (GLM PP 4.1×). On the GPU side we evaluated upstream's meta-backend tensor parallelism (`-sm tensor`): on 2× RTX 3090 + NVLink it measured **-20% (structural regression** — MIRRORED duplicated compute + allreduce boundaries + launch overhead; numerical correctness verified, KL=0), so it stays on an experimental branch and is not merged.
+Early development. `main` branch = production-ready; two-machine expert-parallel is live (DSV4 matches single-machine speed with 26% lower master RAM; GLM-5.2 numbers in the table above), with the EPD worker / RDMA transport / layer mirroring / planner in `tools/epd`. 2026-08-01: row-window EP + affinity fix and IQ2_XS/IQ3_XXS traits + mul_mat_id gemm dispatch merged (GLM PP 4.1×). On the GPU side we evaluated upstream's meta-backend tensor parallelism (`-sm tensor`): on 2× RTX 3090 + NVLink it measured **-20% (structural regression** — MIRRORED duplicated compute + allreduce boundaries + launch overhead; numerical correctness verified, KL=0), so it stays on an experimental branch and is not merged. 2026-08-04: long-context layer-major prefill (16K **604 tok/s** exact baseline / **752 tok/s** sparse opt-in, 4.7× over its first version), true dual-GPU same-layer MoE EP (+63%), batched top-k (21.6×), CPU repack/NUMA audit (MXFP4 Hybrid 4K +144%), and a CPU_REPACK offload correctness fix — see the long-context section above and `docs/CHANGES.md`.
 
 **Full changelog and feature documentation: [docs/CHANGES.md](docs/CHANGES.md)** (Chinese) — NUMA architecture, CPU kernel format matrix, fused ops, environment variable reference.
 

@@ -46,6 +46,9 @@
 - 融合算子框架：`llm_graph_result::add_fused_node`，8 种 fused op（FLASH_ATTN、GDN_AR/CH、LIGHTNING_INDEXER、DSV4_HC_PRE/COMB/POST、DSV4_MOE_ROUTER）
 - GPU 专家卸载配方：`-ot "blk\.(层号)\.ffn_(up|gate|down)_exps\.weight=CUDA0/1"` 把指定层专家放上显卡，实测每加一层 TG +1% 左右
 - 长 Prompt MoE 流式 Prefill：专家权重保留 pinned 原布局，达到阈值后以完整张量 H2D；可选 1-4 个私有设备槽和独立 H2D/commit stream 跨 split 预取。每槽分配前保留 2GiB 显存，申请失败无损退化到更浅窗口或原串行路径；默认关闭，不改变 Decode 与非 CUDA 后端
+- **超长上下文 layer-major prefill（2026-08-04）**：`llama_decode_layer_major()` 层外 token-tile 内执行器，层权重驻留 CUDA slot；16K PP 161→604 tok/s 精确基线（稀疏 raw-KV compact opt-in 752）；真双卡同层 expert-axis EP（`GGML_CUDA_MOE_PP_EP`，2K +63%）；完整有序 K/V tile reuse（+3.9%，logits 逐位一致）；batched top-k（`GGML_CUDA_BATCHED_TOPK`，k=512 21.6×）；q1 FA 16/32-head MMA（fixed TG64 +17%）；raw-SWA 256-cell decode ring（fixed TG512 +7.8%，opt-in 验收中）；MXFP4/Q8 精确 RNE activation 边界；scheduler 分 backend 传输/时间 profile（`GGML_SCHED_PROFILE_INPUTS`）
+- **CUDA 正确性修复**：`offload_op` 拒绝 CPU_REPACK buffer（此前 batch≥32 的 mul_mat_id 把 repack 8×8 布局喂给 MMQ，pp>32 输出垃圾）
+- 已实测否决路线：full tensor split（PP -44%）、跨 tile 全图双 scheduler（CPU backend threadpool 跨 graph arena 语义冲突，基线 208→25-123 tok/s）
 
 ## 四、模型支持
 
