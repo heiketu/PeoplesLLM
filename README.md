@@ -136,7 +136,12 @@ NUMA-EP + mirror、72 线程、fa=1、batch 4096/ubatch 1024；`--no-repack` 为
 
 早期开发阶段。`main` 分支 = 生产可用；双机 expert-parallel 已上线（DSV4 追平单机 + master 内存省 26%；GLM-5.2 见上方数据表），EPD worker / RDMA 后端 / 层镜像 / 规划器均在 `tools/epd`。2026-08-01：行窗 EP + 亲和修复、IQ2_XS/IQ3_XXS traits + mul_mat_id gemm 分流已合入（GLM PP 4.1×）；GPU 侧评估过上游 meta-backend 张量并行（`-sm tensor`），2×3090+NVLink 实测 **-20% 负收益**（MIRRORED 复制计算+allreduce 边界+launch 开销为结构性，数值正确性 KL=0 验证通过），不合入、保留在实验分支。
 
-**完整改动清单见 [docs/CHANGES.md](docs/CHANGES.md)**（NUMA 体系、CPU 内核格式支持、融合算子、环境变量速查）。
+工程入口：
+
+- **完整改动清单见 [docs/CHANGES.md](docs/CHANGES.md)**（NUMA 体系、CPU 内核格式支持、融合算子、分布式 EP）。
+- **构建、测试与分支约定见 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)**。
+- **1M 上下文内存预算与验收门槛见 [docs/LONG-CONTEXT-1M.md](docs/LONG-CONTEXT-1M.md)**。
+- **全部本地参数与生产配方见 [docs/PEOPLESLLM-PARAMS.md](docs/PEOPLESLLM-PARAMS.md)**。
 
 主线跟踪：基于 llama.cpp `e8f19cc0a`（2026-07-16），`vendor` 分支保留基线，定期合并。
 

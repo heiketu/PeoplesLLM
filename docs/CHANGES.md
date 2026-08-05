@@ -45,6 +45,7 @@
 - `mmvq.cu` / `quantize.cu` / `fattn.cu` / `ggml-cuda.cu` 若干优化
 - 融合算子框架：`llm_graph_result::add_fused_node`，8 种 fused op（FLASH_ATTN、GDN_AR/CH、LIGHTNING_INDEXER、DSV4_HC_PRE/COMB/POST、DSV4_MOE_ROUTER）
 - GPU 专家卸载配方：`-ot "blk\.(层号)\.ffn_(up|gate|down)_exps\.weight=CUDA0/1"` 把指定层专家放上显卡，实测每加一层 TG +1% 左右
+- 长 Prompt MoE 流式 Prefill：专家权重保留 pinned 原布局，达到阈值后以完整张量 H2D；可选 1-4 个私有设备槽和独立 H2D/commit stream 跨 split 预取。每槽分配前保留 2GiB 显存，申请失败无损退化到更浅窗口或原串行路径；默认关闭，不改变 Decode 与非 CUDA 后端
 
 ## 四、模型支持
 
@@ -53,19 +54,21 @@
 - **MiniMax-M3（minimax-m3.cpp）**：手抄精简版（text-only，M2 GQA + DSv3 式专家）；主线 07-26 已合入官方版，后续 merge 将切换主线实现
 - **GGUF 字节级修复工具链**：量化块 f16 scale 腐化（Inf/NaN）扫描与补丁（`nan_fix_backup.json` 可回滚），修复了 GLM-5.2 UD-Q2_K 官方文件 138 个腐化块导致的输出乱码
 
-## 五、跨机分布式 EP（开发中，`tools/epd/`）
+## 五、跨机分布式 EP（可用，`tools/epd/`）
 
-- **架构**：激活 dispatch（每 token 每层 KB 级流量），非权重传输——这是跨机场景唯一可行的数据通路（权重流 ~700MB/token vs 激活流 ~1.8MB/token）
-- `llama-ep-transport`：帧协议 LEP1 + 传输函数表隔离（TCP 实现已就绪，RDMA verbs 后端预留接口）
-- `llama-epd`：专家计算守护进程，gguf 元数据 + 只读 mmap 直接加载（284B 模型 0.3s 启动），单层数值验证 diff=0（逐位一致）
-- 目标：双路 8360Y 节点经 InfiniBand EDR 互联，可横向扩展 CPU MoE 节点，跑 2.8T 级模型
+- **架构**：master 发送激活、router ids 和路由权重，worker 读取本地专家权重计算；网络传激活而不是传模型权重
+- `llama-ep-transport`：LEP1/协议 v2，支持 TCP 和 RoCEv2 RDMA；RDMA 建连失败自动回退 TCP
+- `llama-epd`：支持多分卷 GGUF、mmap/`--no-mmap`、持久线程池、运行时 repack、NUMA 加权交织和启动 autotune
+- classic 模式按层分片；mirror 模式把远端专家槽与本地槽并行计算；SCHED 模式通过 REQ2/RESP2 做专家槽级派单
+- DSV4 与 GLM-5.2 已完成逐字输出对拍和双机实测；生产参数与当前限制见 `docs/PEOPLESLLM-PARAMS.md`
 
 ## 六、版本控制策略
 
-- `main`（= local）：生产分支 = vendor base + 本地改动层
+- `local`：本地主集成分支；验证后的快照再发布到 `main`
 - `vendor`：主线基线锚点（e8f19cc0a）
 - `upstream-master`：主线跟踪引用
-- merge 实测：345 个主线提交 trial merge 仅 9 文件冲突，集中在 chat.cpp 等外围文件；性能栈文件（ggml-cpu/repack/llama-graph）merge 时永远保留本分支实现
+- 功能实验通过 Git worktree 隔离；`local` 保持可运行集成状态，成熟实验再按主题合入
+- 跟进上游时逐文件解决冲突并重新跑正确性/性能验收，不默认整文件保留任一侧实现
 
 ## 七、实测数据汇总
 
