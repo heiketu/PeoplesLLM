@@ -254,13 +254,17 @@ static constexpr int64_t DSV4_HCA_RATIO  = 128;
 
 // Fused indexed FA avoids the per-token full-width KV concat by passing the
 // raw and compressed segments to the sparse kernel separately. Mode 1 restores
-// the historical opt-in behavior (decode + prefill), mode 2 (default) enables
-// the q1 decode specialization only. Requires F16 KV: the sparse kernels
-// address the full F16 backing through the row map.
+// the historical opt-in behavior (decode + prefill), mode 2 enables the q1
+// decode specialization only. Requires F16 KV: the sparse kernels address the
+// full F16 backing through the row map.
+// Default is off: at 16K the q1 sparse kernel (ncols2=8 tiles) loses to the
+// dense q1 16/32-head-group MMA (fixed TG64 -12%, TG512 -2%, 2026-08-07 A/B).
+// Re-evaluate the default once the sparse kernel gets wider head groups or at
+// much longer contexts where the row-scan win dominates.
 static int dsv4_fused_indexed_fa_mode() {
     static const int mode = []() {
         const char * value = getenv("LLAMA_DSV4_FUSED_INDEXED_FA");
-        return value ? atoi(value) : 2;
+        return value ? atoi(value) : 0;
     }();
     return mode;
 }
