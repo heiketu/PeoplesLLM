@@ -585,10 +585,17 @@ int llama_context::decode_layer_major(const llama_batch & batch_inp, uint32_t n_
             !sampling.samplers.empty() || !loras->empty() ||
             batch_inp.n_tokens <= 0 || !batch_inp.token || batch_inp.embd ||
             n_ubatch == 0 || n_ubatch > cparams.n_ubatch) {
+        LLAMA_LOG_INFO("%s: ineligible: arch=%d ctx_type=%d causal=%d embd=%d nextn=%d prenorm=%d pooling=%d samplers=%zu loras=%zu n_tokens=%d token=%p embd=%p n_ubatch=%u cparams_ubatch=%u\n",
+                __func__, (int) model.arch, (int) cparams.ctx_type, (int) cparams.causal_attn,
+                (int) cparams.embeddings, (int) cparams.embeddings_nextn, (int) cparams.embeddings_pre_norm,
+                (int) cparams.pooling_type, sampling.samplers.size(), loras->size(),
+                batch_inp.n_tokens, (void *) batch_inp.token, (void *) batch_inp.embd,
+                n_ubatch, cparams.n_ubatch);
         return -1;
     }
 
     if (!dynamic_cast<llama_kv_cache_dsv4 *>(memory.get())) {
+        LLAMA_LOG_INFO("%s: ineligible: KV memory is not llama_kv_cache_dsv4\n", __func__);
         return -1;
     }
 
@@ -611,6 +618,8 @@ int llama_context::decode_layer_major(const llama_batch & batch_inp, uint32_t n_
     // Initial-prompt, one-sequence sessions give DSV4 a reliable rollback:
     // seq_rm(seq, 0, -1) clears raw KV, compressed KV and compressor state.
     if (n_outputs_all != 1 || batch.logits[n_tokens_all - 1] == 0) {
+        LLAMA_LOG_INFO("%s: ineligible: n_outputs=%u last_logits=%d\n",
+                __func__, n_outputs_all, (int) batch.logits[n_tokens_all - 1]);
         return -1;
     }
 
@@ -619,10 +628,15 @@ int llama_context::decode_layer_major(const llama_batch & batch_inp, uint32_t n_
         if (batch.n_seq_id[i] != 1 || batch.seq_id[i][0] != seq_id ||
                 batch.pos[i] != (llama_pos) i ||
                 batch.logits[i] != (int8_t) (i + 1 == n_tokens_all)) {
+            LLAMA_LOG_INFO("%s: ineligible: token %u n_seq_id=%d seq=%d pos=%d logits=%d\n",
+                    __func__, i, (int) batch.n_seq_id[i], (int) batch.seq_id[i][0],
+                    (int) batch.pos[i], (int) batch.logits[i]);
             return -1;
         }
     }
     if (memory->seq_pos_max(seq_id) >= 0) {
+        LLAMA_LOG_INFO("%s: ineligible: seq %d has cached pos %d\n",
+                __func__, (int) seq_id, (int) memory->seq_pos_max(seq_id));
         return -1;
     }
 

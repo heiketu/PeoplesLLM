@@ -3415,6 +3415,10 @@ private:
                             lm_batch.seq_id[i][0] = slot.id;
                             lm_batch.logits[i]    = i + 1 == n_prompt;
                         }
+                        // llama_batch_init only allocates; the token count must
+                        // be set explicitly or every downstream check sees an
+                        // empty batch
+                        lm_batch.n_tokens = n_prompt;
                         // the runtime embeddings flag may still be on from a
                         // previous batch of another slot
                         llama_set_embeddings(ctx_tgt, false);
