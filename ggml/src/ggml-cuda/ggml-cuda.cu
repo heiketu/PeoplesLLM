@@ -80,6 +80,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cfloat>
+#include <deque>
 #include <initializer_list>
 #include <limits>
 #include <map>
@@ -90,8 +91,13 @@
 #include <cstdlib>
 #include <regex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
+
+#if defined(__gnu_linux__)
+#include <sched.h>
+#endif
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
@@ -717,6 +723,21 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     ggml_cuda_graph_timing_finish(this);
 #endif
 
+    // drain in-flight REPACK unrepack tasks targeting this context: their
+    // worker records ready events and touches our streams before clearing
+    // the pending flag
+    {
+        std::unique_lock<std::mutex> ulock(moe_unrepack_mutex);
+        moe_unrepack_cv.wait(ulock, [&] {
+            for (int slot = 0; slot < GGML_CUDA_MOE_PP_MAX_PREFETCH; ++slot) {
+                if (moe_prefetch_pending[slot]) {
+                    return false;
+                }
+            }
+            return true;
+        });
+    }
+
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
@@ -729,6 +750,9 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     for (int slot = 0; slot < GGML_CUDA_MOE_PP_MAX_PREFETCH; ++slot) {
         if (moe_prefetch_data[slot] != nullptr) {
             CUDA_CHECK(cudaFree(moe_prefetch_data[slot]));
+        }
+        if (moe_staging_data[slot] != nullptr) {
+            CUDA_CHECK(cudaFreeHost(moe_staging_data[slot]));
         }
         if (moe_prefetch_ready[slot] != nullptr) {
             CUDA_CHECK(cudaEventDestroy(moe_prefetch_ready[slot]));
@@ -2778,6 +2802,361 @@ static int ggml_backend_cuda_moe_prefetch_auto(
     return slot;
 }
 
+// -------------------------------------------------------------------------
+// REPACK-source MoE prefetch
+//
+// CPU_REPACK expert weights keep the ggml-cpu interleaved mxfp4 layout in
+// host memory; the GPU needs the plain GGUF layout. The bit-exact inverse
+// transform (ggml/src/ggml-cpu/repack.cpp) runs on a process-wide worker
+// pool into per-slot pinned staging, and the last worker to finish launches
+// the staging -> slot H2D copy on the context's copy stream. The pending
+// flag gives host-side ordering: it is cleared only after the ready event
+// has been recorded, and commit() host-waits on it before referencing the
+// event (a stream wait on an event whose record has not been captured yet
+// would be a no-op).
+
+struct ggml_repack_unrepack_job;
+
+struct ggml_cuda_unrepack_api {
+    int                            (*interleave)(const ggml_tensor *);
+    ggml_repack_unrepack_job *     (*job_new)(const void *, void *, int64_t, int64_t, int64_t, int, int64_t);
+    void                           (*job_free)(ggml_repack_unrepack_job *);
+    void                           (*job_run)(ggml_repack_unrepack_job *, int, int);
+};
+
+// the CPU backend exports the unrepack kernels through its proc registry
+// (ggml-cuda does not link against ggml-cpu)
+static const ggml_cuda_unrepack_api * ggml_cuda_unrepack_api_get() {
+    static const ggml_cuda_unrepack_api api = [] {
+        ggml_cuda_unrepack_api a = {};
+        ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        if (cpu_dev != nullptr) {
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(cpu_dev);
+            if (reg != nullptr) {
+                a.interleave = (decltype(a.interleave))
+                    ggml_backend_reg_get_proc_address(reg, "ggml_repack_mxfp4_interleave");
+                a.job_new = (decltype(a.job_new))
+                    ggml_backend_reg_get_proc_address(reg, "ggml_repack_unrepack_job_new");
+                a.job_free = (decltype(a.job_free))
+                    ggml_backend_reg_get_proc_address(reg, "ggml_repack_unrepack_job_free");
+                a.job_run = (decltype(a.job_run))
+                    ggml_backend_reg_get_proc_address(reg, "ggml_repack_unrepack_job_run");
+            }
+        }
+        return a;
+    }();
+    const bool ok = api.interleave != nullptr && api.job_new != nullptr &&
+        api.job_free != nullptr && api.job_run != nullptr;
+    return ok ? &api : nullptr;
+}
+
+struct ggml_cuda_unrepack_task {
+    ggml_backend_cuda_context * ctx;
+    int                         slot;
+    int                         device;
+    ggml_repack_unrepack_job *  job;
+    void *                      staging;
+    size_t                      size;
+    std::atomic<int>            n_done{0};
+};
+
+class ggml_cuda_unrepack_pool {
+  public:
+    ggml_cuda_unrepack_pool(const ggml_cuda_unrepack_api * api, int nth) : api(api), nth(nth) {
+        workers.reserve(nth);
+        for (int ith = 0; ith < nth; ++ith) {
+            workers.emplace_back([this, ith] { worker(ith); });
+        }
+    }
+
+    // serializes unrepack tasks: a task needs every worker, so at most one
+    // task is active at a time
+    void submit(ggml_cuda_unrepack_task * task) {
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            cv.wait(lock, [&] { return current == nullptr; });
+            current = task;
+        }
+        cv.notify_all();
+    }
+
+  private:
+    void worker(int ith) {
+        pin(ith);
+        for (;;) {
+            ggml_cuda_unrepack_task * task = nullptr;
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                cv.wait(lock, [&] { return current != nullptr; });
+                task = current;
+            }
+            api->job_run(task->job, ith, nth);
+            if (task->n_done.fetch_add(1, std::memory_order_acq_rel) + 1 < nth) {
+                continue;
+            }
+            // last worker out: launch staging -> slot H2D, then release the
+            // slot. The ready event record must happen-before the pending
+            // flag is cleared (commit host-waits on the flag).
+            ggml_backend_cuda_context * ctx = task->ctx;
+            const int slot = task->slot;
+            ggml_cuda_set_device(task->device);
+            CUDA_CHECK(cudaStreamWaitEvent(ctx->moe_h2d_stream, ctx->moe_prefetch_done[slot], 0));
+            CUDA_CHECK(cudaMemcpyAsync(ctx->moe_prefetch_data[slot], task->staging, task->size,
+                cudaMemcpyHostToDevice, ctx->moe_h2d_stream));
+            CUDA_CHECK(cudaEventRecord(ctx->moe_prefetch_ready[slot], ctx->moe_h2d_stream));
+            ctx->moe_staging_used[slot] = true;
+            {
+                std::lock_guard<std::mutex> lock(ctx->moe_unrepack_mutex);
+                ctx->moe_prefetch_pending[slot] = false;
+            }
+            ctx->moe_unrepack_cv.notify_all();
+            api->job_free(task->job);
+            delete task;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                current = nullptr;
+            }
+            cv.notify_all();
+        }
+    }
+
+#if defined(__gnu_linux__)
+    // block-split the pool across NUMA nodes exactly like
+    // ggml_numa_node_for_thread so each worker's local window claims land on
+    // its own node's pages
+    void pin(int ith) {
+        static const std::vector<std::vector<int>> node_cpus = [] {
+            std::vector<std::vector<int>> out;
+            for (int node = 0; ; ++node) {
+                char path[128];
+                snprintf(path, sizeof(path), "/sys/devices/system/node/node%d/cpulist", node);
+                FILE * f = fopen(path, "r");
+                if (f == nullptr) {
+                    break;
+                }
+                char buf[1024] = {};
+                if (fgets(buf, sizeof(buf), f) == nullptr) {
+                    fclose(f);
+                    break;
+                }
+                fclose(f);
+                std::vector<int> cpus;
+                for (char * tok = strtok(buf, ",\n"); tok != nullptr; tok = strtok(nullptr, ",\n")) {
+                    int a = 0, b = 0;
+                    if (sscanf(tok, "%d-%d", &a, &b) == 2) {
+                        for (int c = a; c <= b; ++c) {
+                            cpus.push_back(c);
+                        }
+                    } else if (sscanf(tok, "%d", &a) == 1) {
+                        cpus.push_back(a);
+                    }
+                }
+                if (cpus.empty()) {
+                    break;
+                }
+                out.push_back(std::move(cpus));
+            }
+            return out;
+        }();
+        const int n_nodes = (int) node_cpus.size();
+        if (n_nodes <= 1) {
+            return;
+        }
+        const int node = std::min((ith*n_nodes)/nth, n_nodes - 1);
+        // first pool thread index of this node under the block split
+        const int t_first = (int) (((int64_t) node*nth + n_nodes - 1)/n_nodes);
+        const auto & cpus = node_cpus[node];
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        CPU_SET(cpus[(size_t) (ith - t_first)%cpus.size()], &set);
+        (void) sched_setaffinity(0, sizeof(set), &set);
+    }
+#else
+    void pin(int) {}
+#endif
+
+    const ggml_cuda_unrepack_api * api;
+    int nth;
+    std::mutex mutex;
+    std::condition_variable cv;
+    ggml_cuda_unrepack_task * current = nullptr;
+    std::vector<std::thread> workers;
+};
+
+// intentionally never destroyed: the workers block on the cv for the rest of
+// the process lifetime, avoiding static destruction order issues with the
+// backend contexts they serve
+static ggml_cuda_unrepack_pool * ggml_cuda_unrepack_pool_get() {
+    static ggml_cuda_unrepack_pool * pool = [] {
+        const ggml_cuda_unrepack_api * api = ggml_cuda_unrepack_api_get();
+        if (api == nullptr) {
+            return (ggml_cuda_unrepack_pool *) nullptr;
+        }
+        const char * env = getenv("GGML_CUDA_MOE_PP_UNREPACK_THREADS");
+        const int nth = std::max(1, std::min(env != nullptr ? atoi(env) : 16, 256));
+        return new ggml_cuda_unrepack_pool(api, nth);
+    }();
+    return pool;
+}
+
+// root (view_src chain end) of a tensor living in a CPU_REPACK host buffer,
+// nullptr otherwise
+static const ggml_tensor * ggml_cuda_cpu_repack_root(const ggml_tensor * tensor) {
+    if (tensor == nullptr) {
+        return nullptr;
+    }
+    const ggml_tensor * root = tensor;
+    while (root->view_src != nullptr) {
+        root = root->view_src;
+    }
+    if (root->type != GGML_TYPE_MXFP4 || root->buffer == nullptr) {
+        return nullptr;
+    }
+    if (strcmp(ggml_backend_buffer_name(root->buffer), "CPU_REPACK") != 0) {
+        return nullptr;
+    }
+    return root;
+}
+
+static bool ggml_backend_cuda_moe_prefetch_src(
+        ggml_backend_t backend, int slot, const ggml_tensor * tensor, const void * data, size_t size) {
+    if (slot < 0 || slot >= GGML_CUDA_MOE_PP_MAX_PREFETCH) {
+        return false;
+    }
+
+    const ggml_tensor * root = ggml_cuda_cpu_repack_root(tensor);
+    if (root == nullptr) {
+        return ggml_backend_cuda_moe_prefetch(backend, slot, data, size);
+    }
+
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    const ggml_cuda_unrepack_api * api = ggml_cuda_unrepack_api_get();
+    ggml_cuda_unrepack_pool * pool = ggml_cuda_unrepack_pool_get();
+    const int interleave = api != nullptr ? api->interleave(root) : 0;
+    if (api == nullptr || pool == nullptr || interleave == 0) {
+        // a raw H2D copy of CPU_REPACK bytes would be silent numerical
+        // corruption; refuse instead
+        GGML_LOG_ERROR("%s: %s is CPU_REPACK but the ggml-cpu unrepack kernels are unavailable\n",
+            __func__, root->name);
+        return false;
+    }
+
+    // one row is interleave*17 bytes per interleave rows in both layouts, so
+    // rows address src and dst alike and the view geometry is plain rows
+    const int64_t nblocks = root->ne[0]/ggml_blck_size(root->type);
+    const int64_t rpe     = root->ne[1];
+    if (size % root->nb[1] != 0 ||
+            (const char *) data < (const char *) root->data ||
+            ((const char *) data - (const char *) root->data) % root->nb[1] != 0) {
+        GGML_LOG_ERROR("%s: %s has an unsupported CPU_REPACK view geometry\n", __func__, root->name);
+        return false;
+    }
+    const int64_t n_rows = (int64_t) (size/root->nb[1]);
+    if (rpe <= 0 || rpe % interleave != 0 || n_rows == 0 || n_rows % rpe != 0) {
+        GGML_LOG_ERROR("%s: %s has an unsupported CPU_REPACK view geometry\n", __func__, root->name);
+        return false;
+    }
+    const int64_t n_experts = n_rows/rpe;
+
+    ggml_backend_cuda_moe_prefetch_init(cuda_ctx, slot);
+
+    // same content already staged (possibly still in flight; commit orders it)
+    if (cuda_ctx->moe_prefetch_src[slot] == data && cuda_ctx->moe_prefetch_src_size[slot] == size) {
+        return true;
+    }
+
+    // a previous unrepack task on this slot must be done before staging is
+    // touched (also orders the staging_used event sync below)
+    {
+        std::unique_lock<std::mutex> lock(cuda_ctx->moe_unrepack_mutex);
+        cuda_ctx->moe_unrepack_cv.wait(lock, [&] { return !cuda_ctx->moe_prefetch_pending[slot]; });
+    }
+
+    if (cuda_ctx->moe_prefetch_size[slot] < size) {
+        constexpr size_t reserve = 2ull * 1024 * 1024 * 1024;
+        size_t free = 0;
+        size_t total = 0;
+        CUDA_CHECK(cudaMemGetInfo(&free, &total));
+        GGML_UNUSED(total);
+        if (free < size + reserve) {
+            return false;
+        }
+        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->moe_h2d_stream));
+        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->moe_commit_stream));
+        if (cuda_ctx->moe_prefetch_data[slot] != nullptr) {
+            CUDA_CHECK(cudaFree(cuda_ctx->moe_prefetch_data[slot]));
+            cuda_ctx->moe_prefetch_data[slot] = nullptr;
+            cuda_ctx->moe_prefetch_size[slot] = 0;
+            cuda_ctx->moe_prefetch_src[slot] = nullptr;
+            cuda_ctx->moe_prefetch_src_size[slot] = 0;
+        }
+        cudaError_t alloc_status = cudaMalloc(&cuda_ctx->moe_prefetch_data[slot], size);
+        if (alloc_status == cudaErrorMemoryAllocation) {
+            cuda_ctx->moe_prefetch_data[slot] = nullptr;
+            (void) cudaGetLastError();
+            return false;
+        }
+        CUDA_CHECK(alloc_status);
+        cuda_ctx->moe_prefetch_size[slot] = size;
+    }
+
+    if (cuda_ctx->moe_staging_used[slot]) {
+        // the previous H2D out of this staging buffer must have completed
+        // before the workers overwrite it (or it is re-pinned below)
+        CUDA_CHECK(cudaEventSynchronize(cuda_ctx->moe_prefetch_ready[slot]));
+        cuda_ctx->moe_staging_used[slot] = false;
+    }
+    if (cuda_ctx->moe_staging_size[slot] < size) {
+        if (cuda_ctx->moe_staging_data[slot] != nullptr) {
+            CUDA_CHECK(cudaFreeHost(cuda_ctx->moe_staging_data[slot]));
+            cuda_ctx->moe_staging_data[slot] = nullptr;
+            cuda_ctx->moe_staging_size[slot] = 0;
+        }
+        cudaError_t alloc_status = cudaHostAlloc(&cuda_ctx->moe_staging_data[slot], size, cudaHostAllocDefault);
+        if (alloc_status != cudaSuccess) {
+            cuda_ctx->moe_staging_data[slot] = nullptr;
+            (void) cudaGetLastError();
+            GGML_LOG_ERROR("%s: cudaHostAlloc of %.2f GiB unrepack staging failed\n",
+                __func__, size/1073741824.0);
+            return false;
+        }
+        cuda_ctx->moe_staging_size[slot] = size;
+    }
+
+    ggml_repack_unrepack_job * job = api->job_new(
+        data, cuda_ctx->moe_staging_data[slot], nblocks, rpe, n_experts, interleave, -1);
+
+    cuda_ctx->moe_prefetch_src[slot]      = data;
+    cuda_ctx->moe_prefetch_src_size[slot] = size;
+    cuda_ctx->moe_prefetch_age[slot]      = ++cuda_ctx->moe_prefetch_clock;
+    {
+        std::lock_guard<std::mutex> lock(cuda_ctx->moe_unrepack_mutex);
+        cuda_ctx->moe_prefetch_pending[slot] = true;
+    }
+    pool->submit(new ggml_cuda_unrepack_task{
+        cuda_ctx, slot, cuda_ctx->device, job, cuda_ctx->moe_staging_data[slot], size, { 0 }});
+    return true;
+}
+
+static int ggml_backend_cuda_moe_prefetch_auto_src(
+        ggml_backend_t backend, const ggml_tensor * tensor, const void * data, size_t size) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    int slot = ggml_backend_cuda_moe_prefetch_find(backend, data, size);
+    if (slot < 0) {
+        slot = 0;
+        for (int i = 1; i < GGML_CUDA_MOE_PP_MAX_PREFETCH; ++i) {
+            if (cuda_ctx->moe_prefetch_age[i] < cuda_ctx->moe_prefetch_age[slot]) {
+                slot = i;
+            }
+        }
+        if (!ggml_backend_cuda_moe_prefetch_src(backend, slot, tensor, data, size)) {
+            return -1;
+        }
+    }
+    cuda_ctx->moe_prefetch_age[slot] = ++cuda_ctx->moe_prefetch_clock;
+    return slot;
+}
+
 static bool ggml_backend_cuda_moe_prefetch_commit(
         ggml_backend_t backend, int slot, ggml_tensor * tensor, size_t offset,
         size_t size, ggml_backend_event_t reuse_event) {
@@ -2790,6 +3169,14 @@ static bool ggml_backend_cuda_moe_prefetch_commit(
     if (buf->buft != ggml_backend_cuda_buffer_type(cuda_ctx->device) ||
         cuda_ctx->moe_prefetch_size[slot] < size) {
         return false;
+    }
+
+    // a REPACK-source prefetch records its ready event from an unrepack
+    // worker thread; host-wait for the record so the stream wait below cannot
+    // capture a stale (not yet recorded) event
+    {
+        std::unique_lock<std::mutex> lock(cuda_ctx->moe_unrepack_mutex);
+        cuda_ctx->moe_unrepack_cv.wait(lock, [&] { return !cuda_ctx->moe_prefetch_pending[slot]; });
     }
 
     CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->moe_commit_stream, cuda_ctx->moe_prefetch_ready[slot], 0));
@@ -6083,6 +6470,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_moe_prefetch_auto") == 0) {
         return (void *)ggml_backend_cuda_moe_prefetch_auto;
+    }
+    if (strcmp(name, "ggml_backend_cuda_moe_prefetch_src") == 0) {
+        return (void *)ggml_backend_cuda_moe_prefetch_src;
+    }
+    if (strcmp(name, "ggml_backend_cuda_moe_prefetch_auto_src") == 0) {
+        return (void *)ggml_backend_cuda_moe_prefetch_auto_src;
     }
 #if defined(USE_CUDA_GRAPH) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     if (strcmp(name, "ggml_backend_cuda_graph_timing_input_begin") == 0) {

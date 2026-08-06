@@ -195,6 +195,10 @@ public:
             if (fn != nullptr) {
                 backends_.push_back(backend);
                 fns_.push_back(fn);
+                // src variant: takes the weight tensor and un-repacks
+                // CPU_REPACK buffers on the CPU before the H2D copy
+                fns_src_.push_back((moe_prefetch_auto_src_t)
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_moe_prefetch_auto_src"));
             }
         }
         return !backends_.empty();
@@ -231,17 +235,33 @@ public:
                     ggml_backend_buffer_get_usage(buf) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
                 continue;
             }
+            // CPU_REPACK weights need the src variant (CPU-side inverse
+            // transform before H2D). Without EP the MoE op is not pinned to
+            // the GPU for host weights, so hinting would only burn bandwidth.
+            const bool repack = strcmp(ggml_backend_buffer_name(buf), "CPU_REPACK") == 0;
+            if (repack && !ep) {
+                continue;
+            }
             if (ep && w->ne[2] % 2 == 0) {
                 const int64_t half = w->ne[2]/2;
                 for (int rank = 0; rank < 2; ++rank) {
-                    fns_[rank](backends_[rank],
-                        (const char *) w->data + rank*half*w->nb[2], rank_view_nbytes(w, half));
+                    const char * data = (const char *) w->data + rank*half*w->nb[2];
+                    const size_t size = rank_view_nbytes(w, half);
+                    if (fns_src_[rank] != nullptr) {
+                        fns_src_[rank](backends_[rank], w, data, size);
+                    } else if (!repack) {
+                        fns_[rank](backends_[rank], data, size);
+                    }
                 }
             } else {
                 ggml_backend_t backend = backend_for_device(backends, model.dev_layer(il));
                 for (size_t i = 0; i < backends_.size(); ++i) {
                     if (backends_[i] == backend) {
-                        fns_[i](backend, w->data, ggml_nbytes(w));
+                        if (fns_src_[i] != nullptr) {
+                            fns_src_[i](backend, w, w->data, ggml_nbytes(w));
+                        } else if (!repack) {
+                            fns_[i](backend, w->data, ggml_nbytes(w));
+                        }
                         break;
                     }
                 }
@@ -251,11 +271,13 @@ public:
 
 private:
     typedef int (*moe_prefetch_auto_t)(ggml_backend_t, const void *, size_t);
+    typedef int (*moe_prefetch_auto_src_t)(ggml_backend_t, const ggml_tensor *, const void *, size_t);
 
     bool active_ = false;
     bool ep_ = false;
     std::vector<ggml_backend_t> backends_;
     std::vector<moe_prefetch_auto_t> fns_;
+    std::vector<moe_prefetch_auto_src_t> fns_src_;
 };
 
 } // namespace

@@ -179,6 +179,33 @@ static_assert(sizeof(block_mxfp4x8) == 8 + QK_MXFP4 * 4, "wrong mxfp4x8 block si
 extern "C" {
 #endif
 
+// Bit-exact inverse of the CPU_REPACK mxfp4 interleave: make_block_mxfp4x4/x8
+// are pure byte permutations, so the original block_mxfp4 row-major layout can
+// be recovered exactly. Used by the GPU-stream MoE prefetch to consume
+// REPACK-layout expert weights without a second host copy.
+
+// interleave factor (4 or 8) of the tensor's repacked mxfp4 layout, or 0 when
+// the tensor does not hold repacked mxfp4 data (walks the view_src chain)
+int ggml_repack_mxfp4_interleave(const struct ggml_tensor * t);
+
+// one contiguous row window: src = repacked rows, dst = original block_mxfp4
+// row-major layout; nrows must be a multiple of the interleave factor
+void ggml_repack_mxfp4_unrepack_rows(const void * src, void * dst, int64_t nblocks, int64_t nrows, int interleave);
+
+// Cooperative multithreaded inverse transform over whole expert planes. With
+// ep_win < 0 the per-node row windows match llama_model::numa_ep_place_experts
+// (128-row aligned): threads first claim windows owned by their NUMA node,
+// then steal the rest; ep_win == 0 disables NUMA phasing (flat claims), any
+// positive value forces that window size. ggml_repack_unrepack_job_run is
+// called once by every participating worker with its (ith, nth); the job is
+// complete when all nth calls returned.
+struct ggml_repack_unrepack_job;
+struct ggml_repack_unrepack_job * ggml_repack_unrepack_job_new(
+        const void * src, void * dst, int64_t nblocks, int64_t rows_per_expert, int64_t n_experts, int interleave,
+        int64_t ep_win);
+void ggml_repack_unrepack_job_free(struct ggml_repack_unrepack_job * job);
+void ggml_repack_unrepack_job_run(struct ggml_repack_unrepack_job * job, int ith, int nth);
+
 void ggml_quantize_mat_q8_0_4x4(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k);
 void ggml_quantize_mat_q8_0_4x8(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k);
 void ggml_quantize_mat_q8_K_4x4(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k);

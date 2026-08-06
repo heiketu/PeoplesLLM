@@ -1742,9 +1742,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     std::vector<ggml_bitset_t> used_ids;
 
     typedef bool (*moe_prefetch_t)(ggml_backend_t, int, const void *, size_t);
+    typedef bool (*moe_prefetch_src_t)(ggml_backend_t, int, const ggml_tensor *, const void *, size_t);
     typedef bool (*moe_prefetch_commit_t)(
         ggml_backend_t, int, ggml_tensor *, size_t, size_t, ggml_backend_event_t);
     typedef int (*moe_prefetch_slot_t)(ggml_backend_t, const void *, size_t);
+    typedef int (*moe_prefetch_slot_src_t)(ggml_backend_t, const ggml_tensor *, const void *, size_t);
     typedef void (*cuda_graph_timing_input_begin_t)(ggml_backend_t, const ggml_cgraph *);
 
     static const int64_t moe_pp_min_tokens = []() {
@@ -1784,8 +1786,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     std::array<std::vector<moe_prefetch_candidate>, GGML_SCHED_MAX_BACKENDS> moe_candidates;
     std::array<size_t, GGML_SCHED_MAX_BACKENDS> moe_next_candidate = {};
     std::array<moe_prefetch_t, GGML_SCHED_MAX_BACKENDS> moe_prefetch_fns = {};
+    std::array<moe_prefetch_src_t, GGML_SCHED_MAX_BACKENDS> moe_prefetch_src_fns = {};
     std::array<moe_prefetch_commit_t, GGML_SCHED_MAX_BACKENDS> moe_commit_fns = {};
     std::array<moe_prefetch_slot_t, GGML_SCHED_MAX_BACKENDS> moe_auto_fns = {};
+    std::array<moe_prefetch_slot_src_t, GGML_SCHED_MAX_BACKENDS> moe_auto_src_fns = {};
     std::array<moe_prefetch_slot_t, GGML_SCHED_MAX_BACKENDS> moe_find_fns = {};
     std::vector<int> moe_slot_by_split(sched->n_splits, -1);
     std::vector<int> moe_input_by_split(sched->n_splits, -1);
@@ -1854,11 +1858,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
             moe_prefetch_fns[backend_id] = (moe_prefetch_t)
                 ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_moe_prefetch");
+            // src variants take the weight tensor and detect CPU_REPACK
+            // buffers, transforming the layout on the CPU before the H2D copy
+            moe_prefetch_src_fns[backend_id] = (moe_prefetch_src_t)
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_moe_prefetch_src");
             moe_commit_fns[backend_id] = (moe_prefetch_commit_t)
                 ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_moe_prefetch_commit");
             if (moe_pipe) {
                 moe_auto_fns[backend_id] = (moe_prefetch_slot_t)
                     ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_moe_prefetch_auto");
+                moe_auto_src_fns[backend_id] = (moe_prefetch_slot_src_t)
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_moe_prefetch_auto_src");
                 moe_find_fns[backend_id] = (moe_prefetch_slot_t)
                     ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_moe_prefetch_find");
             }
@@ -1888,14 +1898,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 const auto candidate = moe_candidates[backend_id][pos];
                 ggml_tensor * input = splits[candidate.split_id].inputs[candidate.input_id];
                 if (moe_pipe_active(backend_id)) {
-                    const int slot = moe_auto_fns[backend_id](backend, input->data, ggml_nbytes(input));
+                    const int slot = moe_auto_src_fns[backend_id] != nullptr
+                        ? moe_auto_src_fns[backend_id](backend, input, input->data, ggml_nbytes(input))
+                        : moe_auto_fns[backend_id](backend, input->data, ggml_nbytes(input));
                     if (slot < 0) {
                         break;
                     }
                     moe_pipe_assignments.push_back({ candidate.split_id, candidate.input_id, slot });
                 } else {
                     const int slot = (int) pos;
-                    if (!moe_prefetch_fns[backend_id](backend, slot, input->data, ggml_nbytes(input))) {
+                    const bool ok = moe_prefetch_src_fns[backend_id] != nullptr
+                        ? moe_prefetch_src_fns[backend_id](backend, slot, input, input->data, ggml_nbytes(input))
+                        : moe_prefetch_fns[backend_id](backend, slot, input->data, ggml_nbytes(input));
+                    if (!ok) {
                         break;
                     }
                     moe_slot_by_split[candidate.split_id] = slot;
@@ -1962,6 +1977,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     ggml_backend_buffer_get_usage(input_buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
                     ggml_backend_buffer_is_host(input_buffer);
 
+                // CPU_REPACK weight bytes are not the GGUF layout; copying them
+                // raw to another backend is silent numerical corruption. The
+                // only legal cross-backend route is the prefetch commit path
+                // (pipe mode), whose src variant un-repacks on the CPU first.
+                auto abort_raw_repack_copy = [&]() {
+                    if (input_buffer != nullptr && input_backend != split_backend &&
+                            ggml_backend_buffer_get_usage(input_buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                            strcmp(ggml_backend_buffer_name(input_buffer), "CPU_REPACK") == 0) {
+                        GGML_ABORT("%s: CPU_REPACK weight %s cannot be copied raw to backend %s "
+                            "(REPACK layout is not the GGUF layout); use the GPU unrepack prefetch path",
+                            __func__, input->name, ggml_backend_name(split_backend));
+                    }
+                };
+
                 // pipe mode: commit the staged slot entirely on device streams,
                 // guarded by the per-backend reuse event instead of a host drain
                 if (moe_weight_input && moe_pp_min_tokens > 0 &&
@@ -2024,6 +2053,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 split_backend, slot, input_cpy, 0, ggml_nbytes(input), reuse_event)) {
                             moe_slot_used = slot;
                         } else {
+                            abort_raw_repack_copy();
                             ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
                         }
                         if (profile_enabled) {
@@ -2074,6 +2104,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                     // group consecutive experts and copy them together
                     auto copy_experts = [&](int32_t first_id, int32_t last_id) {
+                        abort_raw_repack_copy();
                         const size_t expert_offset = first_id * expert_size;
                         const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
                         const size_t padding = std::min<size_t>(expert_size, 512);
@@ -2115,6 +2146,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
                 } else {
                     const int64_t other_input_start_us = profile_enabled ? ggml_time_us() : 0;
+                    abort_raw_repack_copy();
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
                     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
@@ -2228,16 +2260,26 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 if (moe_pipe_active(split_backend_id)) {
                     // reuse the just-consumed slot: an LRU victim could still
                     // be assigned to a later split in this call
-                    if (moe_prefetch_fns[split_backend_id](
-                            split_backend, moe_slot_used, input->data, ggml_nbytes(input))) {
+                    const bool ok = moe_prefetch_src_fns[split_backend_id] != nullptr
+                        ? moe_prefetch_src_fns[split_backend_id](
+                            split_backend, moe_slot_used, input, input->data, ggml_nbytes(input))
+                        : moe_prefetch_fns[split_backend_id](
+                            split_backend, moe_slot_used, input->data, ggml_nbytes(input));
+                    if (ok) {
                         moe_pipe_assignments.push_back({ candidate.split_id, candidate.input_id, moe_slot_used });
                         ++next;
                     }
-                } else if (moe_prefetch_fns[split_backend_id](
-                        split_backend, moe_slot_used, input->data, ggml_nbytes(input))) {
-                    moe_slot_by_split[candidate.split_id] = moe_slot_used;
-                    moe_input_by_split[candidate.split_id] = candidate.input_id;
-                    ++next;
+                } else {
+                    const bool ok = moe_prefetch_src_fns[split_backend_id] != nullptr
+                        ? moe_prefetch_src_fns[split_backend_id](
+                            split_backend, moe_slot_used, input, input->data, ggml_nbytes(input))
+                        : moe_prefetch_fns[split_backend_id](
+                            split_backend, moe_slot_used, input->data, ggml_nbytes(input));
+                    if (ok) {
+                        moe_slot_by_split[candidate.split_id] = moe_slot_used;
+                        moe_input_by_split[candidate.split_id] = candidate.input_id;
+                        ++next;
+                    }
                 }
             }
         }

@@ -6219,6 +6219,11 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
 }  // namespace ggml::cpu::repack
 
+// MXFP4 trait instances at file scope so ggml_repack_mxfp4_interleave can
+// recognize a tensor's repacked layout by pointer comparison
+static const ggml::cpu::repack::tensor_traits<block_mxfp4, 4, 4, GGML_TYPE_Q8_0> mxfp4_4x4_q8_0;
+static const ggml::cpu::repack::tensor_traits<block_mxfp4, 8, 8, GGML_TYPE_Q8_0> mxfp4_8x8_q8_0;
+
 static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(const struct ggml_tensor * cur) {
     // instance for Q4
     static const ggml::cpu::repack::tensor_traits<block_q4_0, 4, 4, GGML_TYPE_Q8_0> q4_0_4x4_q8_0;
@@ -6255,9 +6260,7 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
     static const ggml::cpu::repack::tensor_traits<block_iq2_xs, 8, 8, GGML_TYPE_Q8_K>  iq2_xs_8x8_q8_K;
     static const ggml::cpu::repack::tensor_traits<block_iq3_xxs, 8, 8, GGML_TYPE_Q8_K> iq3_xxs_8x8_q8_K;
 
-    // instance for MXFP4
-    static const ggml::cpu::repack::tensor_traits<block_mxfp4, 4, 4, GGML_TYPE_Q8_0> mxfp4_4x4_q8_0;
-    static const ggml::cpu::repack::tensor_traits<block_mxfp4, 8, 8, GGML_TYPE_Q8_0> mxfp4_8x8_q8_0;
+    // instance for MXFP4 (file scope, see above)
 
     // instance for Q8_0
     static const ggml::cpu::repack::tensor_traits<block_q8_0, 4, 4, GGML_TYPE_Q8_0> q8_0_4x4_q8_0;
@@ -6602,4 +6605,198 @@ ggml_backend_buffer_type_t ggml_backend_cpu_repack_buffer_type(void) {
     };
 
     return &ggml_backend_cpu_buffer_type_repack;
+}
+
+
+////////////////////////////////////////////////////////////////////////////////
+// inverse mxfp4 repack: bit-exact undo of the x4/x8 interleave (pure byte
+// permutation, see make_block_mxfp4x4/make_block_mxfp4x8)
+
+static void unrepack_mxfp4_4_bl_rows(const void * GGML_RESTRICT data, void * GGML_RESTRICT out, int64_t nblocks, int64_t nrows) {
+    GGML_ASSERT(nrows % 4 == 0);
+
+    const block_mxfp4x4 * GGML_RESTRICT src = (const block_mxfp4x4 *) data;
+          block_mxfp4   * GGML_RESTRICT dst = (      block_mxfp4   *) out;
+
+    // row-major writes: each output row is a sequential 17B/block stream; the
+    // row group's input (nblocks*68B) stays cache-resident across its 4 rows
+    for (int64_t g = 0; g < nrows/4; ++g) {
+        const block_mxfp4x4 * in = src + g*nblocks;
+        block_mxfp4 * row = dst + g*4*nblocks;
+        for (int i = 0; i < 4; ++i) {
+            for (int64_t x = 0; x < nblocks; ++x) {
+                // forward: dst.qs[j*4] = src[j%4].qs[(j/4)*4] (4-byte chunks)
+                row[i*nblocks + x].e = in[x].e[i];
+                memcpy(row[i*nblocks + x].qs,     &in[x].qs[i*4],      sizeof(uint32_t));
+                memcpy(row[i*nblocks + x].qs + 4, &in[x].qs[16 + i*4], sizeof(uint32_t));
+                memcpy(row[i*nblocks + x].qs + 8, &in[x].qs[32 + i*4], sizeof(uint32_t));
+                memcpy(row[i*nblocks + x].qs + 12, &in[x].qs[48 + i*4], sizeof(uint32_t));
+            }
+        }
+    }
+}
+
+static void unrepack_mxfp4_8_bl_rows(const void * GGML_RESTRICT data, void * GGML_RESTRICT out, int64_t nblocks, int64_t nrows) {
+    GGML_ASSERT(nrows % 8 == 0);
+
+    const block_mxfp4x8 * GGML_RESTRICT src = (const block_mxfp4x8 *) data;
+          block_mxfp4   * GGML_RESTRICT dst = (      block_mxfp4   *) out;
+
+    // row-major writes (see the x4 variant)
+    for (int64_t g = 0; g < nrows/8; ++g) {
+        const block_mxfp4x8 * in = src + g*nblocks;
+        block_mxfp4 * row = dst + g*8*nblocks;
+        for (int i = 0; i < 8; ++i) {
+            for (int64_t x = 0; x < nblocks; ++x) {
+                // forward: dst.qs[j*8] = src[j%8].qs[(j/8)*8] (8-byte chunks)
+                row[i*nblocks + x].e = in[x].e[i];
+                memcpy(row[i*nblocks + x].qs,     &in[x].qs[i*8],      sizeof(uint64_t));
+                memcpy(row[i*nblocks + x].qs + 8, &in[x].qs[64 + i*8], sizeof(uint64_t));
+            }
+        }
+    }
+}
+
+void ggml_repack_mxfp4_unrepack_rows(const void * src, void * dst, int64_t nblocks, int64_t nrows, int interleave) {
+    if (interleave == 8) {
+        unrepack_mxfp4_8_bl_rows(src, dst, nblocks, nrows);
+    } else if (interleave == 4) {
+        unrepack_mxfp4_4_bl_rows(src, dst, nblocks, nrows);
+    } else {
+        GGML_ASSERT(false);
+    }
+}
+
+int ggml_repack_mxfp4_interleave(const struct ggml_tensor * t) {
+    while (t != nullptr && t->view_src != nullptr) {
+        t = t->view_src;
+    }
+    if (t == nullptr || t->type != GGML_TYPE_MXFP4 || t->extra == nullptr) {
+        return 0;
+    }
+    if (t->extra == (const void *) &mxfp4_8x8_q8_0) {
+        return 8;
+    }
+    if (t->extra == (const void *) &mxfp4_4x4_q8_0) {
+        return 4;
+    }
+    return 0;
+}
+
+struct ggml_repack_unrepack_job {
+    const void * src;
+    void *       dst;
+    int64_t      nblocks;
+    int64_t      rows_per_expert;
+    int64_t      n_experts;
+    int          interleave;
+    int          n_nodes;
+    int64_t      ep_win;  // rows per per-node window inside each expert plane (128-aligned); 0 = flat claims
+    std::atomic<int64_t> claim_flat;
+    // one claim cursor per OWNING node's window, shared by local and steal
+    // phases so every 128-row block is transformed exactly once
+    std::atomic<int64_t> claim_window[GGML_NUMA_MAX_NODES];
+};
+
+struct ggml_repack_unrepack_job * ggml_repack_unrepack_job_new(
+        const void * src, void * dst, int64_t nblocks, int64_t rows_per_expert, int64_t n_experts, int interleave,
+        int64_t ep_win) {
+    GGML_ASSERT(src != nullptr && dst != nullptr);
+    GGML_ASSERT(nblocks > 0 && rows_per_expert > 0 && n_experts > 0);
+    GGML_ASSERT(interleave == 4 || interleave == 8);
+    GGML_ASSERT(rows_per_expert % interleave == 0);
+
+    ggml_repack_unrepack_job * job = new ggml_repack_unrepack_job();
+    job->src             = src;
+    job->dst             = dst;
+    job->nblocks         = nblocks;
+    job->rows_per_expert = rows_per_expert;
+    job->n_experts       = n_experts;
+    job->interleave      = interleave;
+    job->n_nodes         = 1;
+    job->ep_win          = 0;
+    job->claim_flat.store(0, std::memory_order_relaxed);
+    for (int n = 0; n < GGML_NUMA_MAX_NODES; ++n) {
+        job->claim_window[n].store(0, std::memory_order_relaxed);
+    }
+
+    if (ep_win > 0) {
+        // explicit window size (benchmarks); must be 128-row aligned
+        GGML_ASSERT(ep_win % 128 == 0);
+        job->n_nodes = std::min(ggml_numa_node_count(), (int) GGML_NUMA_MAX_NODES);
+        job->ep_win  = ep_win;
+    } else if (ep_win < 0 && ggml_cpu_numa_ep_active()) {
+        // window ownership only exists when the expert pages were actually
+        // placed per node (GGML_NUMA_EP + NUMA init)
+        const int n_nodes = std::min(ggml_numa_node_count(), (int) GGML_NUMA_MAX_NODES);
+        job->n_nodes = n_nodes;
+        job->ep_win  = ((rows_per_expert + n_nodes - 1)/n_nodes + 127)/128*128;
+    }
+    return job;
+}
+
+void ggml_repack_unrepack_job_free(struct ggml_repack_unrepack_job * job) {
+    delete job;
+}
+
+void ggml_repack_unrepack_job_run(struct ggml_repack_unrepack_job * job, int ith, int nth) {
+    GGML_ASSERT(job != nullptr && ith >= 0 && ith < nth);
+
+    // both layouts are size-equivalent per row (interleave*17 bytes per
+    // interleave rows), so one row offset addresses src and dst alike
+    const int64_t row_bytes = job->nblocks*(int64_t) sizeof(block_mxfp4);
+    const int64_t n_blk = (job->rows_per_expert + 127)/128;
+
+    auto process = [&](int64_t e, int64_t b) {
+        const int64_t r0 = b*128;
+        const int64_t r1 = std::min(r0 + 128, job->rows_per_expert);
+        const int64_t off = (e*job->rows_per_expert + r0)*row_bytes;
+        ggml_repack_mxfp4_unrepack_rows(
+                (const char *) job->src + off, (char *) job->dst + off,
+                job->nblocks, r1 - r0, job->interleave);
+    };
+
+    if (job->ep_win == 0) {
+        const int64_t total = n_blk*job->n_experts;
+        for (;;) {
+            const int64_t i = job->claim_flat.fetch_add(1, std::memory_order_relaxed);
+            if (i >= total) {
+                break;
+            }
+            process(i/n_blk, i%n_blk);
+        }
+        return;
+    }
+
+    const int node = ggml_numa_node_for_thread(ith, nth);
+    GGML_ASSERT(node >= 0 && node < job->n_nodes);
+
+    const int64_t wpb = job->ep_win/128;   // 128-row blocks per node window
+
+    // claim 128-row block items of owner window w from its shared cursor; the
+    // last window always covers the expert's tail blocks
+    auto run_window = [&](int w) {
+        const int64_t lo  = std::min<int64_t>((int64_t) w*wpb, n_blk);
+        const int64_t hi  = w + 1 == job->n_nodes ? n_blk : std::min<int64_t>((int64_t) w*wpb + wpb, n_blk);
+        const int64_t own = hi - lo;
+        if (own <= 0) {
+            return;
+        }
+        const int64_t total = own*job->n_experts;
+        for (;;) {
+            const int64_t i = job->claim_window[w].fetch_add(1, std::memory_order_relaxed);
+            if (i >= total) {
+                break;
+            }
+            process(i/own, lo + i%own);
+        }
+    };
+
+    // local phase first, then steal the stragglers of every other window
+    run_window(node);
+    for (int w = 0; w < job->n_nodes; ++w) {
+        if (w != node) {
+            run_window(w);
+        }
+    }
 }

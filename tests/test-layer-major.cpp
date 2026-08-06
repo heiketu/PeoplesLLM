@@ -1,6 +1,7 @@
 #include "llama.h"
 #include "../src/llama-ext.h"
 #include "ggml-backend.h"
+#include "repack.h"
 
 #include <algorithm>
 #include <cmath>
@@ -40,7 +41,7 @@ static bool compare_logits(const char * label, const std::vector<float> & a, con
 int main(int argc, char ** argv) {
     if (argc < 2) {
         printf("usage: %s MODEL [N_TOKENS=8] [TILE=4] [N_GPU_LAYERS=999] "
-               "[BENCH_CPU_REPACK|BENCH_GPU_STREAM|CHECK_CPU_REPACK] [N_THREADS=72] [N_GEN=0]\n", argv[0]);
+               "[BENCH_CPU_REPACK|BENCH_GPU_STREAM|BENCH_GPU_STREAM_REPACK|CHECK_CPU_REPACK] [N_THREADS=72] [N_GEN=0]\n", argv[0]);
         return 0;
     }
 
@@ -54,9 +55,10 @@ int main(int argc, char ** argv) {
 
     const bool bench_cpu_repack = argc > 5 && std::strcmp(argv[5], "BENCH_CPU_REPACK") == 0;
     const bool bench_gpu_stream = argc > 5 && std::strcmp(argv[5], "BENCH_GPU_STREAM") == 0;
+    const bool bench_gpu_stream_repack = argc > 5 && std::strcmp(argv[5], "BENCH_GPU_STREAM_REPACK") == 0;
     const bool check_cpu_repack = argc > 5 && std::strcmp(argv[5], "CHECK_CPU_REPACK") == 0;
-    const bool use_cpu_repack = bench_cpu_repack || check_cpu_repack;
-    const bool benchmark = bench_cpu_repack || bench_gpu_stream;
+    const bool use_cpu_repack = bench_cpu_repack || check_cpu_repack || bench_gpu_stream_repack;
+    const bool benchmark = bench_cpu_repack || bench_gpu_stream || bench_gpu_stream_repack;
     const int32_t n_threads = argc > 6 ? std::atoi(argv[6]) : 72;
     const int32_t n_gen = argc > 7 ? std::atoi(argv[7]) : 0;
     const bool fixed_tg = getenv("LLAMA_BENCH_FIXED_TG") != nullptr;
@@ -85,7 +87,11 @@ int main(int argc, char ** argv) {
             { "\\.ffn_(up|down|gate|gate_up)_(ch|)exps", nullptr },
             { nullptr, nullptr },
         };
-        if (use_cpu_repack) {
+        if (bench_gpu_stream_repack) {
+            // MoE weights stay in CPU_REPACK host buffers; the GPU streams
+            // them through the unrepack prefetch path (moe_prefetch_src)
+            overrides[0].buft = ggml_backend_cpu_repack_buffer_type();
+        } else if (use_cpu_repack) {
             // A CPU override still lets the model loader select CPU extra buffer
             // types, including CPU_REPACK, when the tensor shape and ISA support it.
             overrides[0].buft = ggml_backend_cpu_buffer_type();

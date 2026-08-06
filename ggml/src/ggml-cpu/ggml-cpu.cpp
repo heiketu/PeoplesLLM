@@ -700,6 +700,21 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     if (strcmp(name, "ggml_backend_cpu_set_use_ref") == 0) {
         return (void *)ggml_backend_cpu_set_use_ref;
     }
+    if (strcmp(name, "ggml_repack_mxfp4_interleave") == 0) {
+        return (void *)ggml_repack_mxfp4_interleave;
+    }
+    if (strcmp(name, "ggml_repack_mxfp4_unrepack_rows") == 0) {
+        return (void *)ggml_repack_mxfp4_unrepack_rows;
+    }
+    if (strcmp(name, "ggml_repack_unrepack_job_new") == 0) {
+        return (void *)ggml_repack_unrepack_job_new;
+    }
+    if (strcmp(name, "ggml_repack_unrepack_job_free") == 0) {
+        return (void *)ggml_repack_unrepack_job_free;
+    }
+    if (strcmp(name, "ggml_repack_unrepack_job_run") == 0) {
+        return (void *)ggml_repack_unrepack_job_run;
+    }
 
     // threadpool - TODO:  move to ggml-base
     if (strcmp(name, "ggml_threadpool_new") == 0) {

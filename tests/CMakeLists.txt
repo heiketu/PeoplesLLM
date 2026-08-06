@@ -342,6 +342,12 @@ if (GGML_CUDA)
     find_package(CUDAToolkit REQUIRED)
     target_link_libraries(test-layer-major PRIVATE CUDA::cudart)
 endif()
+if (NOT LLAMA_USE_SYSTEM_GGML)
+    # BENCH_GPU_STREAM_REPACK names the CPU_REPACK buffer type from repack.h
+    target_include_directories(test-layer-major PRIVATE
+        ${PROJECT_SOURCE_DIR}/ggml/src
+        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cpu)
+endif()
 llama_test(test-layer-major LABEL model)
 
 # standalone correctness harness for GGML_CUDA_RESIDENT_BF16 resident f16/bf16

@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 
@@ -1437,6 +1438,16 @@ struct ggml_backend_cuda_context {
     cudaEvent_t  moe_prefetch_done[GGML_CUDA_MOE_PP_MAX_PREFETCH] = {};
     uint64_t     moe_prefetch_age[GGML_CUDA_MOE_PP_MAX_PREFETCH] = {};
     uint64_t     moe_prefetch_clock = 0;
+
+    // REPACK-source prefetch: pinned staging the unrepack workers write, and
+    // the pending flag guarding host-side ordering against their async
+    // ready-event record (see ggml_backend_cuda_moe_prefetch_src)
+    void *       moe_staging_data[GGML_CUDA_MOE_PP_MAX_PREFETCH] = {};
+    size_t       moe_staging_size[GGML_CUDA_MOE_PP_MAX_PREFETCH] = {};
+    bool         moe_staging_used[GGML_CUDA_MOE_PP_MAX_PREFETCH] = {};
+    bool         moe_prefetch_pending[GGML_CUDA_MOE_PP_MAX_PREFETCH] = {};
+    std::mutex   moe_unrepack_mutex;
+    std::condition_variable moe_unrepack_cv;
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};

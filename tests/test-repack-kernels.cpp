@@ -27,6 +27,10 @@
 #include <string>
 #include <vector>
 
+#if defined(__linux__)
+#include <sched.h>
+#endif
+
 namespace {
 
 struct diff_stats {
@@ -317,10 +321,310 @@ void perf_type(const kernel_fns & fn, int nc, int k, int nr, int nthreads, int n
     free_repacked(rw);
 }
 
+// ---- mxfp4 unrepack (inverse transform) bit-exact tests and bandwidth bench ----
+
+// faithful replicas of make_block_mxfp4x4/x8 (repack.cpp) used to build x4/x8
+// interleaved inputs without going through the ISA-dependent buffer path;
+// `in` points at column block x of the row group, rows are strided by nblocks
+void fwd_mxfp4x4(const block_mxfp4 * in, block_mxfp4x4 * out, int64_t nblocks) {
+    for (int i = 0; i < 4; i++) out->e[i] = in[i*nblocks].e;
+    for (int i = 0; i < QK_MXFP4*2/4; i++) {
+        memcpy(&out->qs[i*4], &in[(i%4)*nblocks].qs[(i/4)*4], sizeof(uint32_t));
+    }
+}
+
+void fwd_mxfp4x8(const block_mxfp4 * in, block_mxfp4x8 * out, int64_t nblocks) {
+    for (int i = 0; i < 8; i++) out->e[i] = in[i*nblocks].e;
+    for (int i = 0; i < QK_MXFP4*4/8; i++) {
+        memcpy(&out->qs[i*8], &in[(i%8)*nblocks].qs[(i/8)*8], sizeof(uint64_t));
+    }
+}
+
+std::vector<char> make_random_bytes(int64_t n, uint32_t seed) {
+    std::mt19937 rng(seed);
+    std::vector<char> v(n);
+    for (auto & x : v) x = (char) (rng() & 0xff);
+    return v;
+}
+
+// repack (via the replica) then unrepack, compare against the original bytes
+bool test_unrepack_layout(int interleave, int64_t nblocks, int64_t nrows, bool verbose) {
+    const int64_t row_bytes = nblocks*(int64_t) sizeof(block_mxfp4);
+    std::vector<char> orig = make_random_bytes(nrows*row_bytes, 20260806 + (uint32_t) interleave + (uint32_t) nrows);
+
+    std::vector<char> packed(orig.size());
+    if (interleave == 8) {
+        for (int64_t g = 0; g < nrows/8; g++) {
+            for (int64_t x = 0; x < nblocks; x++) {
+                fwd_mxfp4x8((const block_mxfp4 *) (orig.data() + g*8*row_bytes) + x,
+                            (block_mxfp4x8 *) (packed.data() + g*8*row_bytes) + x, nblocks);
+            }
+        }
+    } else {
+        for (int64_t g = 0; g < nrows/4; g++) {
+            for (int64_t x = 0; x < nblocks; x++) {
+                fwd_mxfp4x4((const block_mxfp4 *) (orig.data() + g*4*row_bytes) + x,
+                            (block_mxfp4x4 *) (packed.data() + g*4*row_bytes) + x, nblocks);
+            }
+        }
+    }
+
+    std::vector<char> back(orig.size());
+    ggml_repack_mxfp4_unrepack_rows(packed.data(), back.data(), nblocks, nrows, interleave);
+
+    const bool ok = memcmp(back.data(), orig.data(), orig.size()) == 0;
+    printf("  [MXFP4 x%d] unrepack nblocks=%-4d nrows=%-5d bit-exact: %s\n",
+           interleave, (int) nblocks, (int) nrows, ok ? "OK" : "MISMATCH");
+    GGML_UNUSED(verbose);
+    return ok;
+}
+
+// multithreaded job over whole expert planes (+ EP-style rank half), bit-exact;
+// ep_win = 0 uses flat claims, a 128-aligned value exercises the windowed
+// local/steal claim path
+bool test_unrepack_job(int interleave, int64_t nblocks, int64_t rpe, int64_t n_exp, int nth, int64_t ep_win) {
+    const int64_t row_bytes = nblocks*(int64_t) sizeof(block_mxfp4);
+    const int64_t expert_bytes = rpe*row_bytes;
+    std::vector<char> orig = make_random_bytes(n_exp*expert_bytes, 777 + (uint32_t) interleave);
+
+    std::vector<char> packed(orig.size());
+    for (int64_t e = 0; e < n_exp; e++) {
+        for (int64_t g = 0; g < rpe/interleave; g++) {
+            for (int64_t x = 0; x < nblocks; x++) {
+                if (interleave == 8) {
+                    fwd_mxfp4x8((const block_mxfp4 *) (orig.data() + e*expert_bytes + g*8*row_bytes) + x,
+                                (block_mxfp4x8 *) (packed.data() + e*expert_bytes + g*8*row_bytes) + x, nblocks);
+                } else {
+                    fwd_mxfp4x4((const block_mxfp4 *) (orig.data() + e*expert_bytes + g*4*row_bytes) + x,
+                                (block_mxfp4x4 *) (packed.data() + e*expert_bytes + g*4*row_bytes) + x, nblocks);
+                }
+            }
+        }
+    }
+
+    bool ok = true;
+    // full tensor
+    {
+        std::vector<char> back(orig.size(), 0);
+        ggml_repack_unrepack_job * job = ggml_repack_unrepack_job_new(
+                packed.data(), back.data(), nblocks, rpe, n_exp, interleave, ep_win);
+        std::vector<std::thread> ths;
+        for (int ith = 0; ith < nth; ith++) ths.emplace_back([&, ith] { ggml_repack_unrepack_job_run(job, ith, nth); });
+        for (auto & th : ths) th.join();
+        ggml_repack_unrepack_job_free(job);
+        const bool pass = memcmp(back.data(), orig.data(), orig.size()) == 0;
+        printf("  [MXFP4 x%d] unrepack job rpe=%-5d E=%-3d threads=%-2d win=%-5d full: %s\n",
+               interleave, (int) rpe, (int) n_exp, nth, (int) ep_win, pass ? "OK" : "MISMATCH");
+        ok = ok && pass;
+    }
+    // EP-rank style: second half of the expert stack from a repacked row offset
+    {
+        const int64_t half = n_exp/2;
+        std::vector<char> back((size_t) half*expert_bytes, 0);
+        ggml_repack_unrepack_job * job = ggml_repack_unrepack_job_new(
+                packed.data() + half*expert_bytes, back.data(), nblocks, rpe, half, interleave, ep_win);
+        std::vector<std::thread> ths;
+        for (int ith = 0; ith < nth; ith++) ths.emplace_back([&, ith] { ggml_repack_unrepack_job_run(job, ith, nth); });
+        for (auto & th : ths) th.join();
+        ggml_repack_unrepack_job_free(job);
+        const bool pass = memcmp(back.data(), orig.data() + half*expert_bytes, back.size()) == 0;
+        printf("  [MXFP4 x%d] unrepack job rpe=%-5d E=%-3d threads=%-2d win=%-5d rank-half: %s\n",
+               interleave, (int) rpe, (int) half, nth, (int) ep_win, pass ? "OK" : "MISMATCH");
+        ok = ok && pass;
+    }
+    return ok;
+}
+
+// the real CPU_REPACK buffer path (set_tensor performs the interleave chosen
+// for this ISA) must be undone bit-exactly by ggml_repack_mxfp4_unrepack_rows
+bool test_unrepack_buffer_path(int nc, int k) {
+    std::vector<float> w = make_random_f32((int64_t) nc*k, 555);
+
+    repacked_weights rw;
+    if (!make_repacked(GGML_TYPE_MXFP4, w, nc, k, rw)) {
+        printf("  [MXFP4] unrepack buffer path: SKIPPED (no CPU_REPACK kernel)\n");
+        return true;
+    }
+
+    const int interleave = ggml_repack_mxfp4_interleave(rw.tensor);
+    const int64_t nblocks = k/QK_MXFP4;
+    bool ok = true;
+    if (interleave == 0) {
+        printf("  [MXFP4] unrepack buffer path: SKIPPED (tensor not repacked)\n");
+    } else {
+        std::vector<char> back(rw.nbytes);
+        ggml_repack_mxfp4_unrepack_rows(rw.data, back.data(), nblocks, nc, interleave);
+        ok = memcmp(back.data(), rw.raw.data(), rw.nbytes) == 0;
+        printf("  [MXFP4] unrepack buffer path nc=%-4d k=%-5d interleave=x%d bit-exact: %s\n",
+               nc, k, interleave, ok ? "OK" : "MISMATCH");
+    }
+
+    // the replica must produce the exact bytes the buffer path produced
+    if (ok && interleave == 8 && nc % 8 == 0) {
+        const int64_t row_bytes = ggml_row_size(GGML_TYPE_MXFP4, k);
+        std::vector<char> replica(rw.nbytes);
+        for (int64_t g = 0; g < nc/8; g++) {
+            for (int64_t x = 0; x < nblocks; x++) {
+                fwd_mxfp4x8((const block_mxfp4 *) (rw.raw.data() + g*8*row_bytes) + x,
+                            (block_mxfp4x8 *) (replica.data() + g*8*row_bytes) + x, nblocks);
+            }
+        }
+        const bool pass = memcmp(replica.data(), rw.data, rw.nbytes) == 0;
+        printf("  [MXFP4] replica-vs-buffer interleave layout: %s\n", pass ? "OK" : "MISMATCH");
+        ok = ok && pass;
+    }
+
+    free_repacked(rw);
+    return ok;
+}
+
+#if defined(__linux__)
+// CPUs of each NUMA node parsed from /sys, for benchmark thread pinning
+std::vector<std::vector<int>> numa_node_cpus() {
+    std::vector<std::vector<int>> out;
+    for (int node = 0; ; node++) {
+        char path[128];
+        snprintf(path, sizeof(path), "/sys/devices/system/node/node%d/cpulist", node);
+        FILE * f = fopen(path, "r");
+        if (!f) break;
+        char buf[1024] = { 0 };
+        if (!fgets(buf, sizeof(buf), f)) { fclose(f); break; }
+        fclose(f);
+        std::vector<int> cpus;
+        for (char * tok = strtok(buf, ",\n"); tok; tok = strtok(nullptr, ",\n")) {
+            int a = 0, b = 0;
+            if (sscanf(tok, "%d-%d", &a, &b) == 2) {
+                for (int c = a; c <= b; c++) cpus.push_back(c);
+            } else if (sscanf(tok, "%d", &a) == 1) {
+                cpus.push_back(a);
+            }
+        }
+        out.push_back(std::move(cpus));
+    }
+    return out;
+}
+#endif
+
+// bandwidth benchmark of the inverse transform at one MoE layer's expert size
+// (default ~3.43 GiB): flat claims vs NUMA-local window claims
+void bench_unrepack(int nthreads, double gib) {
+    ggml_numa_init(GGML_NUMA_STRATEGY_DISTRIBUTE);
+    const int n_nodes = ggml_numa_node_count();
+
+    const int64_t nblocks = 128;   // k = 4096
+    const int64_t rpe = 2048;      // rows per expert
+    const int64_t row_bytes = nblocks*(int64_t) sizeof(block_mxfp4);
+    const int64_t expert_bytes = rpe*row_bytes;
+    const int64_t n_exp = std::max<int64_t>(1, (int64_t) (gib*1073741824.0/expert_bytes));
+    const int64_t total = n_exp*expert_bytes;
+
+    printf("== unrepack bench: %.3f GiB (E=%lld rpe=%lld k=%lld) threads=%d nodes=%d ==\n",
+           total/1073741824.0, (long long) n_exp, (long long) rpe, (long long) (nblocks*QK_MXFP4), nthreads, n_nodes);
+
+    char * src = (char *) aligned_alloc(64, total);
+    char * dst = (char *) aligned_alloc(64, total);
+    if (!src || !dst) {
+        printf("  allocation failed\n");
+        free(src); free(dst);
+        return;
+    }
+    {
+        // parallel first touch spreads pages across nodes before any binding
+        std::vector<std::thread> ths;
+        for (int t = 0; t < nthreads; t++) {
+            ths.emplace_back([&, t] {
+                std::mt19937 rng(1234 + t);
+                const int64_t chunk = total/nthreads;
+                char * p = src + t*chunk;
+                for (int64_t i = 0; i < chunk; i += 4096) p[i] = (char) (rng() & 0xff);
+            });
+        }
+        for (auto & th : ths) th.join();
+    }
+
+    const int64_t ep_win = n_nodes > 1 ? ((rpe + n_nodes - 1)/n_nodes + 127)/128*128 : 0;
+
+    // EP-style placement: per-expert row windows bound to their node, for both
+    // src (as the CPU_REPACK buffer does) and dst (as pinned staging first-touched
+    // by the NUMA-local unrepack workers would be)
+    if (ep_win > 0) {
+        for (int64_t e = 0; e < n_exp; e++) {
+            for (int n = 0; n < n_nodes; n++) {
+                const int64_t r0 = n*ep_win;
+                const int64_t r1 = std::min(r0 + ep_win, rpe);
+                if (r1 <= r0) continue;
+                ggml_numa_bind(src + e*expert_bytes + r0*row_bytes, (size_t) (r1 - r0)*row_bytes, n);
+                ggml_numa_bind(dst + e*expert_bytes + r0*row_bytes, (size_t) (r1 - r0)*row_bytes, n);
+            }
+        }
+    }
+
+#if defined(__linux__)
+    const auto node_cpus = numa_node_cpus();
+    auto pin = [&](int ith, int nth) {
+        if ((int) node_cpus.size() < n_nodes) return;
+        const int node = ggml_numa_node_for_thread(ith, nth);
+        const int t_first = (int) (((int64_t) node*nth + n_nodes - 1)/n_nodes);
+        const int t_next  = (int) (((int64_t) (node + 1)*nth + n_nodes - 1)/n_nodes);
+        const auto & cpus = node_cpus[node];
+        if (cpus.empty() || t_next - t_first <= 0) return;
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        CPU_SET(cpus[(size_t) (ith - t_first)%cpus.size()], &set);
+        sched_setaffinity(0, sizeof(set), &set);
+    };
+#else
+    auto pin = [](int, int) {};
+#endif
+
+    auto run = [&](const char * label, int64_t job_ep_win, int nth) {
+        double best = 1e30;
+        for (int iter = 0; iter < 3; iter++) {
+            ggml_repack_unrepack_job * job = ggml_repack_unrepack_job_new(
+                    src, dst, nblocks, rpe, n_exp, 8, job_ep_win);
+            const auto t0 = std::chrono::steady_clock::now();
+            std::vector<std::thread> ths;
+            for (int ith = 0; ith < nth; ith++) {
+                ths.emplace_back([&, ith] {
+                    pin(ith, nth);
+                    ggml_repack_unrepack_job_run(job, ith, nth);
+                });
+            }
+            for (auto & th : ths) th.join();
+            const auto t1 = std::chrono::steady_clock::now();
+            ggml_repack_unrepack_job_free(job);
+            best = std::min(best, std::chrono::duration<double, std::milli>(t1 - t0).count());
+        }
+        const double gbs = 2.0*total/1e9/(best/1e3); // read + write
+        printf("  %-34s %10.2f ms  %8.1f GB/s (r+w)\n", label, best, gbs);
+        return best;
+    };
+
+    run("single thread", 0, 1);
+    run("flat claims", 0, nthreads);
+    if (ep_win > 0) {
+        char label[64];
+        snprintf(label, sizeof(label), "numa-local claims (win=%lld rows)", (long long) ep_win);
+        run(label, ep_win, nthreads);
+    } else {
+        printf("  numa-local claims: SKIPPED (single NUMA node)\n");
+    }
+
+    free(src);
+    free(dst);
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
     const bool perf = argc > 1 && std::string(argv[1]) == "--perf";
+
+    if (argc > 1 && std::string(argv[1]) == "--unrepack-bench") {
+        const int nthreads = argc > 2 ? atoi(argv[2]) : 16;
+        const double gib = argc > 3 ? atof(argv[3]) : 3.43;
+        bench_unrepack(nthreads, gib);
+        return 0;
+    }
 
     const std::vector<kernel_fns> types = {
         { GGML_TYPE_Q2_K, "Q2_K", ggml_vec_dot_q2_K_q8_K, ggml_gemv_q2_K_8x8_q8_K, ggml_gemv_q2_K_8x8_q8_K_generic,
@@ -399,6 +703,21 @@ int main(int argc, char ** argv) {
             ok &= test_type(fn, 64, 1024, { 8 }, false);
         }
     }
+
+    printf("[MXFP4] unrepack (inverse transform) bit-exact roundtrips\n");
+    ok &= test_unrepack_layout(8, 128, 512, false);   // k=4096 gate/up row
+    ok &= test_unrepack_layout(8,  64, 520, false);   // k=2048, non-128-multiple rows
+    ok &= test_unrepack_layout(8, 128,   8, false);   // single row group
+    ok &= test_unrepack_layout(4, 128, 512, false);
+    ok &= test_unrepack_layout(4,  64, 520, false);
+    ok &= test_unrepack_job(8, 128, 2048, 16, 8, 0);     // model-like expert planes
+    ok &= test_unrepack_job(8,  64, 2056,  8, 4, 0);     // rpe not a multiple of 128
+    ok &= test_unrepack_job(4, 128, 1024,  8, 8, 0);
+    ok &= test_unrepack_job(8, 128, 2048, 16, 8, 1024);  // windowed local/steal claims
+    ok &= test_unrepack_job(8,  64, 2056,  8, 4, 1152);  // windowed, tail block per expert
+    ok &= test_unrepack_job(4, 128, 1024,  8, 8, 512);
+    ok &= test_unrepack_buffer_path(512, 2048);
+    ok &= test_unrepack_buffer_path(520, 2048);
 
     printf("%s\n", ok ? "ALL TESTS PASSED" : "TESTS FAILED");
     ggml_quantize_free();
