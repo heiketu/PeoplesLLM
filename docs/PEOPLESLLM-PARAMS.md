@@ -149,7 +149,7 @@
 | `GGML_CUDA_DSV4_KV_REUSE` | `0`（关） | 对 DSV4 `K=V` alias、512 维、64 列 FA specialization 保留完整 K shared tile供 V 阶段复用 | 16K true-EP 581.47 -> 604.23 tok/s，保持原 KQ 运算顺序与精确 logits；约需 100480 bytes dynamic shared memory |
 | `LLAMA_DSV4_SPARSE_FA` | `0`（关） | 用 8-query union 组装 raw/compressed sparse physical rows 和逐 query mask | 只在 query batch `>=256` 建图，q1 自动 dense；会改变浮点归约分组，不能当作 bit-exact 优化 |
 | `GGML_CUDA_DSV4_SPARSE_RAW_COMPACT` | `0`（关） | 在 sparse FA 内仅保留每组有效 raw span（最多 512 行），再追加 compressed union | `=1` 要求同时开启 sparse FA 且 query batch `>=256`；16K sparse 596.08 -> 754.60 tok/s，TG 不命中。`=2` 只用于强制小形状 CUDA 单测，生产勿用 |
-| `LLAMA_DSV4_COMPACT_DECODE_SWA` | `0`（关） | layer-major 大 prefill 完成后，把 raw SWA 的最后 128 行搬到 256-cell 物理环，使 q1 decode 的 raw KV 图宽与 prompt 长度解耦 | 16K fixed TG64 `9.666 -> 11.801 tok/s`（+22.08%）；TG512 `11.298 -> 12.184 tok/s`（+7.84%）且完成环绕写回。prefill logits bit-exact，decode 会因 FA/stream-K 归约分组变化产生小数值差，完成 greedy/多序列/fallback 验收前仅作实验开关 |
+| `LLAMA_DSV4_COMPACT_DECODE_SWA` | `1`（开） | layer-major 大 prefill 完成后，把 raw SWA 的最后 128 行搬到 256-cell 物理环，使 q1 decode 的 raw KV 图宽与 prompt 长度解耦；`=0` 恢复全宽行为 | 16K fixed TG64 `9.666 -> 11.801 tok/s`（+22.08%）；TG512 `11.298 -> 12.184 tok/s`（+7.84%）且完成环绕写回。prefill logits bit-exact，decode 会因 FA/stream-K 归约分组变化产生小数值差（语义等价、非 bit-exact）。多 slot 上下文（`-np>1`，raw 每序列独立 stream）与 cache 被其他序列占用时自动回退全宽语义 |
 
 ### 2.9 Hybrid CPU-MoE 边界（2 个）
 

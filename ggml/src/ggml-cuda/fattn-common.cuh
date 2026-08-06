@@ -1427,9 +1427,12 @@ void launch_fattn(
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
+    // q1 single-sequence decode over a long masked KV range (e.g. a raw SWA cache exposed at full width, where
+    //     fully masked tiles dominate and are skipped entirely) qualifies as well.
     const int64_t n_kv_masked = sparse_idx ? mask->ne[0] : K->ne[1];
     const bool scan_mask_bounds = mask && n_kv_masked % FATTN_KQ_STRIDE == 0 &&
-        (sparse_idx || Q->ne[1] >= 1024 || Q->ne[3] > 1);
+        (sparse_idx || Q->ne[1] >= 1024 || Q->ne[3] > 1 ||
+         (Q->ne[1] == 1 && Q->ne[3] == 1 && n_kv_masked >= 2048));
     const bool query_prepare_bounds = sparse_idx && ncols1 == 1;
     const int ne_KV_max = ntiles_x*Q->ne[3];
     if (scan_mask_bounds || sparse_idx) {

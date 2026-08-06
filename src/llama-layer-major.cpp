@@ -723,17 +723,27 @@ int llama_context::decode_layer_major(const llama_batch & batch_inp, uint32_t n_
                 store_us/1000.0, sync_us/1000.0, rewind_us/1000.0);
     }
 
+    // On by default: after a large layer-major prefill, pack the raw SWA
+    // window into a 256-cell decode ring so q1 decode graph width stays
+    // decoupled from the prompt length. LLAMA_DSV4_COMPACT_DECODE_SWA=0
+    // restores the full-cache behavior.
     static const bool compact_decode_swa = []() {
         const char * value = getenv("LLAMA_DSV4_COMPACT_DECODE_SWA");
-        return value && atoi(value) > 0;
+        return value ? atoi(value) > 0 : true;
     }();
     if (compact_decode_swa && hparams.n_swa > 0 && n_tokens_all > hparams.n_swa) {
         auto * dsv4_memory = dynamic_cast<llama_kv_cache_dsv4 *>(memory.get());
-        const uint32_t n_keep = hparams.n_swa;
-        const uint32_t capacity = GGML_PAD(2*n_keep, 256);
-        if (!dsv4_memory || !dsv4_memory->get_raw()->get_swa()->compact_decode_window(
-                    seq_id, n_keep, capacity)) {
-            LLAMA_LOG_WARN("%s: unable to compact the raw SWA cache for decode; using the full cache\n", __func__);
+        llama_kv_cache * raw_swa = dsv4_memory ? dsv4_memory->get_raw()->get_swa() : nullptr;
+        // Multi-slot contexts (n_seq_max > 1) keep one raw SWA stream per
+        // sequence; a single ring bound cannot isolate them, so they keep
+        // full-cache semantics. compact_decode_window re-checks this together
+        // with per-cell exclusive ownership before moving any data.
+        if (raw_swa && raw_swa->get_n_stream() == 1) {
+            const uint32_t n_keep = hparams.n_swa;
+            const uint32_t capacity = GGML_PAD(2*n_keep, 256);
+            if (!raw_swa->compact_decode_window(seq_id, n_keep, capacity)) {
+                LLAMA_LOG_WARN("%s: unable to compact the raw SWA cache for decode; using the full cache\n", __func__);
+            }
         }
     }
 
