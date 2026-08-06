@@ -120,6 +120,21 @@ int main(int argc, char ** argv) {
     cparams.n_ctx = std::max(128, n_tokens + n_gen + 2);
     cparams.n_batch = n_ubatch;
     cparams.n_ubatch = n_ubatch;
+    if (const char * env = getenv("LLAMA_BENCH_N_CTX")) {
+        cparams.n_ctx = std::max((int32_t) std::atoi(env), n_tokens + n_gen + 2);
+    }
+    if (const char * env = getenv("LLAMA_BENCH_N_BATCH")) {
+        cparams.n_batch = std::max(std::atoi(env), n_ubatch);
+    }
+    if (getenv("LLAMA_BENCH_KV_Q8")) {
+        cparams.type_k = GGML_TYPE_Q8_0;
+        cparams.type_v = GGML_TYPE_Q8_0;
+    }
+    if (const char * env = getenv("LLAMA_BENCH_SWA_FULL")) {
+        // default is the llama_context_default_params() value (true);
+        // LLAMA_BENCH_SWA_FULL=0 reproduces the server's compact SWA cache
+        cparams.swa_full = std::atoi(env) != 0;
+    }
     cparams.n_threads = n_threads;
     cparams.n_threads_batch = n_threads;
     cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
@@ -299,11 +314,9 @@ int main(int argc, char ** argv) {
     }
 
     llama_context * ctx_ref = llama_init_from_model(model, cparams);
-    llama_context * ctx_lm  = llama_init_from_model(model, cparams);
-    if (!ctx_ref || !ctx_lm) {
-        fprintf(stderr, "failed to create contexts\n");
+    if (!ctx_ref) {
+        fprintf(stderr, "failed to create reference context\n");
         llama_free(ctx_ref);
-        llama_free(ctx_lm);
         llama_model_free(model);
         llama_backend_free();
         return 1;
@@ -315,12 +328,87 @@ int main(int argc, char ** argv) {
         tokens[i] = (llama_token) ((i + 1) % n_vocab);
     }
 
+    // optionally replace the synthetic token sequence with real prompt token
+    // ids (JSON array, e.g. saved from llama-server /tokenize)
+    if (const char * env = getenv("LLAMA_BENCH_TOKENS_FILE")) {
+        FILE * f = fopen(env, "rb");
+        if (!f) {
+            fprintf(stderr, "failed to open tokens file: %s\n", env);
+            return 1;
+        }
+        int64_t value = -1;
+        int32_t n_loaded = 0;
+        int ch = 0;
+        while (n_loaded < n_tokens && (ch = fgetc(f)) != EOF) {
+            if (ch >= '0' && ch <= '9') {
+                value = std::max<int64_t>(0, value)*10 + (ch - '0');
+            } else if (value >= 0) {
+                tokens[n_loaded++] = (llama_token) value;
+                value = -1;
+            }
+        }
+        if (n_loaded < n_tokens && value >= 0) {
+            tokens[n_loaded++] = (llama_token) value;
+        }
+        fclose(f);
+        if (n_loaded != n_tokens) {
+            fprintf(stderr, "tokens file has %d ids, expected %d\n", n_loaded, n_tokens);
+            return 1;
+        }
+    }
+
     for (int32_t off = 0; off < n_tokens; off += n_ubatch) {
         const int32_t count = std::min(n_ubatch, n_tokens - off);
         if (llama_decode(ctx_ref, llama_batch_get_one(tokens.data() + off, count)) != 0) {
             fprintf(stderr, "reference decode failed at offset %d\n", off);
             return 1;
         }
+    }
+
+    // capture the reference logits (prefill + one decode step) and release the
+    // reference context before creating the layer-major one, so that large
+    // n_ctx KV caches of the two contexts never coexist
+    const std::vector<float> logits_ref = copy_logits(ctx_ref, n_vocab);
+    const llama_token next = (llama_token) top_one(logits_ref);
+    std::vector<float> logits_ref_next;
+    if (llama_decode(ctx_ref, llama_batch_get_one(const_cast<llama_token *>(&next), 1)) != 0) {
+        fprintf(stderr, "reference post-prefill decode failed\n");
+        return 1;
+    }
+    logits_ref_next = copy_logits(ctx_ref, n_vocab);
+    llama_free(ctx_ref);
+    ctx_ref = nullptr;
+
+    llama_context * ctx_lm  = llama_init_from_model(model, cparams);
+    if (!ctx_lm) {
+        fprintf(stderr, "failed to create layer-major context\n");
+        llama_model_free(model);
+        llama_backend_free();
+        return 1;
+    }
+
+    // mirror of common_init_ warmup (llama-server runs this on the shared
+    // context before serving): a tiny decode followed by a memory clear
+    if (getenv("LLAMA_BENCH_WARMUP")) {
+        const llama_vocab * vocab_w = llama_model_get_vocab(model);
+        std::vector<llama_token> tmp;
+        const llama_token bos = llama_vocab_bos(vocab_w);
+        const llama_token eos = llama_vocab_eos(vocab_w);
+        if (bos != LLAMA_TOKEN_NULL) {
+            tmp.push_back(bos);
+        }
+        if (eos != LLAMA_TOKEN_NULL) {
+            tmp.push_back(eos);
+        }
+        if (tmp.empty()) {
+            tmp.push_back(0);
+        }
+        llama_decode(ctx_lm, llama_batch_get_one(tmp.data(), tmp.size()));
+        llama_memory_clear(llama_get_memory(ctx_lm), true);
+        llama_synchronize(ctx_lm);
+        // llama-server also trims the slot's sequence before the prompt
+        // (common_context_seq_rm(ctx, slot.id, p0=0, -1)); mirror it for seq 0
+        llama_memory_seq_rm(llama_get_memory(ctx_lm), 0, 0, -1);
     }
 
     llama_batch full = llama_batch_init(n_tokens, 0, 1);
@@ -340,17 +428,14 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    bool ok = compare_logits("prefill", copy_logits(ctx_ref, n_vocab), copy_logits(ctx_lm, n_vocab));
+    bool ok = compare_logits("prefill", logits_ref, copy_logits(ctx_lm, n_vocab));
 
-    const llama_token next = (llama_token) top_one(copy_logits(ctx_ref, n_vocab));
-    if (llama_decode(ctx_ref, llama_batch_get_one(const_cast<llama_token *>(&next), 1)) != 0 ||
-            llama_decode(ctx_lm, llama_batch_get_one(const_cast<llama_token *>(&next), 1)) != 0) {
+    if (llama_decode(ctx_lm, llama_batch_get_one(const_cast<llama_token *>(&next), 1)) != 0) {
         fprintf(stderr, "post-prefill decode failed\n");
         return 1;
     }
-    ok = compare_logits("next-token KV", copy_logits(ctx_ref, n_vocab), copy_logits(ctx_lm, n_vocab)) && ok;
+    ok = compare_logits("next-token KV", logits_ref_next, copy_logits(ctx_lm, n_vocab)) && ok;
 
-    llama_free(ctx_ref);
     llama_free(ctx_lm);
     llama_model_free(model);
     llama_backend_free();
