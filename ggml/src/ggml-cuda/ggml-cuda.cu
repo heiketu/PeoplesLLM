@@ -2875,6 +2875,7 @@ class ggml_cuda_unrepack_pool {
         {
             std::unique_lock<std::mutex> lock(mutex);
             cv.wait(lock, [&] { return current == nullptr; });
+            ++generation;
             current = task;
         }
         cv.notify_all();
@@ -2883,12 +2884,18 @@ class ggml_cuda_unrepack_pool {
   private:
     void worker(int ith) {
         pin(ith);
+        uint64_t done_gen = 0;
         for (;;) {
             ggml_cuda_unrepack_task * task = nullptr;
             {
                 std::unique_lock<std::mutex> lock(mutex);
-                cv.wait(lock, [&] { return current != nullptr; });
-                task = current;
+                // one claim per worker per generation: without the generation
+                // check a fast worker would re-claim the task it just finished
+                // (still published until the last finisher unpublishes it) and
+                // run the finisher path on a freed task
+                cv.wait(lock, [&] { return current != nullptr && generation != done_gen; });
+                task     = current;
+                done_gen = generation;
             }
             api->job_run(task->job, ith, nth);
             if (task->n_done.fetch_add(1, std::memory_order_acq_rel) + 1 < nth) {
@@ -2896,7 +2903,10 @@ class ggml_cuda_unrepack_pool {
             }
             // last worker out: launch staging -> slot H2D, then release the
             // slot. The ready event record must happen-before the pending
-            // flag is cleared (commit host-waits on the flag).
+            // flag is cleared (commit host-waits on the flag). The task is
+            // unpublished before it is freed so no worker can observe it
+            // again; every worker is guaranteed to have claimed this
+            // generation (n_done reached nth).
             ggml_backend_cuda_context * ctx = task->ctx;
             const int slot = task->slot;
             ggml_cuda_set_device(task->device);
@@ -2911,11 +2921,11 @@ class ggml_cuda_unrepack_pool {
             }
             ctx->moe_unrepack_cv.notify_all();
             api->job_free(task->job);
-            delete task;
             {
                 std::lock_guard<std::mutex> lock(mutex);
                 current = nullptr;
             }
+            delete task;
             cv.notify_all();
         }
     }
@@ -2980,6 +2990,7 @@ class ggml_cuda_unrepack_pool {
     std::mutex mutex;
     std::condition_variable cv;
     ggml_cuda_unrepack_task * current = nullptr;
+    uint64_t                  generation = 0;
     std::vector<std::thread> workers;
 };
 
