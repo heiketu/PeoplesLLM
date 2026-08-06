@@ -1981,14 +1981,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 // raw to another backend is silent numerical corruption. The
                 // only legal cross-backend route is the prefetch commit path
                 // (pipe mode), whose src variant un-repacks on the CPU first.
-                auto abort_raw_repack_copy = [&]() {
-                    if (input_buffer != nullptr && input_backend != split_backend &&
-                            ggml_backend_buffer_get_usage(input_buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
-                            strcmp(ggml_backend_buffer_name(input_buffer), "CPU_REPACK") == 0) {
-                        GGML_ABORT("%s: CPU_REPACK weight %s cannot be copied raw to backend %s "
-                            "(REPACK layout is not the GGUF layout); use the GPU unrepack prefetch path",
-                            __func__, input->name, ggml_backend_name(split_backend));
-                    }
+                // Fail the compute (not the process) so layer-major callers
+                // can roll back and fall back to the chunked path.
+                auto is_raw_repack_copy = [&]() {
+                    return input_buffer != nullptr && input_backend != split_backend &&
+                        ggml_backend_buffer_get_usage(input_buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                        strcmp(ggml_backend_buffer_name(input_buffer), "CPU_REPACK") == 0;
+                };
+                auto raw_repack_copy_error = [&]() {
+                    GGML_LOG_ERROR("%s: CPU_REPACK weight %s cannot be copied raw to backend %s "
+                        "(REPACK layout is not the GGUF layout); use the GPU unrepack prefetch path\n",
+                        __func__, input->name, ggml_backend_name(split_backend));
+                    return GGML_STATUS_ALLOC_FAILED;
                 };
 
                 // pipe mode: commit the staged slot entirely on device streams,
@@ -2053,7 +2057,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 split_backend, slot, input_cpy, 0, ggml_nbytes(input), reuse_event)) {
                             moe_slot_used = slot;
                         } else {
-                            abort_raw_repack_copy();
+                            if (is_raw_repack_copy()) {
+                                return raw_repack_copy_error();
+                            }
                             ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
                         }
                         if (profile_enabled) {
@@ -2064,6 +2070,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                     const int64_t moe_legacy_start_us = profile_enabled ? ggml_time_us() : 0;
 
+                    if (is_raw_repack_copy()) {
+                        return raw_repack_copy_error();
+                    }
                     const int64_t n_expert   = node->op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1];
                     const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
 
@@ -2104,7 +2113,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                     // group consecutive experts and copy them together
                     auto copy_experts = [&](int32_t first_id, int32_t last_id) {
-                        abort_raw_repack_copy();
                         const size_t expert_offset = first_id * expert_size;
                         const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
                         const size_t padding = std::min<size_t>(expert_size, 512);
@@ -2146,7 +2154,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
                 } else {
                     const int64_t other_input_start_us = profile_enabled ? ggml_time_us() : 0;
-                    abort_raw_repack_copy();
+                    if (is_raw_repack_copy()) {
+                        return raw_repack_copy_error();
+                    }
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
                     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {

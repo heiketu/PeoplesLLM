@@ -3157,6 +3157,14 @@ static int ggml_backend_cuda_moe_prefetch_auto_src(
     return slot;
 }
 
+// free/total device memory of this backend's device, for preflight budget
+// checks by the streaming-prefill callers
+static bool ggml_backend_cuda_mem_get_info(ggml_backend_t backend, size_t * free_mem, size_t * total_mem) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    return cudaMemGetInfo(free_mem, total_mem) == cudaSuccess;
+}
+
 static bool ggml_backend_cuda_moe_prefetch_commit(
         ggml_backend_t backend, int slot, ggml_tensor * tensor, size_t offset,
         size_t size, ggml_backend_event_t reuse_event) {
@@ -6476,6 +6484,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_moe_prefetch_auto_src") == 0) {
         return (void *)ggml_backend_cuda_moe_prefetch_auto_src;
+    }
+    if (strcmp(name, "ggml_backend_cuda_mem_get_info") == 0) {
+        return (void *)ggml_backend_cuda_mem_get_info;
     }
 #if defined(USE_CUDA_GRAPH) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     if (strcmp(name, "ggml_backend_cuda_graph_timing_input_begin") == 0) {

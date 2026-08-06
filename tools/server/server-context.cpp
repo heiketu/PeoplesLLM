@@ -11,6 +11,7 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "../../src/llama-ext.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -3377,6 +3378,103 @@ private:
                     common_context_seq_rm(ctx_tgt, slot.id, p0, -1);
                     if (ctx_dft) {
                         common_context_seq_rm(ctx_dft, slot.id, p0, -1);
+                    }
+
+                    // GPU streaming prefill fast path (layer-major): fresh
+                    // single-sequence prompts above the token threshold with
+                    // no cache reuse, no lora/mtmd/speculative and no prob
+                    // request take the weight-stationary layer-major prefill;
+                    // anything else falls through to the chunked path below
+                    // with zero behavioral change. LLAMA_GPU_PREFILL_MIN_TOKENS
+                    // (default 4096, 0 = off) sets the threshold.
+                    static const int32_t gpu_prefill_min_tokens = []() {
+                        const char * value = getenv("LLAMA_GPU_PREFILL_MIN_TOKENS");
+                        return value ? std::max(0, atoi(value)) : 4096;
+                    }();
+                    if (gpu_prefill_min_tokens > 0 &&
+                            slot.state == SLOT_STATE_PROCESSING_PROMPT &&
+                            slot.n_prompt_tokens_processed == 0 &&
+                            slot.prompt.n_tokens() == 0 &&
+                            slot.task->n_tokens() >= gpu_prefill_min_tokens &&
+                            slot.task->type == SERVER_TASK_TYPE_COMPLETION &&
+                            !slot.task->is_parent() && !slot.task->is_child() &&
+                            !slot.need_embd() &&
+                            !slot.task->tokens.has_mtmd &&
+                            slot.lora.empty() &&
+                            slot.alora_invocation_start <= 0 &&
+                            slot.task->params.sampling.n_probs == 0 &&
+                            spec == nullptr && mctx == nullptr && ctx_dft == nullptr &&
+                            llama_get_memory(ctx_tgt) != nullptr) {
+                        const int32_t n_prompt = slot.task->n_tokens();
+
+                        llama_batch lm_batch = llama_batch_init(n_prompt, 0, 1);
+                        for (int32_t i = 0; i < n_prompt; i++) {
+                            lm_batch.token[i]     = input_tokens[i];
+                            lm_batch.pos[i]       = i;
+                            lm_batch.n_seq_id[i]  = 1;
+                            lm_batch.seq_id[i][0] = slot.id;
+                            lm_batch.logits[i]    = i + 1 == n_prompt;
+                        }
+                        // the runtime embeddings flag may still be on from a
+                        // previous batch of another slot
+                        llama_set_embeddings(ctx_tgt, false);
+
+                        SLT_INF(slot, "trying GPU streaming prefill, n_tokens = %d\n", n_prompt);
+                        const int32_t lm_ret = llama_decode_layer_major(ctx_tgt, lm_batch, llama_n_ubatch(ctx_tgt));
+                        llama_batch_free(lm_batch);
+
+                        if (lm_ret == 0) {
+                            slot.prompt.tokens.insert(input_tokens.get_tokens());
+                            slot.n_prompt_tokens_processed += n_prompt;
+                            slot.n_decoded = 0;
+                            slot.i_batch   = -1;
+                            slot.init_sampler();
+
+                            // mirror post_decode()'s DONE_PROMPT handling: the
+                            // first generated token must be sampled now, before
+                            // any other llama_decode() replaces the context's
+                            // output state (the fast path leaves exactly one
+                            // output row: the last prompt token's logits)
+                            slot.state = SLOT_STATE_GENERATING;
+
+                            llama_token id;
+                            {
+                                scoped_timer timer(t_sampl, n_sampl);
+                                id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, -1);
+                            }
+
+                            common_sampler_accept(slot.smpl.get(), id, true);
+
+                            const int64_t t_now = ggml_time_us();
+                            slot.n_decoded += 1;
+                            slot.t_start_generation = t_now;
+                            slot.t_print_last       = t_now;
+                            slot.n_decoded_last     = 0;
+                            slot.t_prompt_processing = (slot.t_start_generation - slot.t_start_process_prompt) / 1e3;
+                            metrics.on_prompt_eval(slot);
+                            slot.t_token_generation = std::max<int64_t>(1, t_now - slot.t_start_generation) / 1e3;
+
+                            completion_token_output result;
+                            result.tok          = id;
+                            result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok,
+                                    params_base.special ||
+                                    slot.task->params.sampling.preserved_tokens.find(result.tok) !=
+                                        slot.task->params.sampling.preserved_tokens.end());
+                            result.prob         = 1.0f;
+
+                            if (!process_token(result, slot)) {
+                                slot.print_timings();
+                                send_final_response(slot);
+                                metrics.on_prediction(slot);
+                                slot.release();
+                            } else {
+                                slot.print_timings_tg();
+                            }
+
+                            return; // prompt fully processed outside the batch
+                        }
+
+                        SLT_INF(slot, "GPU streaming prefill unavailable (ret = %d), using the chunked path\n", lm_ret);
                     }
 
                     // If using an alora, there may be uncached tokens that come

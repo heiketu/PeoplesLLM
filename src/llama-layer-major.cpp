@@ -282,6 +282,91 @@ private:
 
 } // namespace
 
+namespace {
+
+// Preflight VRAM budget for the streaming MoE prefetch slots: production must
+// never discover the shortfall mid-prefill (the device slot buffers allocate
+// lazily on first use). Estimates GGML_CUDA_MOE_PP_MAX_PREFETCH slots of the
+// largest staged expert view per GPU plus margin and compares against the
+// free memory of every GPU backend.
+bool llama_layer_major_vram_budget_ok(
+        const llama_model & model,
+        const std::vector<ggml_backend_t> & backends,
+        int64_t n_tokens) {
+    static const int64_t pp_min = []() {
+        const char * value = getenv("GGML_CUDA_MOE_PP_MIN_TOKENS");
+        return value ? (int64_t) atoll(value) : (int64_t) 0;
+    }();
+    static const int depth = []() {
+        const char * value = getenv("GGML_CUDA_MOE_PP_PREFETCH");
+        return value ? std::max(0, std::min(4, atoi(value))) : 0;
+    }();
+    static const bool ep_env = []() {
+        const char * value = getenv("GGML_CUDA_MOE_PP_EP");
+        return value && atoi(value) > 0;
+    }();
+    if (pp_min <= 0 || depth <= 0 || n_tokens < pp_min) {
+        return true; // the scheduler will not stage any MoE weight
+    }
+
+    size_t max_bytes = 0;
+    for (const auto & layer : model.layers) {
+        const ggml_tensor * weights[] = {
+            layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps, layer.ffn_gate_up_exps,
+        };
+        for (const ggml_tensor * w : weights) {
+            if (w == nullptr || w->data == nullptr) {
+                continue;
+            }
+            ggml_backend_buffer_t buf = w->view_src ? w->view_src->buffer : w->buffer;
+            if (buf == nullptr || !ggml_backend_buffer_is_host(buf) ||
+                    ggml_backend_buffer_get_usage(buf) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                continue;
+            }
+            max_bytes = std::max(max_bytes, ggml_nbytes(w));
+        }
+    }
+    if (max_bytes == 0) {
+        return true; // no host MoE weight, nothing is staged
+    }
+
+    // EP mode stages per-rank halves of each expert tensor on every GPU
+    const size_t staged = ep_env && backends.size() >= 2 ? max_bytes/2 : max_bytes;
+
+    constexpr int n_slots = 4; // GGML_CUDA_MOE_PP_MAX_PREFETCH
+    const size_t margin   = (size_t) 1*1024*1024*1024;
+    const size_t required = (size_t) n_slots*staged + margin;
+
+    typedef bool (*mem_get_info_t)(ggml_backend_t, size_t *, size_t *);
+    for (ggml_backend_t backend : backends) {
+        if (ggml_backend_dev_type(ggml_backend_get_device(backend)) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            continue;
+        }
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        auto fn = reg != nullptr ? (mem_get_info_t)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_mem_get_info") : nullptr;
+        if (fn == nullptr) {
+            continue; // cannot query: do not block the fast path on it
+        }
+        size_t free_mem = 0;
+        size_t total_mem = 0;
+        if (!fn(backend, &free_mem, &total_mem)) {
+            continue;
+        }
+        if (free_mem < required) {
+            LLAMA_LOG_WARN("%s: VRAM budget insufficient on %s: free %.2f of %.2f GiB < required %.2f GiB "
+                    "(%d prefetch slots x %.2f GiB staged + %.2f GiB margin)\n",
+                    __func__, ggml_backend_name(backend),
+                    free_mem/1073741824.0, total_mem/1073741824.0, required/1073741824.0,
+                    n_slots, staged/1073741824.0, margin/1073741824.0);
+            return false;
+        }
+    }
+    return true;
+}
+
+} // namespace
+
 ggml_backend_t llama_layer_major_buffer_backend(
         const std::vector<ggml_backend_t> & backends,
         const ggml_tensor * tensor) {
@@ -539,6 +624,12 @@ int llama_context::decode_layer_major(const llama_batch & batch_inp, uint32_t n_
     }
     if (memory->seq_pos_max(seq_id) >= 0) {
         return -1;
+    }
+
+    // preflight the prefetch-slot VRAM budget before anything allocates;
+    // a shortfall here still has the untouched chunked path as fallback
+    if (!llama_layer_major_vram_budget_ok(model, backend_ptrs, n_tokens_all)) {
+        return 1;
     }
 
     const size_t hc_dim = hparams.n_embd_h();
