@@ -252,10 +252,27 @@ static ggml_tensor * dsv4_with_zero_dep(ggml_context * ctx, ggml_tensor * t, ggm
 static constexpr int64_t DSV4_CSA_RATIO  = 4;
 static constexpr int64_t DSV4_HCA_RATIO  = 128;
 
-static bool dsv4_fused_indexed_fa_enabled() {
-    static const bool enabled = []() {
+// Fused indexed FA avoids the per-token full-width KV concat by passing the
+// raw and compressed segments to the sparse kernel separately. Mode 1 restores
+// the historical opt-in behavior (decode + prefill), mode 2 (default) enables
+// the q1 decode specialization only. Requires F16 KV: the sparse kernels
+// address the full F16 backing through the row map.
+static int dsv4_fused_indexed_fa_mode() {
+    static const int mode = []() {
         const char * value = getenv("LLAMA_DSV4_FUSED_INDEXED_FA");
-        return value && atoi(value) > 0;
+        return value ? atoi(value) : 2;
+    }();
+    return mode;
+}
+
+// With quantized KV the fused indexed kernels are not applicable. For q1
+// decode the compact gather path copies only the selected compressed rows
+// (keeping the cache type), so the dense FA converts a compact concat instead
+// of the full-width cache on every step.
+static bool dsv4_compact_kv_q8_enabled() {
+    static const bool enabled = []() {
+        const char * value = getenv("LLAMA_DSV4_Q8_SPARSE_FA");
+        return value ? atoi(value) > 0 : true;
     }();
     return enabled;
 }
@@ -757,7 +774,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_attn_mha_2kv(
         ggml_tensor * sinks,
         float kq_scale,
         int il,
-        bool indexed_2kv) const {
+        bool indexed_2kv,
+        bool compact_2kv) const {
     // split the batch into streams if needed
     const auto n_stream = k1->ne[3];
 
@@ -790,30 +808,24 @@ ggml_tensor * llama_model_deepseek4::graph::build_attn_mha_2kv(
         GGML_ASSERT(top_k->type == GGML_TYPE_I32);
         GGML_ASSERT(k1->ne[1] == mask1->ne[0]);
 
-        static const bool compact_kv = []() {
-            const char * value = getenv("LLAMA_DSV4_COMPACT_KV");
-            return value && atoi(value) > 0;
-        }();
-
-        if (indexed_2kv && (q->ne[1] == 1 || q->ne[1] >= 256)) {
-            ggml_tensor * cur = ggml_flash_attn_ext_sparse_2kv(
-                    ctx0, q, k1, k1, k2, k2, mask1, mask2, top_k, kq_scale,
-                    hparams.f_max_alibi_bias,
-                    hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
-            res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
-
-            ggml_flash_attn_ext_add_sinks(cur, sinks);
-            ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
-
-            return ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
-        }
-
-        if (compact_kv && q->ne[1] == 1) {
+        if (compact_2kv && q->ne[1] == 1) {
             // Gather the selected compressed rows before concatenating them with
             // the raw window. This avoids materializing the full compressed KV
-            // segment on every decode step.
+            // segment on every decode step. The gathered rows keep the cache
+            // type: on CUDA the dense FA materializes F16 scratch only for the
+            // compact concat, on CPU quantized KV is consumed natively (a
+            // quantized -> F16 cast would not be supported there).
+            if (ggml_is_quantized(k1->type) && !ggml_is_contiguous_to_3(k1)) {
+                // CUDA concat requires quantized inputs contiguous in dims 0-2;
+                // the permuted raw-window view is not. Materialize just the
+                // window instead of the full-width cache.
+                k1 = ggml_cont(ctx0, k1);
+            }
+
             ggml_tensor * k2_selected = ggml_get_rows(ctx0, k2, top_k);
-            k2_selected = ggml_cast(ctx0, k2_selected, GGML_TYPE_F16);
+            if (k2_selected->type != k1->type) {
+                k2_selected = ggml_cast(ctx0, k2_selected, k1->type);
+            }
 
             ggml_tensor * mask2_t = ggml_cont(ctx0, ggml_permute(ctx0, mask2, 1, 0, 2, 3));
             ggml_tensor * mask2_selected = ggml_get_rows(ctx0, mask2_t, top_k);
@@ -825,6 +837,19 @@ ggml_tensor * llama_model_deepseek4::graph::build_attn_mha_2kv(
             cb(kc, "csa_compact_kv", il);
 
             ggml_tensor * cur = ggml_flash_attn_ext(ctx0, q, kc, kc, maskc, kq_scale,
+                    hparams.f_max_alibi_bias,
+                    hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+            res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
+
+            ggml_flash_attn_ext_add_sinks(cur, sinks);
+            ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
+
+            return ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+        }
+
+        if (indexed_2kv && (q->ne[1] == 1 || q->ne[1] >= 256)) {
+            ggml_tensor * cur = ggml_flash_attn_ext_sparse_2kv(
+                    ctx0, q, k1, k1, k2, k2, mask1, mask2, top_k, kq_scale,
                     hparams.f_max_alibi_bias,
                     hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
             res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
@@ -928,23 +953,33 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
     cb(csa_k, "csa_comp_k", il);
 
     ggml_tensor * raw_mask = inp_attn->get_kq_mask();
+    const int64_t n_tokens = inp_pos->ne[0];
+    // The CUDA sparse kernels address the full physical K/V backing through the
+    // row map and therefore require F16 KV (the 2kv variant has no dequant
+    // scratch for the second segment). Quantized KV takes the compact gather
+    // path for q1 decode, which materializes only the selected rows, and falls
+    // back to the dense top-k mask path otherwise — a sparse op with quantized
+    // KV would leave the GPU backend entirely.
+    const bool kv_f16 = raw_k->type == GGML_TYPE_F16 && csa_k->type == GGML_TYPE_F16;
     const char * sparse_fa_env = getenv("LLAMA_DSV4_SPARSE_FA");
     const int sparse_fa_mode = sparse_fa_env ? atoi(sparse_fa_env) : 0;
     const char * compact_kv_env = getenv("LLAMA_DSV4_COMPACT_KV");
-    const bool compact_kv = compact_kv_env && atoi(compact_kv_env) > 0 && inp_pos->ne[0] == 1;
-    const bool fused_indexed_fa = dsv4_fused_indexed_fa_enabled() &&
-        (inp_pos->ne[0] == 1 || inp_pos->ne[0] >= 256);
+    const bool compact_kv = n_tokens == 1 &&
+        ((compact_kv_env && atoi(compact_kv_env) > 0) || (!kv_f16 && dsv4_compact_kv_q8_enabled()));
+    const int fused_mode = kv_f16 ? dsv4_fused_indexed_fa_mode() : 0;
+    const bool fused_indexed_fa = fused_mode > 0 &&
+        (n_tokens == 1 || (fused_mode == 1 && n_tokens >= 256));
     // Mode 2 exposes the single-query specialization for decode A/B. Mode 1
     // retains the current prefill-only behavior until the long-KV gate is set.
     const bool sparse_fa = sparse_fa_mode > 0 &&
-        (inp_pos->ne[0] >= 256 || (sparse_fa_mode > 1 && inp_pos->ne[0] == 1));
+        (n_tokens >= 256 || (sparse_fa_mode > 1 && n_tokens == 1));
     ggml_tensor * csa_mask = (sparse_fa || compact_kv || fused_indexed_fa) ? inp_csa.kq_mask :
         build_top_k_mask(inp_csa.kq_mask, top_k, "csa_top_k_mask", il);
 
     ggml_tensor * out = build_attn_mha_2kv(
         q, raw_k, csa_k, raw_mask, csa_mask,
         (sparse_fa || compact_kv || fused_indexed_fa) ? top_k : nullptr, sinks, kq_scale, il,
-        fused_indexed_fa);
+        fused_indexed_fa, compact_kv);
     if (k_rot) {
         out = llama_mul_mat_hadamard(ctx0, out, k_rot);
     }
@@ -996,11 +1031,14 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_attention(
     // Indexed FA: the raw SWA mask bounds compact the raw segment while an
     // identity row map keeps every causal compressed block, so neither the
     // full-width concat nor the dense scan of the masked raw rows is needed.
+    // F16 KV only: the 2kv sparse kernel has no dequant scratch for the second
+    // segment, and emitting it with quantized KV would leave the GPU backend.
     static const int sparse_raw_compact = []() {
         const char * value = getenv("GGML_CUDA_DSV4_SPARSE_RAW_COMPACT");
         return value ? atoi(value) : 0;
     }();
-    const bool hca_indexed = dsv4_hca_indexed_fa_enabled() && sparse_raw_compact > 0 && q->ne[2] >= 256;
+    const bool hca_indexed = dsv4_hca_indexed_fa_enabled() && sparse_raw_compact > 0 && q->ne[2] >= 256 &&
+        raw_k->type == GGML_TYPE_F16 && hca_k->type == GGML_TYPE_F16;
 
     ggml_tensor * top_k = nullptr;
     if (hca_indexed) {

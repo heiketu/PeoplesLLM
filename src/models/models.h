@@ -1196,7 +1196,8 @@ struct llama_model_deepseek4 : public llama_model_base {
                 ggml_tensor * sinks,
                 float kq_scale,
                 int il,
-                bool indexed_2kv = false) const;
+                bool indexed_2kv = false,
+                bool compact_2kv = false) const;
 
         ggml_tensor * build_hca_attention(
                 llm_graph_input_dsv4 * inp_dsv4,

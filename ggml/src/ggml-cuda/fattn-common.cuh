@@ -69,13 +69,20 @@ static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_g
 
     const bool V_is_K_view = V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
 
+    // Sparse kernels address the full physical K/V backing through the row map,
+    // so a quantized sparse K/V must be converted across the whole backing
+    // tensor, not just the compact logical view (see ggml_cuda_get_best_fattn_kernel).
+    const bool sparse = dst->src[5] && !dst->src[6];
+    const ggml_tensor * K_cvt = sparse && K->view_src ? K->view_src : K;
+    const ggml_tensor * V_cvt = sparse && V->view_src ? V->view_src : V;
+
     ggml_cuda_flash_attn_ext_f16_extra_data data = {};
     data.end = (uintptr_t) dst->data + ggml_nbytes(dst);
 
     if (need_f16_K && K->type != GGML_TYPE_F16) {
         data.end = GGML_PAD(data.end, 128);
         data.K   = data.end;
-        data.end += ggml_nelements(K)*ggml_type_size(GGML_TYPE_F16);
+        data.end += ggml_nelements(K_cvt)*ggml_type_size(GGML_TYPE_F16);
     }
 
     if (need_f16_V && V->type != GGML_TYPE_F16) {
@@ -84,7 +91,7 @@ static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_g
         } else {
             data.end = GGML_PAD(data.end, 128);
             data.V   = data.end;
-            data.end += ggml_nelements(V)*ggml_type_size(GGML_TYPE_F16);
+            data.end += ggml_nelements(V_cvt)*ggml_type_size(GGML_TYPE_F16);
         }
     }
 
@@ -1349,30 +1356,35 @@ void launch_fattn(
     const size_t nbV2_2 = V2 ? V2->nb[2] : 0;
     const size_t nbV2_3 = V2 ? V2->nb[3] : 0;
 
+    // Sparse kernels address the full physical backing through the row map, so
+    // convert the backing tensor rather than the compact logical view.
+    const ggml_tensor * K_cvt = (sparse_idx && K->view_src) ? K->view_src : K;
+    const ggml_tensor * V_cvt = (sparse_idx && V->view_src) ? V->view_src : V;
+
     if (need_f16_K && K->type != GGML_TYPE_F16) {
-        const size_t bs = ggml_blck_size(K->type);
-        const size_t ts = ggml_type_size(K->type);
+        const size_t bs = ggml_blck_size(K_cvt->type);
+        const size_t ts = ggml_type_size(K_cvt->type);
 
         GGML_ASSERT(f16_extra.K != 0);
         half * K_f16 = (half *) f16_extra.K;
-        if (ggml_is_contiguously_allocated(K)) {
-            to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
-            to_fp16(K_data, K_f16, ggml_nelements(K), main_stream);
+        if (ggml_is_contiguously_allocated(K_cvt)) {
+            to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K_cvt->type);
+            to_fp16((const char *) K_cvt->data, K_f16, ggml_nelements(K_cvt), main_stream);
 
-            nb11 = nb11*bs*sizeof(half)/ts;
-            nb12 = nb12*bs*sizeof(half)/ts;
-            nb13 = nb13*bs*sizeof(half)/ts;
+            nb11 = K_cvt->nb[1]*bs*sizeof(half)/ts;
+            nb12 = K_cvt->nb[2]*bs*sizeof(half)/ts;
+            nb13 = K_cvt->nb[3]*bs*sizeof(half)/ts;
         } else {
-            GGML_ASSERT(K->nb[0] == ts);
-            to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(K->type);
-            const int64_t s01 = nb11 / ts;
-            const int64_t s02 = nb12 / ts;
-            const int64_t s03 = nb13 / ts;
-            to_fp16(K_data, K_f16, K->ne[0], K->ne[1], K->ne[2], K->ne[3], s01, s02, s03, main_stream);
+            GGML_ASSERT(K_cvt->nb[0] == ts);
+            to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(K_cvt->type);
+            const int64_t s01 = K_cvt->nb[1] / ts;
+            const int64_t s02 = K_cvt->nb[2] / ts;
+            const int64_t s03 = K_cvt->nb[3] / ts;
+            to_fp16((const char *) K_cvt->data, K_f16, K_cvt->ne[0], K_cvt->ne[1], K_cvt->ne[2], K_cvt->ne[3], s01, s02, s03, main_stream);
 
-            nb11 = K->ne[0] * sizeof(half);
-            nb12 = K->ne[1] * nb11;
-            nb13 = K->ne[2] * nb12;
+            nb11 = K_cvt->ne[0] * sizeof(half);
+            nb12 = K_cvt->ne[1] * nb11;
+            nb13 = K_cvt->ne[2] * nb12;
         }
         K_data = (char *) K_f16;
     }
@@ -1384,39 +1396,41 @@ void launch_fattn(
             nb22   = nb12;
             nb23   = nb13;
         } else {
-            const size_t bs = ggml_blck_size(V->type);
-            const size_t ts = ggml_type_size(V->type);
+            const size_t bs = ggml_blck_size(V_cvt->type);
+            const size_t ts = ggml_type_size(V_cvt->type);
 
             GGML_ASSERT(f16_extra.V != 0);
             half * V_f16 = (half *) f16_extra.V;
-            if (ggml_is_contiguously_allocated(V)) {
-                to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
-                to_fp16(V_data, V_f16, ggml_nelements(V), main_stream);
+            if (ggml_is_contiguously_allocated(V_cvt)) {
+                to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V_cvt->type);
+                to_fp16((const char *) V_cvt->data, V_f16, ggml_nelements(V_cvt), main_stream);
                 V_data = (char *) V_f16;
 
-                nb21 = nb21*bs*sizeof(half)/ts;
-                nb22 = nb22*bs*sizeof(half)/ts;
-                nb23 = nb23*bs*sizeof(half)/ts;
+                nb21 = V_cvt->nb[1]*bs*sizeof(half)/ts;
+                nb22 = V_cvt->nb[2]*bs*sizeof(half)/ts;
+                nb23 = V_cvt->nb[3]*bs*sizeof(half)/ts;
             } else {
-                GGML_ASSERT(V->nb[0] == ts);
-                to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(V->type);
-                const int64_t s01 = nb21 / ts;
-                const int64_t s02 = nb22 / ts;
-                const int64_t s03 = nb23 / ts;
-                to_fp16(V_data, V_f16, V->ne[0], V->ne[1], V->ne[2], V->ne[3], s01, s02, s03, main_stream);
+                GGML_ASSERT(V_cvt->nb[0] == ts);
+                to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(V_cvt->type);
+                const int64_t s01 = V_cvt->nb[1] / ts;
+                const int64_t s02 = V_cvt->nb[2] / ts;
+                const int64_t s03 = V_cvt->nb[3] / ts;
+                to_fp16((const char *) V_cvt->data, V_f16, V_cvt->ne[0], V_cvt->ne[1], V_cvt->ne[2], V_cvt->ne[3], s01, s02, s03, main_stream);
 
-                nb21 = V->ne[0] * sizeof(half);
-                nb22 = V->ne[1] * nb21;
-                nb23 = V->ne[2] * nb22;
+                nb21 = V_cvt->ne[0] * sizeof(half);
+                nb22 = V_cvt->ne[1] * nb21;
+                nb23 = V_cvt->ne[2] * nb22;
             }
             V_data = (char *) V_f16;
         }
     }
 
-    // Sparse grouping addresses the full F16 concat backing through a compact
-    // logical view. Converting only that view would omit physical rows beyond
-    // it, so non-F16 sparse K/V are intentionally left to the CPU fallback.
-    GGML_ASSERT(!sparse_idx || (K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16));
+    // Sparse grouping addresses the full K/V backing through a compact logical
+    // view. Non-F16 K/V is converted across the whole backing above (non-2kv
+    // only); the 2kv variant has no scratch for the second segment and keeps
+    // the F16 requirement.
+    GGML_ASSERT(!sparse_idx || (K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16) ||
+        (!K2 && K->type == V->type && K->view_src && V->view_src));
     GGML_ASSERT(!K2 || (K2->type == GGML_TYPE_F16 && V2->type == GGML_TYPE_F16));
 
     const int ntiles_x     = ((Q->ne[1] + ncols1 - 1) / ncols1);

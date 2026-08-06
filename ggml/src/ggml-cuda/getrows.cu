@@ -103,6 +103,59 @@ static __global__ void k_get_rows_back_float(
     }
 }
 
+// Same-type quantized row gather: copy whole blocks instead of dequantizing.
+// Used by the DSV4 quantized-KV compact decode path, which gathers only the
+// selected compressed rows and lets the dense FA convert the compact concat.
+static __global__ void k_get_rows_bytes(
+        const char    * __restrict__ src0, const int32_t * __restrict__ src1, char * __restrict__ dst,
+        const int64_t row_bytes, const int64_t ne11, const uint3 ne12_fdv,
+        const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t s10, const size_t s11, const size_t s12,
+        const size_t nb1, const size_t nb2, const size_t nb3) {
+    for (int64_t z = blockIdx.z; z < ne11*(int64_t)ne12_fdv.z; z += gridDim.z) {
+        for (int64_t i = blockIdx.y*blockDim.x + threadIdx.x; i < row_bytes; i += (int64_t) gridDim.y*blockDim.x) {
+            // The x and y dimensions of the grid are swapped because the maximum allowed grid size for x is higher.
+            const int i10 = blockIdx.x;
+            const uint2 dm = fast_div_modulo((uint32_t) z, ne12_fdv);
+
+            const int i01 = src1[i10*s10 + dm.x*s11 + dm.y*s12];
+
+            const char * src_row = src0 + (int64_t) i01*nb01 + dm.x*nb02 + dm.y*nb03;
+            char       * dst_row = dst   + (int64_t) i10*nb1  + dm.x*nb2  + dm.y*nb3;
+            dst_row[i] = src_row[i];
+        }
+    }
+}
+
+static void get_rows_cuda_bytes(
+        const void * src0_d, ggml_type type, const int32_t * src1_d, void * dst_d,
+        const int64_t ne00, const size_t nb01, const size_t nb02, const size_t nb03,
+        const int64_t ne10, const int64_t ne11, const int64_t ne12, const size_t nb10, const size_t nb11, const size_t nb12,
+        const size_t nb1, const size_t nb2, const size_t nb3,
+        cudaStream_t stream) {
+    const size_t row_bytes = ggml_row_size(type, ne00);
+
+    const dim3 block_dims(CUDA_GET_ROWS_BLOCK_SIZE, 1, 1);
+    const int block_num_y = (row_bytes + CUDA_GET_ROWS_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BLOCK_SIZE;
+    const dim3 block_nums(ne10, MIN(block_num_y, UINT16_MAX), MIN(ne11*ne12, UINT16_MAX));
+
+    const size_t s10 = nb10 / sizeof(int32_t);
+    const size_t s11 = nb11 / sizeof(int32_t);
+    const size_t s12 = nb12 / sizeof(int32_t);
+
+    GGML_ASSERT(ne12 > 0);
+    GGML_ASSERT(ne11 <= std::numeric_limits<uint32_t>::max() / ne12);
+    const uint3 ne12_fdv = init_fastdiv_values(ne12);
+
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{block_nums, block_dims, 0, stream};
+    ggml_cuda_kernel_launch(k_get_rows_bytes, launch_params,
+        (const char *) src0_d, src1_d, (char *) dst_d,
+        row_bytes, ne11, ne12_fdv,
+        nb01, nb02, nb03,
+        s10, s11, s12,
+        nb1, nb2, nb3);
+}
+
 template<int qk, int qr, dequantize_kernel_t dq, typename dst_t>
 static void get_rows_cuda_q(
         const void * src0_d, const int32_t * src1_d, dst_t * dst_d,
@@ -237,6 +290,11 @@ void get_rows_cuda(
         int64_t ne10, int64_t ne11, int64_t ne12, size_t nb10, size_t nb11, size_t nb12,
         size_t nb1, size_t nb2, size_t nb3,
         cudaStream_t stream) {
+    if (dst_type == src0_type && ggml_is_quantized(dst_type)) {
+        get_rows_cuda_bytes(src0_d, dst_type, src1_d, dst_d,
+            ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+        return;
+    }
     switch (dst_type) {
         case GGML_TYPE_F32:
             ggml_cuda_get_rows_switch_src0_type(src0_d, src0_type, src1_d, (float *) dst_d,

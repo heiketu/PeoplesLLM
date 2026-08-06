@@ -420,8 +420,18 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         const bool sparse_2kv = ggml_cuda_fattn_is_sparse_2kv(dst);
         const ggml_tensor * K2 = sparse_2kv ? dst->src[8] : nullptr;
         const ggml_tensor * V2 = sparse_2kv ? dst->src[9] : nullptr;
+        // Non-F16 sparse K/V stays on the GPU: the MMA kernel converts the full
+        // physical backing (the row map addresses rows beyond the compact
+        // logical view, so the view alone is not enough). The 2kv variant has
+        // no dequant scratch for the second segment and still requires F16;
+        // the graph never emits that combination (dense top-k mask path).
+        const bool kv_f16 = K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16;
+        const bool kv_full_backing = !sparse_2kv && K->type == V->type &&
+            ggml_cuda_fattn_kv_type_supported(K->type) &&
+            K->view_src != nullptr && V->view_src != nullptr &&
+            ggml_is_contiguous(K->view_src);
         if (!mask || !compressed_mask || top_k->type != GGML_TYPE_I32 || compressed_mask->type != GGML_TYPE_F16 ||
-                Q->ne[0] != 512 || V->ne[0] != 512 || K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16 ||
+                Q->ne[0] != 512 || V->ne[0] != 512 || (!kv_f16 && !kv_full_backing) ||
                 Q->ne[1] != top_k->ne[1] || Q->ne[3] != top_k->ne[3] || top_k->ne[2] != 1 ||
                 Q->ne[1] != compressed_mask->ne[1] || Q->ne[3] != compressed_mask->ne[3] || compressed_mask->ne[2] != 1 ||
                 (!sparse_2kv && K->ne[1] != mask->ne[0] + top_k->ne[0]) ||

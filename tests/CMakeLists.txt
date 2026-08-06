@@ -348,6 +348,11 @@ llama_test(test-layer-major LABEL model)
 # weight materialization in the CUDA device buffer
 llama_build(test-resident-bf16.cpp)
 
+# bit-exactness harness for the DSV4 quantized-KV compact gather path
+# (get_rows + cast vs full dequant + get_rows on the CPU backend)
+llama_build(test-dsv4-gather-dequant.cpp)
+llama_test(test-dsv4-gather-dequant)
+
 # standalone numerical tests + microbenchmarks for the 8x8 repack matmul kernels
 # (Q2_K / Q5_K x Q8_K); needs the internal ggml-cpu repack headers and symbols
 if (NOT LLAMA_USE_SYSTEM_GGML AND TARGET ggml-cpu)

@@ -118,6 +118,19 @@ int main(int argc, char ** argv) {
     cparams.n_threads_batch = n_threads;
     cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
 
+    // quantized-KV A/B for the q1 sparse decode paths (e.g. LLAMA_BENCH_KV_TYPE=q8_0)
+    if (const char * kv_type = getenv("LLAMA_BENCH_KV_TYPE")) {
+        if (std::strcmp(kv_type, "q8_0") == 0) {
+            cparams.type_k = GGML_TYPE_Q8_0;
+            cparams.type_v = GGML_TYPE_Q8_0;
+        } else if (std::strcmp(kv_type, "f16") != 0) {
+            fprintf(stderr, "unknown LLAMA_BENCH_KV_TYPE '%s' (expected f16 or q8_0)\n", kv_type);
+            llama_model_free(model);
+            llama_backend_free();
+            return 1;
+        }
+    }
+
     if (benchmark) {
         llama_context * ctx = llama_init_from_model(model, cparams);
         if (!ctx) {
