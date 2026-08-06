@@ -253,6 +253,7 @@ static constexpr int64_t DSV4_CSA_RATIO  = 4;
 static constexpr int64_t DSV4_HCA_RATIO  = 128;
 
 // Fused indexed FA avoids the per-token full-width KV concat by passing the
+<<<<<<< HEAD
 // raw and compressed segments to the sparse kernel separately. Mode 1 restores
 // the historical opt-in behavior (decode + prefill), mode 2 enables the q1
 // decode specialization only. Requires F16 KV: the sparse kernels address the
@@ -261,6 +262,16 @@ static constexpr int64_t DSV4_HCA_RATIO  = 128;
 // dense q1 16/32-head-group MMA (fixed TG64 -12%, TG512 -2%, 2026-08-07 A/B).
 // Re-evaluate the default once the sparse kernel gets wider head groups or at
 // much longer contexts where the row-scan win dominates.
+=======
+// raw and compressed segments to the sparse kernel separately. Requires F16 KV:
+// the sparse kernels address the full F16 backing through the row map.
+// Modes (LLAMA_DSV4_FUSED_INDEXED_FA):
+//   0 = off
+//   1 = historical opt-in scope: q1 decode + prefill (>= 256 tokens)
+//   2 = q1 decode only (default)
+//   3 = mode 2 + multi-stream decode (one token per stream, opt-in)
+//   4 = mode 1 + multi-stream decode (opt-in)
+>>>>>>> 9306445f4 (dsv4: opt-in multi-stream (per-stream q1) sparse FA + q8 compact gather multi-stream)
 static int dsv4_fused_indexed_fa_mode() {
     static const int mode = []() {
         const char * value = getenv("LLAMA_DSV4_FUSED_INDEXED_FA");
@@ -273,12 +284,16 @@ static int dsv4_fused_indexed_fa_mode() {
 // decode the compact gather path copies only the selected compressed rows
 // (keeping the cache type), so the dense FA converts a compact concat instead
 // of the full-width cache on every step.
-static bool dsv4_compact_kv_q8_enabled() {
-    static const bool enabled = []() {
+// Modes (LLAMA_DSV4_Q8_SPARSE_FA):
+//   0 = off
+//   1 = q1 decode, single stream (default)
+//   2 = q1 decode + multi-stream decode (one token per stream, opt-in)
+static int dsv4_compact_kv_q8_mode() {
+    static const int mode = []() {
         const char * value = getenv("LLAMA_DSV4_Q8_SPARSE_FA");
-        return value ? atoi(value) > 0 : true;
+        return value ? atoi(value) : 1;
     }();
-    return enabled;
+    return mode;
 }
 
 // HCA layers attend over the full compressed state and the raw SWA window. With
@@ -826,13 +841,24 @@ ggml_tensor * llama_model_deepseek4::graph::build_attn_mha_2kv(
                 k1 = ggml_cont(ctx0, k1);
             }
 
-            ggml_tensor * k2_selected = ggml_get_rows(ctx0, k2, top_k);
+            // ggml_get_rows batches over ne[2]/ne[3] of the index tensor
+            // (a->ne[3] == b->ne[2], b->ne[3] == 1). The per-stream indices
+            // arrive as [topk, 1, 1, ns]; remap them to [topk, 1, ns, 1] — a
+            // pure reshape of the contiguous top_k — so each stream gathers
+            // from its own compressed KV slice.
+            ggml_tensor * top_k_rows = top_k;
+            if (n_stream > 1) {
+                GGML_ASSERT(top_k->ne[1] == 1 && top_k->ne[2] == 1 && top_k->ne[3] == n_stream);
+                top_k_rows = ggml_reshape_4d(ctx0, top_k, top_k->ne[0], 1, n_stream, 1);
+            }
+
+            ggml_tensor * k2_selected = ggml_get_rows(ctx0, k2, top_k_rows);
             if (k2_selected->type != k1->type) {
                 k2_selected = ggml_cast(ctx0, k2_selected, k1->type);
             }
 
             ggml_tensor * mask2_t = ggml_cont(ctx0, ggml_permute(ctx0, mask2, 1, 0, 2, 3));
-            ggml_tensor * mask2_selected = ggml_get_rows(ctx0, mask2_t, top_k);
+            ggml_tensor * mask2_selected = ggml_get_rows(ctx0, mask2_t, top_k_rows);
             mask2_selected = ggml_cast(ctx0, mask2_selected, GGML_TYPE_F16);
             mask2_selected = ggml_cont(ctx0, ggml_permute(ctx0, mask2_selected, 1, 0, 2, 3));
 
@@ -965,14 +991,26 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
     // back to the dense top-k mask path otherwise — a sparse op with quantized
     // KV would leave the GPU backend entirely.
     const bool kv_f16 = raw_k->type == GGML_TYPE_F16 && csa_k->type == GGML_TYPE_F16;
+    // Multi-stream decode: exactly one token per unique sequence (pure decode
+    // rounds and the equal-split head ubatch of mixed prefill/decode rounds).
+    // Coupled batches (speculative / shared-prefix tokens) collapse to a
+    // single stream and must keep the dense fallback.
+    const bool ms_q1 = n_tokens > 1 &&
+        ubatch.n_seqs_unq == ubatch.n_tokens && !dsv4_ubatch_has_coupled(ubatch);
     const char * sparse_fa_env = getenv("LLAMA_DSV4_SPARSE_FA");
     const int sparse_fa_mode = sparse_fa_env ? atoi(sparse_fa_env) : 0;
+    // LLAMA_DSV4_COMPACT_KV forces the compact gather path for any KV type:
+    // 1 = q1 decode only, 2 = q1 decode + multi-stream decode. With quantized
+    // KV the q8 gate (dsv4_compact_kv_q8_mode) applies on top.
     const char * compact_kv_env = getenv("LLAMA_DSV4_COMPACT_KV");
-    const bool compact_kv = n_tokens == 1 &&
-        ((compact_kv_env && atoi(compact_kv_env) > 0) || (!kv_f16 && dsv4_compact_kv_q8_enabled()));
+    const int compact_kv_mode = compact_kv_env ? atoi(compact_kv_env) : 0;
+    const int compact_q8_mode = kv_f16 ? 0 : dsv4_compact_kv_q8_mode();
+    const bool compact_kv = (n_tokens == 1 || (ms_q1 && (compact_kv_mode >= 2 || compact_q8_mode >= 2))) &&
+        (compact_kv_mode > 0 || compact_q8_mode > 0);
     const int fused_mode = kv_f16 ? dsv4_fused_indexed_fa_mode() : 0;
     const bool fused_indexed_fa = fused_mode > 0 &&
-        (n_tokens == 1 || (fused_mode == 1 && n_tokens >= 256));
+        (n_tokens == 1 || (n_tokens >= 256 && (fused_mode == 1 || fused_mode >= 4)) ||
+         (ms_q1 && fused_mode >= 3));
     // Mode 2 exposes the single-query specialization for decode A/B. Mode 1
     // retains the current prefill-only behavior until the long-KV gate is set.
     const bool sparse_fa = sparse_fa_mode > 0 &&

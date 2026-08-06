@@ -54,7 +54,7 @@ static int64_t dsv4_stream_offset(uint32_t n_stream, llama_seq_id seq_id, uint32
     return (int64_t) seq_id*size;
 }
 
-static bool dsv4_ubatch_has_coupled(const llama_ubatch & ubatch) {
+bool dsv4_ubatch_has_coupled(const llama_ubatch & ubatch) {
     for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
         if (ubatch.n_seq_id[i] > 1) {
             return true;

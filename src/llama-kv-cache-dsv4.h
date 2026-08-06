@@ -8,6 +8,11 @@
 #include <unordered_map>
 #include <vector>
 
+// true when any token in the ubatch is shared by more than one sequence
+// (coupled speculative / shared-prefix tokens). Coupled batches collapse to a
+// single attention stream, so per-stream decode gates must exclude them.
+bool dsv4_ubatch_has_coupled(const llama_ubatch & ubatch);
+
 class llama_dsv4_comp_state {
 public:
     using stream_copy_info = llama_kv_cache::stream_copy_info;

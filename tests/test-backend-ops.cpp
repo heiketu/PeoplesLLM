@@ -7230,12 +7230,14 @@ struct test_flash_attn_ext_sparse : public test_case {
     const int64_t n_raw;
     const int64_t n_top_k;
     const int64_t n_comp;
+    const int64_t n_stream;
 
     test_flash_attn_ext_sparse(
             int64_t n_q = 8, bool kv_alias = false, bool split_kv = false,
-            int64_t n_raw = 1024, int64_t n_top_k = 512, int64_t n_comp = 1024) :
+            int64_t n_raw = 1024, int64_t n_top_k = 512, int64_t n_comp = 1024,
+            int64_t n_stream = 1) :
         n_q(n_q), kv_alias(kv_alias), split_kv(split_kv),
-        n_raw(n_raw), n_top_k(n_top_k), n_comp(n_comp) {
+        n_raw(n_raw), n_top_k(n_top_k), n_comp(n_comp), n_stream(n_stream) {
         GGML_ASSERT(n_raw > 0 && n_top_k > 0 && n_top_k <= n_comp);
     }
 
@@ -7246,7 +7248,8 @@ struct test_flash_attn_ext_sparse : public test_case {
 
     std::string vars() override {
         return "d=512," + VAR_TO_STR(n_q) + ",n_head_q=64," +
-            VARS_TO_STR3(n_raw, n_top_k, n_comp) + "," + VAR_TO_STR(kv_alias) + "," + VAR_TO_STR(split_kv);
+            VARS_TO_STR3(n_raw, n_top_k, n_comp) + "," + VAR_TO_STR(kv_alias) + "," + VAR_TO_STR(split_kv) +
+            "," + VAR_TO_STR(n_stream);
     }
 
     double max_nmse_err() override {
@@ -7255,11 +7258,17 @@ struct test_flash_attn_ext_sparse : public test_case {
 
     uint64_t op_flops(ggml_tensor * t) override {
         GGML_UNUSED(t);
-        return 2*n_head_q*n_q*(d + d)*(n_raw + n_top_k);
+        return 2*n_head_q*n_q*n_stream*(d + d)*(n_raw + n_top_k);
+    }
+
+    // Row selected by query iq of stream is at sparse position ik. The 11*is
+    // term vanishes for single-stream cases, keeping their data unchanged.
+    int64_t selected_row(int64_t is, int64_t iq, int64_t ik) const {
+        return (37*ik + 13*iq + 11*is) % n_comp;
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d, n_q, n_head_q, 1);
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d, n_q, n_head_q, n_stream);
         ggml_set_name(q, "sparse_q");
 
         ggml_tensor * k = nullptr;
@@ -7267,42 +7276,42 @@ struct test_flash_attn_ext_sparse : public test_case {
         ggml_tensor * k2 = nullptr;
         ggml_tensor * v2 = nullptr;
         if (split_kv) {
-            k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, d, n_raw, 1, 1);
+            k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, d, n_raw, 1, n_stream);
             ggml_set_name(k, "sparse_k_raw");
-            v = kv_alias ? k : ggml_new_tensor_4d(ctx, GGML_TYPE_F16, d, n_raw, 1, 1);
+            v = kv_alias ? k : ggml_new_tensor_4d(ctx, GGML_TYPE_F16, d, n_raw, 1, n_stream);
             if (!kv_alias) {
                 ggml_set_name(v, "sparse_v_raw");
             }
-            k2 = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, d, n_comp, 1, 1);
+            k2 = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, d, n_comp, 1, n_stream);
             ggml_set_name(k2, "sparse_k_comp");
-            v2 = kv_alias ? k2 : ggml_new_tensor_4d(ctx, GGML_TYPE_F16, d, n_comp, 1, 1);
+            v2 = kv_alias ? k2 : ggml_new_tensor_4d(ctx, GGML_TYPE_F16, d, n_comp, 1, n_stream);
             if (!kv_alias) {
                 ggml_set_name(v2, "sparse_v_comp");
             }
         } else {
-            ggml_tensor * k_full = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, d, n_raw + n_comp, 1, 1);
+            ggml_tensor * k_full = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, d, n_raw + n_comp, 1, n_stream);
             ggml_set_name(k_full, "sparse_k_full");
-            k = ggml_view_4d(ctx, k_full, d, n_raw + n_top_k, 1, 1,
+            k = ggml_view_4d(ctx, k_full, d, n_raw + n_top_k, 1, n_stream,
                     k_full->nb[1], k_full->nb[2], k_full->nb[3], 0);
             ggml_set_name(k, "sparse_k");
 
             v = k;
             if (!kv_alias) {
-                ggml_tensor * v_full = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, d, n_raw + n_comp, 1, 1);
+                ggml_tensor * v_full = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, d, n_raw + n_comp, 1, n_stream);
                 ggml_set_name(v_full, "sparse_v_full");
-                v = ggml_view_4d(ctx, v_full, d, n_raw + n_top_k, 1, 1,
+                v = ggml_view_4d(ctx, v_full, d, n_raw + n_top_k, 1, n_stream,
                         v_full->nb[1], v_full->nb[2], v_full->nb[3], 0);
             }
             ggml_set_name(v, "sparse_v");
         }
 
-        ggml_tensor * raw_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_raw, n_q, 1, 1);
+        ggml_tensor * raw_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_raw, n_q, 1, n_stream);
         ggml_set_name(raw_mask, "sparse_raw_mask");
 
-        ggml_tensor * compressed_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_comp, n_q, 1, 1);
+        ggml_tensor * compressed_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_comp, n_q, 1, n_stream);
         ggml_set_name(compressed_mask, "sparse_compressed_mask");
 
-        ggml_tensor * top_k = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_top_k, n_q, 1, 1);
+        ggml_tensor * top_k = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_top_k, n_q, 1, n_stream);
         ggml_set_name(top_k, "sparse_top_k");
 
         ggml_tensor * out = split_kv ? ggml_flash_attn_ext_sparse_2kv(
@@ -7315,6 +7324,30 @@ struct test_flash_attn_ext_sparse : public test_case {
         return out;
     }
 
+    // NaN-poison the compressed rows that no query of a stream selects. A
+    // gather that goes out of bounds or reads the wrong stream turns the
+    // output into NaN and fails the nmse check against the CPU reference.
+    void poison_unselected(ggml_tensor * t, int64_t comp_offset) {
+        std::vector<ggml_fp16_t> data(ggml_nelements(t));
+        ggml_backend_tensor_get(t, data.data(), 0, ggml_nbytes(t));
+        for (int64_t is = 0; is < n_stream; ++is) {
+            std::vector<char> selected(n_comp, 0);
+            for (int64_t iq = 0; iq < n_q; ++iq) {
+                for (int64_t ik = 0; ik < n_top_k; ++ik) {
+                    selected[selected_row(is, iq, ik)] = 1;
+                }
+            }
+            for (int64_t r = 0; r < n_comp; ++r) {
+                if (selected[r]) {
+                    continue;
+                }
+                ggml_fp16_t * row = data.data() + (is*t->ne[1] + comp_offset + r)*t->ne[0];
+                std::fill_n(row, t->ne[0], ggml_fp32_to_fp16(NAN));
+            }
+        }
+        ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+    }
+
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             if (strcmp(t->name, "sparse_k") == 0 || strcmp(t->name, "sparse_v") == 0) {
@@ -7322,29 +7355,42 @@ struct test_flash_attn_ext_sparse : public test_case {
                 // these logical views would overwrite only a prefix of that backing.
                 continue;
             }
+            if (n_stream > 1 &&
+                    (strcmp(t->name, "sparse_k_comp") == 0 || strcmp(t->name, "sparse_v_comp") == 0 ||
+                     strcmp(t->name, "sparse_k_full") == 0 || strcmp(t->name, "sparse_v_full") == 0)) {
+                init_tensor_uniform(t);
+                poison_unselected(t, split_kv ? 0 : n_raw);
+                continue;
+            }
             if (strcmp(t->name, "sparse_top_k") == 0) {
                 std::vector<int32_t> data(ggml_nelements(t));
-                for (int64_t iq = 0; iq < n_q; ++iq) {
-                    for (int64_t ik = 0; ik < n_top_k; ++ik) {
-                        // 37 is coprime to 1024, so every query selects 512
-                        // distinct compressed rows.
-                        data[iq*n_top_k + ik] = (37*ik + 13*iq) % n_comp;
+                for (int64_t is = 0; is < n_stream; ++is) {
+                    for (int64_t iq = 0; iq < n_q; ++iq) {
+                        int32_t * dst = data.data() + (is*n_q + iq)*n_top_k;
+                        for (int64_t ik = 0; ik < n_top_k; ++ik) {
+                            // 37 is coprime to 1024, so every query selects 512
+                            // distinct compressed rows.
+                            dst[ik] = selected_row(is, iq, ik);
+                        }
+                        // The grouped CUDA implementation merges the sorted rows
+                        // produced by DSV4's opt-in top-k contract.
+                        std::sort(dst, dst + n_top_k);
                     }
-                    // The grouped CUDA implementation merges the sorted rows
-                    // produced by DSV4's opt-in top-k contract.
-                    std::sort(data.begin() + iq*n_top_k, data.begin() + (iq + 1)*n_top_k);
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
                 continue;
             }
             if (strcmp(t->name, "sparse_raw_mask") == 0) {
                 std::vector<ggml_fp16_t> data(ggml_nelements(t), ggml_fp32_to_fp16(-INFINITY));
-                for (int64_t iq = 0; iq < n_q; ++iq) {
-                    const int64_t begin = n_raw/4 + (n_q == 1 ? 1 : 4*iq);
-                    const int64_t end   = std::min<int64_t>(n_raw, n_raw/2 + (n_q == 1 ? 1 : 4*iq));
-                    for (int64_t ik = begin; ik < end; ++ik) {
-                        if ((ik + 3*iq) % 17 != 0) {
-                            data[iq*n_raw + ik] = ggml_fp32_to_fp16(0.0f);
+                for (int64_t is = 0; is < n_stream; ++is) {
+                    for (int64_t iq = 0; iq < n_q; ++iq) {
+                        ggml_fp16_t * dst = data.data() + (is*n_q + iq)*n_raw;
+                        const int64_t begin = n_raw/4 + (n_q == 1 ? 1 : 4*iq);
+                        const int64_t end   = std::min<int64_t>(n_raw, n_raw/2 + (n_q == 1 ? 1 : 4*iq));
+                        for (int64_t ik = begin; ik < end; ++ik) {
+                            if ((ik + 3*iq) % 17 != 0) {
+                                dst[ik] = ggml_fp32_to_fp16(0.0f);
+                            }
                         }
                     }
                 }
@@ -7353,10 +7399,13 @@ struct test_flash_attn_ext_sparse : public test_case {
             }
             if (strcmp(t->name, "sparse_compressed_mask") == 0) {
                 std::vector<ggml_fp16_t> data(ggml_nelements(t), ggml_fp32_to_fp16(0.0f));
-                for (int64_t iq = 0; iq < n_q; ++iq) {
-                    for (int64_t ik = 0; ik < n_comp; ++ik) {
-                        if ((ik + 5*iq) % 19 == 0) {
-                            data[iq*n_comp + ik] = ggml_fp32_to_fp16(-INFINITY);
+                for (int64_t is = 0; is < n_stream; ++is) {
+                    for (int64_t iq = 0; iq < n_q; ++iq) {
+                        ggml_fp16_t * dst = data.data() + (is*n_q + iq)*n_comp;
+                        for (int64_t ik = 0; ik < n_comp; ++ik) {
+                            if ((ik + 5*iq) % 19 == 0) {
+                                dst[ik] = ggml_fp32_to_fp16(-INFINITY);
+                            }
                         }
                     }
                 }
@@ -10082,6 +10131,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext_sparse(8, true, true));
     test_cases.emplace_back(new test_flash_attn_ext_sparse(8, true, true, 256, 512, 4096));
     test_cases.emplace_back(new test_flash_attn_ext_sparse(256, true, true, 256, 512, 4096));
+    // Multi-stream decode shapes (one query per stream, DSV4 non-unified KV):
+    // q=1 x 2/4/8 streams for both the fused 2kv and the view-based sparse
+    // variants. Unselected compressed rows are NaN-poisoned to catch
+    // out-of-bounds or wrong-stream gathers.
+    for (int64_t ns : {2, 4, 8}) {
+        test_cases.emplace_back(new test_flash_attn_ext_sparse(1, true, true,  256, 512, 4096, ns));
+        test_cases.emplace_back(new test_flash_attn_ext_sparse(1, true, false, 256, 512, 4096, ns));
+        test_cases.emplace_back(new test_flash_attn_ext_sparse(1, false, true,  256, 512, 4096, ns));
+    }
 
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
@@ -10447,6 +10505,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext_sparse(1, true, true, 256, 512, 4096));
     test_cases.emplace_back(new test_flash_attn_ext_sparse(8, true, true));
     test_cases.emplace_back(new test_flash_attn_ext_sparse(8, true, true, 256, 512, 4096));
+    // multi-stream decode spot checks (q=1 x 4 streams, see the dedicated block above)
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(1, true, true,  256, 512, 4096, 4));
+    test_cases.emplace_back(new test_flash_attn_ext_sparse(1, true, false, 256, 512, 4096, 4));
 
     // DeepSeek V4 long-prefill tile: 64 query heads share one aliased K/V
     // head. The masked prefix activates the exact lower-bound skip used by
