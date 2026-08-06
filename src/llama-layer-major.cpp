@@ -808,6 +808,36 @@ int llama_context::decode_layer_major(const llama_batch & batch_inp, uint32_t n_
             sync_us += ggml_time_us() - sync_start_us;
         }
 
+        // diagnostic: per-layer hc checksum to localize nondeterministic drift
+        // (LLAMA_LAYER_MAJOR_DEBUG_SUM=1); the hc state holds this layer's
+        // output right after the boundary sync
+        static const bool debug_sum = []() {
+            const char * value = getenv("LLAMA_LAYER_MAJOR_DEBUG_SUM");
+            return value && atoi(value) > 0;
+        }();
+        if (debug_sum && il + 1 < n_layer) {
+            std::vector<float> state((size_t) n_tokens_all*hc_dim);
+            bool got = false;
+            if (hc_state.is_device_resident()) {
+                const ggml_tensor * t0 = hc_state.device_tile(0);
+                const ggml_tensor * full = t0 != nullptr && t0->view_src != nullptr ? t0->view_src : t0;
+                if (full != nullptr && hc_state.device_backend() != nullptr) {
+                    ggml_backend_tensor_get(full, state.data(), 0, state.size()*sizeof(float));
+                    got = true;
+                }
+            } else if (const float * h = hc_state.host_tile(0)) {
+                memcpy(state.data(), h, state.size()*sizeof(float));
+                got = true;
+            }
+            if (got) {
+                double sum = 0.0;
+                for (const float v : state) {
+                    sum += v;
+                }
+                LLAMA_LOG_INFO("LMDBG layer %d hc sum %.9e\n", il, sum);
+            }
+        }
+
         if (token_offset != n_tokens_all) {
             return rollback(-3);
         }
