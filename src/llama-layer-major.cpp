@@ -9,12 +9,16 @@
 #include "llama-model.h"
 
 #include <algorithm>
+#include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <iterator>
 #include <limits>
 #include <memory>
 #include <new>
+#include <unistd.h>
+#include <vector>
 
 namespace {
 
@@ -27,6 +31,28 @@ ggml_backend_t backend_for_device(
         }
     }
     return nullptr;
+}
+
+// LLAMA_LAYER_MAJOR_DEBUG_SUM >= 3: raw float dump of a tensor (host or
+// device) to /tmp/lmdbg3-<pid>-<tag>.bin, for the layer-1/tile-0 corruption
+// hunt. Synchronizes the tensor's backend via ggml_backend_tensor_get.
+void lmdbg3_dump(const ggml_tensor * t, const char * tag, size_t n_floats) {
+    if (t == nullptr) {
+        LLAMA_LOG_WARN("LMDBG3 %s: null tensor, skipped\n", tag);
+        return;
+    }
+    char path[160];
+    snprintf(path, sizeof(path), "/tmp/lmdbg3-%d-%s.bin", (int) getpid(), tag);
+    std::vector<float> buf(n_floats);
+    ggml_backend_tensor_get(t, buf.data(), 0, n_floats*sizeof(float));
+    FILE * f = fopen(path, "wb");
+    if (f == nullptr) {
+        LLAMA_LOG_WARN("LMDBG3 %s: cannot open %s\n", tag, path);
+        return;
+    }
+    fwrite(buf.data(), sizeof(float), n_floats, f);
+    fclose(f);
+    LLAMA_LOG_INFO("LMDBG3 dumped %s (%zu floats)\n", path, n_floats);
 }
 
 class device_raw_kq_mask_cache {
@@ -594,8 +620,27 @@ int llama_context::decode_layer_major(const llama_batch & batch_inp, uint32_t n_
         return -1;
     }
 
-    if (!dynamic_cast<llama_kv_cache_dsv4 *>(memory.get())) {
+    const auto * kv_dsv4 = dynamic_cast<llama_kv_cache_dsv4 *>(memory.get());
+    if (!kv_dsv4) {
         LLAMA_LOG_INFO("%s: ineligible: KV memory is not llama_kv_cache_dsv4\n", __func__);
+        return -1;
+    }
+
+    // The layer-major walk replays every tile once per layer with the memory
+    // context in replay mode, where apply() skips the KV/compressor state
+    // bookkeeping. With a compact (ring) raw SWA cache (swa_full=false, the
+    // llama-server default) the DSV4 compressor stays active across tiles and
+    // the first tile of every layer past the first reads the previous layer
+    // walk's leftover ring/compressor state, deterministically corrupting
+    // that tile's attention output (garbage generation for some prompts).
+    // The full-size SWA cache keeps compression inert and is bit-exact
+    // against the chunked reference. Decline until the compact-cache replay
+    // semantics are wired; the chunked path handles the ring correctly.
+    const llama_kv_cache_iswa * raw = kv_dsv4->get_raw();
+    if (raw && raw->get_swa() && raw->get_base() &&
+            raw->get_swa()->get_size() < raw->get_base()->get_size()) {
+        LLAMA_LOG_INFO("%s: ineligible: layer-major requires a full-size raw SWA cache (swa cells %u < %u)\n",
+                __func__, raw->get_swa()->get_size(), raw->get_base()->get_size());
         return -1;
     }
 
@@ -722,6 +767,14 @@ int llama_context::decode_layer_major(const llama_batch & batch_inp, uint32_t n_
         pipe_hint.hint(model, backend_ptrs, 0);
     }
 
+    // diagnostic: per-layer hc checksum to localize nondeterministic drift
+    // (LLAMA_LAYER_MAJOR_DEBUG_SUM=1). Level 2 adds per-tile checksums, level
+    // 3 additionally dumps raw floats around the layer-1/tile-0 handoff.
+    static const int debug_sum = []() {
+        const char * value = getenv("LLAMA_LAYER_MAJOR_DEBUG_SUM");
+        return value ? atoi(value) : 0;
+    }();
+
     for (int32_t il = 0; il < n_layer; ++il) {
         ggml_backend_t layer_backend = backend_for_device(backend_ptrs, model.dev_layer(il));
         if (hc_state.is_device_resident() && layer_backend &&
@@ -761,6 +814,11 @@ int llama_context::decode_layer_major(const llama_batch & batch_inp, uint32_t n_
             };
 
             ggml_status status = GGML_STATUS_SUCCESS;
+            if (debug_sum > 2 && il == 1 && tile_index == 0 && hc_state.is_device_resident()) {
+                // point B: hc tile 0 right before layer-1/tile-0 graph build +
+                // input copy + compute; must be identical to point A
+                lmdbg3_dump(hc_state.device_tile(0), "B", (size_t) ubatch.n_tokens*hc_dim);
+            }
             const llm_graph_result * res = process_ubatch(
                     ubatch, LLM_GRAPH_TYPE_DEFAULT, mctx, status, il, il + 1,
                     hc_state.is_device_resident() || raw_kq_mask || profile_enabled ? &graph_input : nullptr);
@@ -778,6 +836,14 @@ int llama_context::decode_layer_major(const llama_batch & batch_inp, uint32_t n_
             if (il == 1 && hc_state.is_device_resident() &&
                     !raw_kq_mask_cache.record_layout(res->get_dsv4_raw_kq_mask(), tile_index)) {
                 LLAMA_LOG_WARN("%s: raw KQ replay cache layout is unavailable\n", __func__);
+            }
+
+            if (debug_sum > 2 && il == 1 && tile_index == 0 && hc_state.is_device_resident()) {
+                // point C: hc tile 0 after layer-1/tile-0 compute but before
+                // store_tile overwrites it; any B->C change is an OOB write.
+                // point H: this tile's h_pre_norm (the store_tile source)
+                lmdbg3_dump(hc_state.device_tile(0), "C", (size_t) ubatch.n_tokens*hc_dim);
+                lmdbg3_dump(res->get_h_pre_norm(),    "H", (size_t) ubatch.n_tokens*hc_dim);
             }
 
             const int64_t store_start_us = profile_enabled ? ggml_time_us() : 0;
@@ -824,12 +890,16 @@ int llama_context::decode_layer_major(const llama_batch & batch_inp, uint32_t n_
 
         // diagnostic: per-layer hc checksum to localize nondeterministic drift
         // (LLAMA_LAYER_MAJOR_DEBUG_SUM=1); the hc state holds this layer's
-        // output right after the boundary sync
-        static const bool debug_sum = []() {
-            const char * value = getenv("LLAMA_LAYER_MAJOR_DEBUG_SUM");
-            return value && atoi(value) > 0;
-        }();
-        if (debug_sum && il + 1 < n_layer) {
+        // output right after the boundary sync. Level 2 additionally prints a
+        // per-tile checksum so a bad ubatch can be isolated. Level 3 dumps raw
+        // floats (see lmdbg3_dump and the B/C/H points inside the tile loop).
+        if (debug_sum > 2 && il == 0 && hc_state.is_device_resident()) {
+            // point A: hc tile 0 right after the layer-0 boundary sync
+            const ggml_tensor * t0 = hc_state.device_tile(0);
+            const size_t tile0_tokens = std::min((size_t) n_ubatch, (size_t) n_tokens_all);
+            lmdbg3_dump(t0, "A", tile0_tokens*hc_dim);
+        }
+        if (debug_sum > 0 && il + 1 < n_layer) {
             std::vector<float> state((size_t) n_tokens_all*hc_dim);
             bool got = false;
             if (hc_state.is_device_resident()) {
@@ -849,6 +919,23 @@ int llama_context::decode_layer_major(const llama_batch & batch_inp, uint32_t n_
                     sum += v;
                 }
                 LLAMA_LOG_INFO("LMDBG layer %d hc sum %.9e\n", il, sum);
+                if (debug_sum > 1) {
+                    for (size_t off = 0, tile = 0; off < n_tokens_all; off += n_ubatch, ++tile) {
+                        const size_t tile_tokens = std::min((size_t) n_ubatch, n_tokens_all - off);
+                        const float * row = state.data() + off*hc_dim;
+                        double tsum = 0.0;
+                        double tmax = 0.0;
+                        int tnan = 0;
+                        for (size_t e = 0; e < tile_tokens*hc_dim; ++e) {
+                            const float v = row[e];
+                            tsum += v;
+                            tmax = std::max(tmax, (double) std::fabs(v));
+                            tnan += v != v;
+                        }
+                        LLAMA_LOG_INFO("LMDBG layer %d tile %zu off %zu nt %zu sum %.9e max %.6e nan %d\n",
+                                il, tile, off, tile_tokens, tsum, tmax, tnan);
+                    }
+                }
             }
         }
 
