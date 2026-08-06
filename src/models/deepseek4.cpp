@@ -253,25 +253,18 @@ static constexpr int64_t DSV4_CSA_RATIO  = 4;
 static constexpr int64_t DSV4_HCA_RATIO  = 128;
 
 // Fused indexed FA avoids the per-token full-width KV concat by passing the
-<<<<<<< HEAD
-// raw and compressed segments to the sparse kernel separately. Mode 1 restores
-// the historical opt-in behavior (decode + prefill), mode 2 enables the q1
-// decode specialization only. Requires F16 KV: the sparse kernels address the
-// full F16 backing through the row map.
+// raw and compressed segments to the sparse kernel separately. Requires F16 KV:
+// the sparse kernels address the full F16 backing through the row map.
+// Modes (LLAMA_DSV4_FUSED_INDEXED_FA):
+//   0 = off (default)
+//   1 = historical opt-in scope: q1 decode + prefill (>= 256 tokens)
+//   2 = q1 decode only
+//   3 = mode 2 + multi-stream decode (one token per stream, opt-in)
+//   4 = mode 1 + multi-stream decode (opt-in)
 // Default is off: at 16K the q1 sparse kernel (ncols2=8 tiles) loses to the
 // dense q1 16/32-head-group MMA (fixed TG64 -12%, TG512 -2%, 2026-08-07 A/B).
 // Re-evaluate the default once the sparse kernel gets wider head groups or at
 // much longer contexts where the row-scan win dominates.
-=======
-// raw and compressed segments to the sparse kernel separately. Requires F16 KV:
-// the sparse kernels address the full F16 backing through the row map.
-// Modes (LLAMA_DSV4_FUSED_INDEXED_FA):
-//   0 = off
-//   1 = historical opt-in scope: q1 decode + prefill (>= 256 tokens)
-//   2 = q1 decode only (default)
-//   3 = mode 2 + multi-stream decode (one token per stream, opt-in)
-//   4 = mode 1 + multi-stream decode (opt-in)
->>>>>>> 9306445f4 (dsv4: opt-in multi-stream (per-stream q1) sparse FA + q8 compact gather multi-stream)
 static int dsv4_fused_indexed_fa_mode() {
     static const int mode = []() {
         const char * value = getenv("LLAMA_DSV4_FUSED_INDEXED_FA");
