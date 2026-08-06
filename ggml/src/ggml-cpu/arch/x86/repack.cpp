@@ -3329,6 +3329,149 @@ void ggml_gemv_iq2_xs_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const 
 #endif
 }
 
+void ggml_gemv_iq2_xxs_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+    const int qk = QK_K;
+    const int nb = n / qk;
+    const int ncols_interleaved = 8;
+
+    assert (n % qk == 0);
+    assert (nc % ncols_interleaved == 0);
+
+    UNUSED(s);
+    UNUSED(bs);
+    UNUSED(vx);
+    UNUSED(vy);
+    UNUSED(nr);
+    UNUSED(nc);
+    UNUSED(nb);
+    UNUSED(ncols_interleaved);
+
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__) && defined(__AVX512VNNI__) && defined(__AVX512VBMI__)
+
+    // One 64-bit lane per column. The 64-byte qs chunk of sub block g holds the 8-byte
+    // record of each column: bytes 0..3 are the four 8-bit grid indices, bytes 4..7 hold
+    // the four 7-bit sign fields (bits 0..27) and the 4-bit sub block scale (bits 28..31).
+    //
+    // Sign handling (shared per group): the 8 sign dwords of the chunk are expanded to
+    // two zmm of 16 dwords each (4 per lane, one per entry), shifted by 0/7/14/21 with
+    // vpsrlvd, and each field byte is turned into the keven sign byte (field | parity
+    // << 7) with one gf2p8affine per vector. Per entry a single vpermt2b then splats the
+    // sign byte of (lane j, entry e) over lane j for the mask test.
+    //
+    // Dot handling: the four entry dots feed vpackssdw pairs + zmm vpdpwssd, so one group
+    // costs 2 instead of 8 widening multiplies.
+
+    const __m512i mff          = _mm512_set1_epi64(0xFF);
+    const __m512i bit_selector = _mm512_set1_epi64(0x8040201008040201);
+    // dword expanders: sign dword of lanes 0..3 / 4..7, duplicated 4x for the field shifts
+    const __m512i dwsel_lo = _mm512_set_epi32(7,7,7,7, 5,5,5,5, 3,3,3,3, 1,1,1,1);
+    const __m512i dwsel_hi = _mm512_set_epi32(15,15,15,15, 13,13,13,13, 11,11,11,11, 9,9,9,9);
+    const __m512i sshift   = _mm512_set_epi32(21,14,7,0, 21,14,7,0, 21,14,7,0, 21,14,7,0);
+#if defined(__GFNI__)
+    // gf2p8affine matrix computing identity on bits 0..6 and parity of bits 0..6 into bit 7
+    const __m512i mpar     = _mm512_set1_epi64(0x010204081020407fULL);
+#else
+    const __m512i m127     = _mm512_set1_epi32(127);
+    const __m512i mone32   = _mm512_set1_epi32(1);
+#endif
+    // per-entry splat: byte p of the result = sign byte of (lane p/8, entry e), which sits
+    // at byte 16*(p/8) + 4*e of the (lo, hi) sign vectors
+    const __m512i splat_base = _mm512_set_epi8(
+        112,112,112,112,112,112,112,112, 96,96,96,96,96,96,96,96, 80,80,80,80,80,80,80,80, 64,64,64,64,64,64,64,64,
+        48,48,48,48,48,48,48,48, 32,32,32,32,32,32,32,32, 16,16,16,16,16,16,16,16, 0,0,0,0,0,0,0,0);
+    const __m512i splat_e[4] = {
+        splat_base,
+        _mm512_add_epi8(splat_base, _mm512_set1_epi8(4)),
+        _mm512_add_epi8(splat_base, _mm512_set1_epi8(8)),
+        _mm512_add_epi8(splat_base, _mm512_set1_epi8(12)),
+    };
+    // int16 scale expander matching the vpackssdw lane interleave: dpwssd element i covers
+    // column 2*(i/4) + i%2, so int16 position q needs scale 2*(q/8) + (q/2)%2
+    const __m512i sc_idx = _mm512_set_epi16(7,7,6,6, 7,7,6,6, 5,5,4,4, 5,5,4,4,
+                                            3,3,2,2, 3,3,2,2, 1,1,0,0, 1,1,0,0);
+    // float scale expander: element i of the accumulator belongs to column 2*(i/4) + i%2
+    const __m512i sc_idx_ps = _mm512_set_epi32(7,6,7,6, 5,4,5,4, 3,2,3,2, 1,0,1,0);
+    // elements holding the first of each column's accumulator pair: column j sits in
+    // elements 4*(j/2) + j%2 and +2
+    const __m512i even_ps  = _mm512_set_epi32(13,13,13,13,13,13,13,13, 13,12,9,8,5,4,1,0);
+
+    const __m256 m0125 = _mm256_set1_ps(0.125f);
+
+    const block_iq2_xxsx8 * b_ptr_start = (const block_iq2_xxsx8 *)vx;
+    const block_q8_K      * a_ptr       = (const block_q8_K *)vy;
+
+    for (int64_t x = 0; x < nc / ncols_interleaved; x++) {
+        const block_iq2_xxsx8 * b_ptr = b_ptr_start + (x * nb);
+
+        __m512 acc_f = _mm512_setzero_ps(); // 16 floats, element i <-> column 2*(i/4) + i%2
+
+        for (int64_t b = 0; b < nb; b++) {
+            const __m512 d_prod = _mm512_permutexvar_ps(sc_idx_ps,
+                _mm512_castps256_ps512(_mm256_mul_ps(GGML_F32Cx8_LOAD(b_ptr[b].d), _mm256_set1_ps(a_ptr[b].d))));
+
+            __m512i iacc = _mm512_setzero_si512();
+
+            for (int g = 0; g < 8; g++) {
+                // sub block g: elements 32*g..32*g+31; lane j of the chunk is column j's
+                // 8-byte record (4 grid index bytes + sign/scale word)
+                const __m512i chunk = _mm512_loadu_si512((const void *) ((const uint8_t *) b_ptr[b].qs + g * 64));
+
+                // keven sign bytes of all 8 lanes x 4 entries: dword 4*(j%4)+e of the
+                // lo/hi vectors = ksigns byte of (lane j, entry e)
+                const __m512i sf_lo = _mm512_srlv_epi32(_mm512_permutexvar_epi32(dwsel_lo, chunk), sshift);
+                const __m512i sf_hi = _mm512_srlv_epi32(_mm512_permutexvar_epi32(dwsel_hi, chunk), sshift);
+#if defined(__GFNI__)
+                const __m512i sb_lo = _mm512_gf2p8affine_epi64_epi8(sf_lo, mpar, 0);
+                const __m512i sb_hi = _mm512_gf2p8affine_epi64_epi8(sf_hi, mpar, 0);
+#else
+                const __m512i sb_lo = _mm512_or_si512(_mm512_and_si512(sf_lo, m127),
+                    _mm512_slli_epi32(_mm512_and_si512(_mm512_popcnt_epi32(_mm512_and_si512(sf_lo, m127)), mone32), 7));
+                const __m512i sb_hi = _mm512_or_si512(_mm512_and_si512(sf_hi, m127),
+                    _mm512_slli_epi32(_mm512_and_si512(_mm512_popcnt_epi32(_mm512_and_si512(sf_hi, m127)), mone32), 7));
+#endif
+
+                // per-column sub block scale: ls = 2*(bits 60..63) + 1, shared by all 4 entries
+                const __m128i sc16 = _mm512_cvtepi64_epi16(_mm512_srli_epi64(chunk, 60));
+                const __m128i ls16 = _mm_add_epi16(_mm_slli_epi16(sc16, 1), _mm_set1_epi16(1));
+                const __m512i scz  = _mm512_permutexvar_epi16(sc_idx, _mm512_castsi128_si512(ls16));
+
+                __m512i dot[4];
+                for (int e = 0; e < 4; e++) {
+                    // col j's grid index byte e -> 8 grid bytes from iq2xxs_grid
+                    const __m512i word = _mm512_and_si512(_mm512_srli_epi64(chunk, 8 * e), mff);
+                    const __m512i q2b  = _mm512_i64gather_epi64(word, (const long long *)iq2xxs_grid, 8);
+
+                    const __m512i sb  = _mm512_permutex2var_epi8(sb_lo, splat_e[e], sb_hi);
+                    const __mmask64 neg = _mm512_test_epi8_mask(sb, bit_selector);
+
+                    const __m512i q8b = _mm512_set1_epi64(
+                        ggml_load_i64_unaligned(a_ptr[b].qs + 32 * g + 8 * e));
+                    const __m512i q8s = _mm512_mask_sub_epi8(q8b, neg, _mm512_setzero_si512(), q8b);
+
+                    dot[e] = _mm512_dpbusd_epi32(_mm512_setzero_si512(), q2b, q8s);
+                }
+                // int32 quarters are bounded by 4*43*127 = 21844 (max iq2xxs_grid byte is
+                // 43), so vpackssdw cannot saturate
+                iacc = _mm512_dpwssd_epi32(iacc, _mm512_packs_epi32(dot[0], dot[1]), scz);
+                iacc = _mm512_dpwssd_epi32(iacc, _mm512_packs_epi32(dot[2], dot[3]), scz);
+            }
+
+            acc_f = _mm512_fmadd_ps(_mm512_cvtepi32_ps(iacc), d_prod, acc_f);
+        }
+
+        // reduce the int32 pairs of each column (elements i and i^2) and store
+        const __m512 pair_sum = _mm512_add_ps(acc_f, _mm512_permute_ps(acc_f, 0x4E));
+        _mm256_storeu_ps(s + (x * ncols_interleaved),
+            _mm256_mul_ps(_mm512_castps512_ps256(_mm512_permutexvar_ps(even_ps, pair_sum)), m0125));
+    }
+
+#else
+
+    ggml_gemv_iq2_xxs_8x8_q8_K_generic(n, s, bs, vx, vy, nr, nc);
+
+#endif
+}
+
 void ggml_gemv_iq3_xxs_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
     const int qk = QK_K;
     const int nb = n / qk;
@@ -9243,6 +9386,150 @@ void ggml_gemm_iq2_xs_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const 
 #else
 
     ggml_gemm_iq2_xs_8x8_q8_K_generic(n, s, bs, vx, vy, nr, nc);
+
+#endif
+}
+
+void ggml_gemm_iq2_xxs_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+    const int qk = QK_K;
+    const int nb = n / qk;
+    const int ncols_interleaved = 8;
+
+    assert (n % qk == 0);
+    assert (nr % 4 == 0);
+    assert (nc % ncols_interleaved == 0);
+
+    UNUSED(s);
+    UNUSED(bs);
+    UNUSED(vx);
+    UNUSED(vy);
+    UNUSED(nr);
+    UNUSED(nc);
+    UNUSED(nb);
+    UNUSED(ncols_interleaved);
+
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__) && defined(__AVX512VNNI__) && defined(__AVX512VBMI__)
+
+    // Same one-lane-per-column scheme as the iq2_xxs gemv above; the chunk load, gathers,
+    // sign bytes and scale vector are shared across the 4 activation rows of the tile
+    const __m512i mff          = _mm512_set1_epi64(0xFF);
+    const __m512i bit_selector = _mm512_set1_epi64(0x8040201008040201);
+    const __m512i dwsel_lo = _mm512_set_epi32(7,7,7,7, 5,5,5,5, 3,3,3,3, 1,1,1,1);
+    const __m512i dwsel_hi = _mm512_set_epi32(15,15,15,15, 13,13,13,13, 11,11,11,11, 9,9,9,9);
+    const __m512i sshift   = _mm512_set_epi32(21,14,7,0, 21,14,7,0, 21,14,7,0, 21,14,7,0);
+#if defined(__GFNI__)
+    const __m512i mpar     = _mm512_set1_epi64(0x010204081020407fULL);
+#else
+    const __m512i m127     = _mm512_set1_epi32(127);
+    const __m512i mone32   = _mm512_set1_epi32(1);
+#endif
+    const __m512i splat_base = _mm512_set_epi8(
+        112,112,112,112,112,112,112,112, 96,96,96,96,96,96,96,96, 80,80,80,80,80,80,80,80, 64,64,64,64,64,64,64,64,
+        48,48,48,48,48,48,48,48, 32,32,32,32,32,32,32,32, 16,16,16,16,16,16,16,16, 0,0,0,0,0,0,0,0);
+    const __m512i splat_e[4] = {
+        splat_base,
+        _mm512_add_epi8(splat_base, _mm512_set1_epi8(4)),
+        _mm512_add_epi8(splat_base, _mm512_set1_epi8(8)),
+        _mm512_add_epi8(splat_base, _mm512_set1_epi8(12)),
+    };
+    const __m512i sc_idx = _mm512_set_epi16(7,7,6,6, 7,7,6,6, 5,5,4,4, 5,5,4,4,
+                                            3,3,2,2, 3,3,2,2, 1,1,0,0, 1,1,0,0);
+    const __m512i sc_idx_ps = _mm512_set_epi32(7,6,7,6, 5,4,5,4, 3,2,3,2, 1,0,1,0);
+    const __m512i even_ps   = _mm512_set_epi32(13,13,13,13,13,13,13,13, 13,12,9,8,5,4,1,0);
+
+    const __m256 m0125 = _mm256_set1_ps(0.125f);
+
+    const block_iq2_xxsx8 * b_ptr_start = (const block_iq2_xxsx8 *)vx;
+    const block_q8_Kx4    * a_ptr_start = (const block_q8_Kx4 *)vy;
+
+    for (int64_t y = 0; y < nr / 4; y++) {
+        const block_q8_Kx4 * a_ptr = a_ptr_start + (y * nb);
+
+        for (int64_t x = 0; x < nc / ncols_interleaved; x++) {
+            const block_iq2_xxsx8 * b_ptr = b_ptr_start + (x * nb);
+
+            __m512 acc_f[4];
+            for (int m = 0; m < 4; m++) {
+                acc_f[m] = _mm512_setzero_ps();
+            }
+
+            for (int64_t b = 0; b < nb; b++) {
+                const __m256 col_scale_f32 = GGML_F32Cx8_LOAD(b_ptr[b].d);
+
+                __m512i iacc_rows[4];
+                for (int m = 0; m < 4; m++) {
+                    iacc_rows[m] = _mm512_setzero_si512();
+                }
+
+                for (int g = 0; g < 8; g++) {
+                    // sub block g (shared across rows): see the iq2_xxs gemv for the layout
+                    const __m512i chunk = _mm512_loadu_si512((const void *) ((const uint8_t *) b_ptr[b].qs + g * 64));
+
+                    // keven sign bytes of all 8 lanes x 4 entries
+                    const __m512i sf_lo = _mm512_srlv_epi32(_mm512_permutexvar_epi32(dwsel_lo, chunk), sshift);
+                    const __m512i sf_hi = _mm512_srlv_epi32(_mm512_permutexvar_epi32(dwsel_hi, chunk), sshift);
+#if defined(__GFNI__)
+                    const __m512i sb_lo = _mm512_gf2p8affine_epi64_epi8(sf_lo, mpar, 0);
+                    const __m512i sb_hi = _mm512_gf2p8affine_epi64_epi8(sf_hi, mpar, 0);
+#else
+                    const __m512i sb_lo = _mm512_or_si512(_mm512_and_si512(sf_lo, m127),
+                        _mm512_slli_epi32(_mm512_and_si512(_mm512_popcnt_epi32(_mm512_and_si512(sf_lo, m127)), mone32), 7));
+                    const __m512i sb_hi = _mm512_or_si512(_mm512_and_si512(sf_hi, m127),
+                        _mm512_slli_epi32(_mm512_and_si512(_mm512_popcnt_epi32(_mm512_and_si512(sf_hi, m127)), mone32), 7));
+#endif
+
+                    // per-column sub block scale: ls = 2*(bits 60..63) + 1
+                    const __m128i sc16 = _mm512_cvtepi64_epi16(_mm512_srli_epi64(chunk, 60));
+                    const __m128i ls16 = _mm_add_epi16(_mm_slli_epi16(sc16, 1), _mm_set1_epi16(1));
+                    const __m512i scz  = _mm512_permutexvar_epi16(sc_idx, _mm512_castsi128_si512(ls16));
+
+                    __m512i   q2b[4];
+                    __mmask64 neg[4];
+                    for (int e = 0; e < 4; e++) {
+                        const __m512i word = _mm512_and_si512(_mm512_srli_epi64(chunk, 8 * e), mff);
+                        q2b[e] = _mm512_i64gather_epi64(word, (const long long *)iq2xxs_grid, 8);
+
+                        const __m512i sb = _mm512_permutex2var_epi8(sb_lo, splat_e[e], sb_hi);
+                        neg[e] = _mm512_test_epi8_mask(sb, bit_selector);
+                    }
+
+                    for (int m = 0; m < 4; m++) {
+                        // entry e of row m: qs + g*128 + (e/2)*64 + (e%2)*32 + m*8
+                        const int8_t * q8 = a_ptr[b].qs + g * 128 + m * 8;
+
+                        __m512i dot[4];
+                        for (int e = 0; e < 4; e++) {
+                            const __m512i q8b = _mm512_set1_epi64(
+                                ggml_load_i64_unaligned(q8 + (e / 2) * 64 + (e % 2) * 32));
+                            const __m512i q8s = _mm512_mask_sub_epi8(q8b, neg[e], _mm512_setzero_si512(), q8b);
+                            dot[e] = _mm512_dpbusd_epi32(_mm512_setzero_si512(), q2b[e], q8s);
+                        }
+                        // int32 quarters are bounded by 4*43*127 = 21844; vpackssdw is safe
+                        iacc_rows[m] = _mm512_dpwssd_epi32(iacc_rows[m], _mm512_packs_epi32(dot[0], dot[1]), scz);
+                        iacc_rows[m] = _mm512_dpwssd_epi32(iacc_rows[m], _mm512_packs_epi32(dot[2], dot[3]), scz);
+                    }
+                }
+
+                for (int m = 0; m < 4; m++) {
+                    const __m512 d_prod = _mm512_permutexvar_ps(sc_idx_ps,
+                        _mm512_castps256_ps512(_mm256_mul_ps(col_scale_f32, _mm256_set1_ps(a_ptr[b].d[m]))));
+                    acc_f[m] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(iacc_rows[m]), d_prod, acc_f[m]);
+                }
+            }
+
+            for (int m = 0; m < 4; m++) {
+                const __m512 pair_sum = _mm512_add_ps(acc_f[m], _mm512_permute_ps(acc_f[m], 0x4E));
+                _mm256_storeu_ps(s + ((y * 4 + m) * bs + x * ncols_interleaved),
+                    _mm256_mul_ps(_mm512_castps512_ps256(_mm512_permutexvar_ps(even_ps, pair_sum)), m0125));
+            }
+        }
+    }
+
+    return;
+
+#else
+
+    ggml_gemm_iq2_xxs_8x8_q8_K_generic(n, s, bs, vx, vy, nr, nc);
 
 #endif
 }
