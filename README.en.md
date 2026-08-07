@@ -19,7 +19,8 @@ Test platform: dual Xeon 8360Y (Ice Lake, 152 threads, 251G RAM) + 2× RTX 3090 
 
 | Feature | When to use | Impact |
 |---|---|---|
-| **AVX512/VNNI/VBMI 8×8 repack kernels** (Q2_K–Q6_K, Q8_0, MXFP4, IQ1_S/IQ1_M/IQ2_XS/IQ3_XXS) | All CPU compute; biggest win on long-prompt batches | prefill gemm up to **4.9×** (micro-bench); GLM-5.2 end-to-end **PP 4.1×** |
+| **AVX512/VNNI/VBMI 8×8 repack kernels** (Q2_K–Q6_K, Q8_0, MXFP4, IQ1_S/IQ1_M/IQ2_XXS) | All CPU compute; biggest win on long-prompt batches | prefill gemm up to **4.9×** (micro-bench); GLM-5.2 end-to-end **PP 4.1×** |
+| **IQ2_XXS AVX512 repack gemv/gemm kernel** (x8 layout) | CPU inference of IQ2_XXS-weight models | gemv micro-bench **17×**; full-model A/B still flat (bottleneck is the uncovered expert mul_mat_id) — model-level gains pending extension |
 | **NUMA mirror** (`--numa mirror`) | Dual-socket servers with RAM to spare | Best TG (**+9%** vs upstream), zero cross-socket UPI traffic |
 | **NUMA row-window EP** (`GGML_NUMA_EP=1`) | RAM-constrained, loading oversized models | **Half the expert memory**, TG matches mirror, single-writer dst rows with zero merge |
 | **Fused ops** (hyper-connection HC, MoE router, RMS_NORM absorption, DSA Lightning Indexer) | DSV4 / GLM everywhere | Eliminates decomposed paths and intermediate activation traffic |
@@ -33,7 +34,10 @@ Test platform: dual Xeon 8360Y (Ice Lake, 152 threads, 251G RAM) + 2× RTX 3090 
 | **Streaming MoE prefill + 3-slot dual-GPU prefetch** | Hybrid inference with expert weights in host RAM | Each layer's weights uploaded once, reused across tiles |
 | **True dual-GPU same-layer expert-axis EP** (`GGML_CUDA_MOE_PP_EP`, opt-in) | Dual-GPU prefill | 2K PP **+63%** (277→452 tok/s), bit-identical output |
 | **Batched top-k** (`GGML_CUDA_BATCHED_TOPK`) | DSA sparse-attention models, long context | top-k kernel **21.6×**, e2e PP +8.2% |
-| **q1 32-head FA / raw-SWA decode ring** | Long-context decode | fixed TG64 **+17%** / TG512 **+7.8%** (ring opt-in, in validation) |
+| **q1 32-head FA + raw-SWA decode ring** (ring on by default; `LLAMA_DSV4_COMPACT_DECODE_SWA=0` to disable) | Long-context decode | q1 decode graph width decoupled from prompt length: fixed TG64 8.89→**12.09** (+33~36%), TG512 +4~8%; automatic fallback for multi-slot |
+| **q8 compact sparse FA** (on by default, q8_0 KV) | Long-context decode with q8 KV | q1 decode materializes only top-k selected rows: TG64 9.75→**10.69** (+10%) — fastest q1 decode path (beats f16 dense); f16 fused sparse stays opt-in (16K measured -12%) |
+| **Multi-stream (small-q) sparse FA** (`LLAMA_DSV4_FUSED_INDEXED_FA=3/4`, `LLAMA_DSV4_Q8_SPARSE_FA=2`, opt-in) | Multi-slot concurrent decode | Correctness verified three-way byte-identical; parity at ≤16K (weight-bandwidth bound), payoff targeted at 256K+ context |
+| **GPU streaming prefill** (plan A, server integration) | Long prompts in llama-server | Full-tile path PP 63→**127.6 tok/s** (2×); falls back to chunked via eligibility gate under compact ring SWA cache, `--swa-full` to enable |
 | **GPU expert offload** (`-ot blk.N.ffn_*_exps=CUDA0/1`) | Spare VRAM | ~+1% TG per offloaded layer |
 
 ### Cross-machine distributed EP (`tools/epd/`)
@@ -48,6 +52,14 @@ Test platform: dual Xeon 8360Y (Ice Lake, 152 threads, 251G RAM) + 2× RTX 3090 
 ### Model support
 
 DeepSeek-V4 / DSV4-Flash (incl. native MXFP4), GLM-5.2 (DSA), MiniMax-M3; plus a byte-level GGUF repair toolchain (quant-block corruption scan + patch — fixed 138 corrupted blocks in the official GLM-5.2 file that caused garbled output).
+
+## Latest progress (2026-08-06/07)
+
+- **raw-SWA decode ring on by default** (branch fa-decode-fix): q1 decode graph width decoupled from prompt length — fixed TG64 8.894→11.837/12.085 tok/s (+33~36%), TG512 +4~8%; automatic fallback to full-width semantics in multi-slot scenarios.
+- **q8 compact sparse FA on by default**: with q8_0 KV, q1 decode materializes only top-k selected rows — TG64 9.75→10.69 (+10%), TG512 +1.3%, now the fastest q1 decode path (beats f16 dense); f16 fused sparse stays opt-in (16K measured -12%, to be re-evaluated at longer context).
+- **Multi-stream (small-q) sparse FA** (opt-in, `LLAMA_DSV4_FUSED_INDEXED_FA=3/4`, `LLAMA_DSV4_Q8_SPARSE_FA=2`): sparse extension for multi-slot concurrent decode, verified three-way byte-identical; performance parity at ≤16K (weight-bandwidth bound), payoff targeted at 256K+ context.
+- **GPU streaming prefill** (plan A, server integration): full-tile path PP 63→127.6 tok/s (2×) on long prompts; automatic fallback to chunked via an eligibility gate under compact ring SWA cache, `--swa-full` to enable; fingerprints bit-exact across all four test groups.
+- **IQ2_XXS AVX512 kernel**: gemv micro-bench **17×**; full-model A/B flat (3.78→3.71, bottleneck is the uncovered expert mul_mat_id) — a micro-benchmark win with model-level extension still pending.
 
 ## Benchmarks
 
@@ -99,9 +111,15 @@ The native MXFP4 build (155GB; 137GiB experts as a single CPU_REPACK copy on dua
 
 ![16K TG improvements](docs/benchmarks/longctx_tg_improvements.png)
 
-Long-context TG degradation was root-caused to the physical dense scan of GPU attention/KV and is being fixed item by item. 16K GPU-side breakdown (Nsight):
+Long-context TG degradation was root-caused to the physical dense scan of GPU attention/KV and is being fixed item by item (the raw-SWA ring went default-on on 08-06 — see next section). 16K GPU-side breakdown (Nsight):
 
 ![16K hotspot breakdown](docs/benchmarks/longctx_hotspots.png)
+
+### FA decode structural fixes: TG64 progression (2026-08-06/07)
+
+![FA decode TG64 progression / 累积演进](docs/benchmarks/fa_decode_tg64_progression.png)
+
+Left: F16 KV — the default-on raw-SWA decode ring lifts fixed TG64 from 8.894 to 12.085 tok/s (+36%), with automatic multi-slot fallback. Right: q8_0 KV — compact sparse FA materializes only top-k selected rows, 9.75→10.69 (+9.6%), overtaking f16 dense (9.66) as the fastest q1 decode path. Multi-stream sparse FA (opt-in) is at parity up to 16K; its payoff is targeted at 256K+ context.
 
 ### Two-machine expert-parallel (GLM-5.2, 100G RoCEv2 direct link)
 

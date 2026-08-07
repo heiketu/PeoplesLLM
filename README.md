@@ -19,7 +19,8 @@ llama.cpp 特化分支，面向双路/多路 CPU 服务器 + 消费级 GPU：CPU
 
 | 特性 | 使用场景 | 性能影响 |
 |---|---|---|
-| **AVX512/VNNI/VBMI 8×8 repack 内核**（Q2_K~Q6_K、Q8_0、MXFP4、IQ1_S/IQ1_M/IQ2_XS/IQ3_XXS 全格式） | 所有 CPU 计算；长 prompt 批量收益最大 | prefill gemm 微基准最高 **4.9×**；GLM-5.2 端到端 **PP 4.1×** |
+| **AVX512/VNNI/VBMI 8×8 repack 内核**（Q2_K~Q6_K、Q8_0、MXFP4、IQ1_S/IQ1_M/IQ2_XXS 全格式） | 所有 CPU 计算；长 prompt 批量收益最大 | prefill gemm 微基准最高 **4.9×**；GLM-5.2 端到端 **PP 4.1×** |
+| **IQ2_XXS AVX512 repack gemv/gemm 内核**（x8 布局） | IQ2_XXS 权重模型 CPU 推理 | gemv 微基准 **17×**；全模型 A/B 暂持平（瓶颈在专家 mul_mat_id 未覆盖），模型级收益待扩展 |
 | **NUMA 镜像 mirror**（`--numa mirror`） | 双路服务器、内存充裕 | TG 最优（vs 主线 **+9%**），跨插槽 UPI 流量归零 |
 | **NUMA 行窗 EP**（`GGML_NUMA_EP=1`） | 内存受限、超大模型装载 | 专家权重**内存减半**，TG 追平 mirror，dst 行单写者零归并 |
 | **融合算子**（超连接 HC、MoE router、RMS_NORM 吸收、DSA 闪电索引器） | DSV4 / GLM 全场景 | 消除分解路径与中间激活读写，PP 固定开销显著降低 |
@@ -33,7 +34,10 @@ llama.cpp 特化分支，面向双路/多路 CPU 服务器 + 消费级 GPU：CPU
 | **MoE 流式 prefill + 3-slot 双卡预取** | 专家权重在 host 内存的混合推理 | 每层权重只上传一次，跨 tile 复用 |
 | **真双卡同层 expert-axis EP**（`GGML_CUDA_MOE_PP_EP`，opt-in） | 双 GPU prefill | 2K PP **+63%**（277→452 tok/s），输出逐位一致 |
 | **batched top-k**（`GGML_CUDA_BATCHED_TOPK`） | DSA 稀疏注意力模型长上下文 | top-k 内核 **21.6×**，e2e PP +8.2% |
-| **q1 32-head FA / raw-SWA decode ring** | 长上下文 decode | fixed TG64 **+17%** / TG512 **+7.8%**（ring 为 opt-in 验收中） |
+| **q1 32-head FA + raw-SWA decode ring**（ring 默认开，`LLAMA_DSV4_COMPACT_DECODE_SWA=0` 可关） | 长上下文 decode | q1 decode 图宽与 prompt 长度解耦，fixed TG64 8.89→**12.09**（+33~36%）、TG512 +4~8%；多 slot 自动回退 |
+| **q8 compact 稀疏 FA**（默认开，q8_0 KV） | q8 KV 长上下文 decode | q1 decode 只物化 top-k 选中行，TG64 9.75→**10.69**（+10%），最快 q1 decode 路径（超 f16 dense）；f16 fused sparse 保持 opt-in（16K 实测 -12%） |
+| **多流（小 q）稀疏 FA**（`LLAMA_DSV4_FUSED_INDEXED_FA=3/4`、`LLAMA_DSV4_Q8_SPARSE_FA=2`，opt-in） | 多 slot 并发 decode | 正确性三方 byte-identical；≤16K 持平（权重带宽主导），收益主场 256K+ 长上下文 |
+| **GPU 流式 prefill**（方案A，server 集成） | server 长 prompt | 整 tile 路径 PP 63→**127.6 tok/s**（2×）；紧凑环形 SWA 缓存下按资格门回落 chunked，`--swa-full` 启用 |
 | **GPU 专家卸载**（`-ot blk.N.ffn_*_exps=CUDA0/1`） | 显存富余 | 每卸载一层 TG 约 +1% |
 
 ### 跨机分布式 EP（`tools/epd/`）
@@ -48,6 +52,14 @@ llama.cpp 特化分支，面向双路/多路 CPU 服务器 + 消费级 GPU：CPU
 ### 模型支持
 
 DeepSeek-V4 / DSV4-Flash（含原生 MXFP4）、GLM-5.2（DSA）、MiniMax-M3；GGUF 字节级修复工具链（量化块腐化扫描+补丁，修复过 GLM-5.2 官方文件 138 个腐化块导致的乱码）。
+
+## 最新进展（2026-08-06/07）
+
+- **raw-SWA decode ring 默认启用**（分支 fa-decode-fix）：q1 decode 图宽与 prompt 长度解耦，fixed TG64 8.894→11.837/12.085 tok/s（+33~36%）、TG512 +4~8%；多 slot 场景自动回退全宽语义。
+- **q8 compact 稀疏 FA 默认启用**：q8_0 KV 下 q1 decode 只物化 top-k 选中行，TG64 9.75→10.69（+10%）、TG512 +1.3%，成为最快 q1 decode 路径（超 f16 dense）；f16 fused sparse 保持 opt-in（16K 实测 -12%，长上下文再评估）。
+- **多流（小 q）稀疏 FA**（opt-in，`LLAMA_DSV4_FUSED_INDEXED_FA=3/4`、`LLAMA_DSV4_Q8_SPARSE_FA=2`）：多 slot 并发 decode 的稀疏扩展，正确性三方 byte-identical 验证；≤16K 性能持平（权重带宽主导），收益主场在 256K+ 长上下文。
+- **GPU 流式 prefill（方案A，server 集成）**：长 prompt 整 tile 路径 PP 63→127.6 tok/s（2×）；紧凑环形 SWA 缓存下按资格门自动回落 chunked，`--swa-full` 可启用；指纹四组逐位命中。
+- **IQ2_XXS AVX512 kernel**：gemv 微基准 **17×**；全模型 A/B 持平（3.78→3.71，瓶颈在专家 mul_mat_id 未覆盖）——微基准提升、模型级收益待扩展。
 
 ## 性能实测
 
@@ -99,9 +111,15 @@ llama-server 8 槽并发压测（每槽 512 tok）：**EP（行窗）配置全�
 
 ![16K TG 改进](docs/benchmarks/longctx_tg_improvements.png)
 
-长上下文 TG 衰减根因已定位为 GPU attention/KV 的物理 dense 扫描，逐项修复中。16K GPU 侧时间分解（Nsight）：
+长上下文 TG 衰减根因已定位为 GPU attention/KV 的物理 dense 扫描，逐项修复（raw-SWA ring 已于 08-06 默认化，见下节）。16K GPU 侧时间分解（Nsight）：
 
 ![16K 热点分解](docs/benchmarks/longctx_hotspots.png)
+
+### FA decode 结构性修复：TG64 累积演进（2026-08-06/07）
+
+![FA decode TG64 累积演进 / progression](docs/benchmarks/fa_decode_tg64_progression.png)
+
+左：f16 KV，raw-SWA decode ring 默认化把 fixed TG64 从 8.894 推到 12.085 tok/s（+36%），多 slot 自动回退。右：q8_0 KV，compact 稀疏 FA 只物化 top-k 选中行，9.75→10.69（+9.6%），超越 f16 dense（9.66）成为最快 q1 decode 路径。多流稀疏 FA（opt-in）≤16K 持平，收益主场在 256K+ 长上下文。
 
 ### 双机 expert-parallel（GLM-5.2，100G RoCEv2 直连）
 
