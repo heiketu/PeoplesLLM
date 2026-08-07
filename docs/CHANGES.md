@@ -32,6 +32,7 @@
 - 效果：gemm（PP 批量）单线程大形状 nr≥16 实测 **2.6~4.9×**（Q4_K 4.87、Q6_K 4.85、Q5_K 4.70、Q8_0 3.76、Q4_0 3.67、IQ1_M 3.81、IQ1_S 3.67、MXFP4 3.53、Q3_K 3.02、Q2_K 1.13）；72 线程满核 1.4~3.2×；端到端纯 CPU PP +17.7%/TG -1.8%，GPU 卸载下 <1%（完整 300 格基准表与端到端 A/B 见 [README](../README.md)）；gemv（TG 单 token）受内存带宽封顶 ≈1×（物理上限，非内核问题）
 - 路由：Q2_K/Q3_K/Q5_K/IQ1_S/IQ1_M/IQ2_XXS 的 4 行尾块全程向量化，`gemm_min_nrows=4`；其余格式 min_nrows=16（Q4_K/Q6_K 尾块为标量实现，小批刻意走 gemv）
 - 工具：`llama-bench` 补 `--no-repack` 开关（映射模型加载 `use_extra_bufts=false`，主线 llama-bench 无此参数），用于 repack 开/关 A/B 对比
+- **repack 全模型净收益格式依赖（2026-08-07 实测，dsv4 Flash 284B、-ngl 99 -ncmoe 99 EP、q8 KV、72t）**：IQ2_XXS 专家模型（生产 mxfp4 版）repack 开 pp2048=212.4/tg256=20.5，关 168.6/17.5（**关 repack PP −21%/TG −15%，生产必须开**）；Q2_K 模型相反，开 164.1/23.2、关 243.8/23.5（**开 repack PP −33%，Q2_K 应加 --no-repack**）。根因：IQ2_XXS 有本分支 AVX512 repack 内核（快），Q2_K repack gemm 仍是 maddubs 老路径（慢，512 条待 dpbusd 化）
 - generic 回退路径全格式可用（非 AVX512 机器）
 - **MXFP4/NVFP4 单行 vec_dot VNNI 化（本分支新增）**：`ggml_vec_dot_mxfp4_q8_0`/`ggml_vec_dot_nvfp4_q8_0` 的 AVX2 点积链 maddubs+madd 改为 `_mm256_dpbusd_epi32`（VNNI 编译期分支，非 VNNI 目标保留原链）；与旧实现逐位一致（整数点积数学等价），n=7168 单核 vec_dot 各 −7%
 
