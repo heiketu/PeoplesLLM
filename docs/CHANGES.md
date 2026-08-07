@@ -33,6 +33,7 @@
 - 路由：Q2_K/Q3_K/Q5_K/IQ1_S/IQ1_M/IQ2_XXS 的 4 行尾块全程向量化，`gemm_min_nrows=4`；其余格式 min_nrows=16（Q4_K/Q6_K 尾块为标量实现，小批刻意走 gemv）
 - 工具：`llama-bench` 补 `--no-repack` 开关（映射模型加载 `use_extra_bufts=false`，主线 llama-bench 无此参数），用于 repack 开/关 A/B 对比
 - generic 回退路径全格式可用（非 AVX512 机器）
+- **MXFP4/NVFP4 单行 vec_dot VNNI 化（本分支新增）**：`ggml_vec_dot_mxfp4_q8_0`/`ggml_vec_dot_nvfp4_q8_0` 的 AVX2 点积链 maddubs+madd 改为 `_mm256_dpbusd_epi32`（VNNI 编译期分支，非 VNNI 目标保留原链）；与旧实现逐位一致（整数点积数学等价），n=7168 单核 vec_dot 各 −7%
 
 ### 2. 图级融合
 - **RMS_NORM(+权重乘) 吸收进 mul_mat**：norm 结果直接物化进矩阵乘输入，省一次全量激活读写
