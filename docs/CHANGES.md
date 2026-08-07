@@ -33,6 +33,7 @@
 - 路由：Q2_K/Q3_K/Q5_K/IQ1_S/IQ1_M/IQ2_XXS 的 4 行尾块全程向量化，`gemm_min_nrows=4`；其余格式 min_nrows=16（Q4_K/Q6_K 尾块为标量实现，小批刻意走 gemv）
 - 工具：`llama-bench` 补 `--no-repack` 开关（映射模型加载 `use_extra_bufts=false`，主线 llama-bench 无此参数），用于 repack 开/关 A/B 对比
 - **repack 全模型净收益格式依赖（2026-08-07 实测，dsv4 Flash 284B、-ngl 99 -ncmoe 99 EP、q8 KV、72t）**：IQ2_XXS 专家模型（生产 mxfp4 版）repack 开 pp2048=212.4/tg256=20.5，关 168.6/17.5（**关 repack PP −21%/TG −15%，生产必须开**）；Q2_K 模型相反，开 164.1/23.2、关 243.8/23.5（**开 repack PP −33%，Q2_K 应加 --no-repack**）。根因：IQ2_XXS 有本分支 AVX512 repack 内核（快），Q2_K repack gemm 仍是 maddubs 老路径（慢，512 条待 dpbusd 化）
+- **Q2_K repack gemm VNNI 化（本分支新增，2026-08-07）**：`ggml_gemm_q2_K_8x8_q8_K` 全部四段累加链（16r×16c / 4r×16c / 16r×8c / 4r×8c，共 512 条 maddubs）改为 `_mm512_dpbusd_epi32`/`_mm256_dpbusd_epi32`（`_mm256_dpbusd_avx_epi32` for AVX-VNNI），scale 乘法 madd_epi16 改 mullo_epi32（相邻 i16 scale lane 恒相等，数学等价）；非 VNNI 目标编译期保留原 maddubs 链。与旧实现逐位一致（test-q2k-vnni dump/check，413856 值 0 mismatch，四段全覆盖，1T/32T 结果相同）。gemm 大形状 nr≥16 微基准（min-of-3）：单线程 repack −22~−29%（k=7168 m=4096 tok=16：10.49→7.43ms；tok=64：40.44→30.37ms），32 线程 −11~−23%；repack vs generic 由 ≈1.0× 提升到 1T 1.38~1.48×——上面“Q2_K 开 repack 反拖 PP 33%”的结论需重测，可能已不再成立
 - generic 回退路径全格式可用（非 AVX512 机器）
 - **MXFP4/NVFP4 单行 vec_dot VNNI 化（本分支新增）**：`ggml_vec_dot_mxfp4_q8_0`/`ggml_vec_dot_nvfp4_q8_0` 的 AVX2 点积链 maddubs+madd 改为 `_mm256_dpbusd_epi32`（VNNI 编译期分支，非 VNNI 目标保留原链）；与旧实现逐位一致（整数点积数学等价），n=7168 单核 vec_dot 各 −7%
 

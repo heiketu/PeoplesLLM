@@ -5838,6 +5838,203 @@ void ggml_gemm_q2_K_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
                         const __m512i lhs_mat_23_71_sp2 = _mm512_shuffle_epi32(lhs_mat_23_71, (_MM_PERM_ENUM)245); //A72(12-15) A72(12-15) A73(12-15) A73(12-15) A72(12-15) A72(12-15) A73(12-15) A73(12-15) A72(12-15) A72(12-15) A73(12-15) A73(12-15) A72(12-15) A72(12-15) A73(12-15) A73(12-15)
 
                         // The values arranged in shuffle patterns are operated with dot product operation within 32 bit lane i.e corresponding bytes and multiplied and added into 32 bit integers within 32 bit lane
+#if defined(__AVX512VNNI__)
+                        const __m512i scale32_014589CD_0 = _mm512_and_si512(scale_014589CD_0, _mm512_set1_epi32(0xFFFF));
+                        const __m512i scale32_2367ABEF_0 = _mm512_and_si512(scale_2367ABEF_0, _mm512_set1_epi32(0xFFFF));
+                        const __m512i scale32_014589CD_1 = _mm512_and_si512(scale_014589CD_1, _mm512_set1_epi32(0xFFFF));
+                        const __m512i scale32_2367ABEF_1 = _mm512_and_si512(scale_2367ABEF_1, _mm512_set1_epi32(0xFFFF));
+                        const __m512i scale32_014589CD_2 = _mm512_and_si512(scale_014589CD_2, _mm512_set1_epi32(0xFFFF));
+                        const __m512i scale32_2367ABEF_2 = _mm512_and_si512(scale_2367ABEF_2, _mm512_set1_epi32(0xFFFF));
+                        const __m512i scale32_014589CD_3 = _mm512_and_si512(scale_014589CD_3, _mm512_set1_epi32(0xFFFF));
+                        const __m512i scale32_2367ABEF_3 = _mm512_and_si512(scale_2367ABEF_3, _mm512_set1_epi32(0xFFFF));
+                        const __m512i scale32_014589CD_4 = _mm512_and_si512(scale_014589CD_4, _mm512_set1_epi32(0xFFFF));
+                        const __m512i scale32_2367ABEF_4 = _mm512_and_si512(scale_2367ABEF_4, _mm512_set1_epi32(0xFFFF));
+                        const __m512i scale32_014589CD_5 = _mm512_and_si512(scale_014589CD_5, _mm512_set1_epi32(0xFFFF));
+                        const __m512i scale32_2367ABEF_5 = _mm512_and_si512(scale_2367ABEF_5, _mm512_set1_epi32(0xFFFF));
+                        const __m512i scale32_014589CD_6 = _mm512_and_si512(scale_014589CD_6, _mm512_set1_epi32(0xFFFF));
+                        const __m512i scale32_2367ABEF_6 = _mm512_and_si512(scale_2367ABEF_6, _mm512_set1_epi32(0xFFFF));
+                        const __m512i scale32_014589CD_7 = _mm512_and_si512(scale_014589CD_7, _mm512_set1_epi32(0xFFFF));
+                        const __m512i scale32_2367ABEF_7 = _mm512_and_si512(scale_2367ABEF_7, _mm512_set1_epi32(0xFFFF));
+
+                        __m512i iacc_mat_00_0_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_00_sp1, lhs_mat_01_00_sp1), rhs_mat_014589CD_01_sp1, lhs_mat_01_01_sp1);
+                        __m512i iacc_mat_01_0_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_00_sp1, lhs_mat_01_00_sp1), rhs_mat_2367ABEF_01_sp1, lhs_mat_01_01_sp1);
+
+                        __m512i iacc_mat_10_0_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_00_sp1, lhs_mat_23_00_sp1), rhs_mat_014589CD_01_sp1, lhs_mat_23_01_sp1);
+                        __m512i iacc_mat_11_0_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_00_sp1, lhs_mat_23_00_sp1), rhs_mat_2367ABEF_01_sp1, lhs_mat_23_01_sp1);
+
+                        __m512i iacc_mat_00_1_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_10_sp1, lhs_mat_01_10_sp1), rhs_mat_014589CD_11_sp1, lhs_mat_01_11_sp1);
+                        __m512i iacc_mat_01_1_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_10_sp1, lhs_mat_01_10_sp1), rhs_mat_2367ABEF_11_sp1, lhs_mat_01_11_sp1);
+
+                        __m512i iacc_mat_10_1_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_10_sp1, lhs_mat_23_10_sp1), rhs_mat_014589CD_11_sp1, lhs_mat_23_11_sp1);
+                        __m512i iacc_mat_11_1_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_10_sp1, lhs_mat_23_10_sp1), rhs_mat_2367ABEF_11_sp1, lhs_mat_23_11_sp1);
+
+                        __m512i iacc_mat_00_2_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_20_sp1, lhs_mat_01_20_sp1), rhs_mat_014589CD_21_sp1, lhs_mat_01_21_sp1);
+                        __m512i iacc_mat_01_2_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_20_sp1, lhs_mat_01_20_sp1), rhs_mat_2367ABEF_21_sp1, lhs_mat_01_21_sp1);
+
+                        __m512i iacc_mat_10_2_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_20_sp1, lhs_mat_23_20_sp1), rhs_mat_014589CD_21_sp1, lhs_mat_23_21_sp1);
+                        __m512i iacc_mat_11_2_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_20_sp1, lhs_mat_23_20_sp1), rhs_mat_2367ABEF_21_sp1, lhs_mat_23_21_sp1);
+
+                        __m512i iacc_mat_00_3_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_30_sp1, lhs_mat_01_30_sp1), rhs_mat_014589CD_31_sp1, lhs_mat_01_31_sp1);
+                        __m512i iacc_mat_01_3_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_30_sp1, lhs_mat_01_30_sp1), rhs_mat_2367ABEF_31_sp1, lhs_mat_01_31_sp1);
+
+                        __m512i iacc_mat_10_3_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_30_sp1, lhs_mat_23_30_sp1), rhs_mat_014589CD_31_sp1, lhs_mat_23_31_sp1);
+                        __m512i iacc_mat_11_3_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_30_sp1, lhs_mat_23_30_sp1), rhs_mat_2367ABEF_31_sp1, lhs_mat_23_31_sp1);
+
+                        __m512i iacc_mat_00_4_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_40_sp1, lhs_mat_01_40_sp1), rhs_mat_014589CD_41_sp1, lhs_mat_01_41_sp1);
+                        __m512i iacc_mat_01_4_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_40_sp1, lhs_mat_01_40_sp1), rhs_mat_2367ABEF_41_sp1, lhs_mat_01_41_sp1);
+
+                        __m512i iacc_mat_10_4_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_40_sp1, lhs_mat_23_40_sp1), rhs_mat_014589CD_41_sp1, lhs_mat_23_41_sp1);
+                        __m512i iacc_mat_11_4_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_40_sp1, lhs_mat_23_40_sp1), rhs_mat_2367ABEF_41_sp1, lhs_mat_23_41_sp1);
+
+                        __m512i iacc_mat_00_5_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_50_sp1, lhs_mat_01_50_sp1), rhs_mat_014589CD_51_sp1, lhs_mat_01_51_sp1);
+                        __m512i iacc_mat_01_5_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_50_sp1, lhs_mat_01_50_sp1), rhs_mat_2367ABEF_51_sp1, lhs_mat_01_51_sp1);
+
+                        __m512i iacc_mat_10_5_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_50_sp1, lhs_mat_23_50_sp1), rhs_mat_014589CD_51_sp1, lhs_mat_23_51_sp1);
+                        __m512i iacc_mat_11_5_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_50_sp1, lhs_mat_23_50_sp1), rhs_mat_2367ABEF_51_sp1, lhs_mat_23_51_sp1);
+
+                        __m512i iacc_mat_00_6_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_60_sp1, lhs_mat_01_60_sp1), rhs_mat_014589CD_61_sp1, lhs_mat_01_61_sp1);
+                        __m512i iacc_mat_01_6_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_60_sp1, lhs_mat_01_60_sp1), rhs_mat_2367ABEF_61_sp1, lhs_mat_01_61_sp1);
+
+                        __m512i iacc_mat_10_6_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_60_sp1, lhs_mat_23_60_sp1), rhs_mat_014589CD_61_sp1, lhs_mat_23_61_sp1);
+                        __m512i iacc_mat_11_6_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_60_sp1, lhs_mat_23_60_sp1), rhs_mat_2367ABEF_61_sp1, lhs_mat_23_61_sp1);
+
+                        __m512i iacc_mat_00_7_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_70_sp1, lhs_mat_01_70_sp1), rhs_mat_014589CD_71_sp1, lhs_mat_01_71_sp1);
+                        __m512i iacc_mat_01_7_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_70_sp1, lhs_mat_01_70_sp1), rhs_mat_2367ABEF_71_sp1, lhs_mat_01_71_sp1);
+
+                        __m512i iacc_mat_10_7_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_70_sp1, lhs_mat_23_70_sp1), rhs_mat_014589CD_71_sp1, lhs_mat_23_71_sp1);
+                        __m512i iacc_mat_11_7_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_70_sp1, lhs_mat_23_70_sp1), rhs_mat_2367ABEF_71_sp1, lhs_mat_23_71_sp1);
+
+
+                        __m512i iacc_mat_00_0_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_00_sp2, lhs_mat_01_00_sp2), rhs_mat_014589CD_01_sp2, lhs_mat_01_01_sp2);
+                        __m512i iacc_mat_01_0_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_00_sp2, lhs_mat_01_00_sp2), rhs_mat_2367ABEF_01_sp2, lhs_mat_01_01_sp2);
+
+                        __m512i iacc_mat_10_0_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_00_sp2, lhs_mat_23_00_sp2), rhs_mat_014589CD_01_sp2, lhs_mat_23_01_sp2);
+                        __m512i iacc_mat_11_0_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_00_sp2, lhs_mat_23_00_sp2), rhs_mat_2367ABEF_01_sp2, lhs_mat_23_01_sp2);
+
+                        __m512i iacc_mat_00_1_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_10_sp2, lhs_mat_01_10_sp2), rhs_mat_014589CD_11_sp2, lhs_mat_01_11_sp2);
+                        __m512i iacc_mat_01_1_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_10_sp2, lhs_mat_01_10_sp2), rhs_mat_2367ABEF_11_sp2, lhs_mat_01_11_sp2);
+
+                        __m512i iacc_mat_10_1_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_10_sp2, lhs_mat_23_10_sp2), rhs_mat_014589CD_11_sp2, lhs_mat_23_11_sp2);
+                        __m512i iacc_mat_11_1_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_10_sp2, lhs_mat_23_10_sp2), rhs_mat_2367ABEF_11_sp2, lhs_mat_23_11_sp2);
+
+                        __m512i iacc_mat_00_2_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_20_sp2, lhs_mat_01_20_sp2), rhs_mat_014589CD_21_sp2, lhs_mat_01_21_sp2);
+                        __m512i iacc_mat_01_2_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_20_sp2, lhs_mat_01_20_sp2), rhs_mat_2367ABEF_21_sp2, lhs_mat_01_21_sp2);
+
+                        __m512i iacc_mat_10_2_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_20_sp2, lhs_mat_23_20_sp2), rhs_mat_014589CD_21_sp2, lhs_mat_23_21_sp2);
+                        __m512i iacc_mat_11_2_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_20_sp2, lhs_mat_23_20_sp2), rhs_mat_2367ABEF_21_sp2, lhs_mat_23_21_sp2);
+
+                        __m512i iacc_mat_00_3_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_30_sp2, lhs_mat_01_30_sp2), rhs_mat_014589CD_31_sp2, lhs_mat_01_31_sp2);
+                        __m512i iacc_mat_01_3_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_30_sp2, lhs_mat_01_30_sp2), rhs_mat_2367ABEF_31_sp2, lhs_mat_01_31_sp2);
+
+                        __m512i iacc_mat_10_3_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_30_sp2, lhs_mat_23_30_sp2), rhs_mat_014589CD_31_sp2, lhs_mat_23_31_sp2);
+                        __m512i iacc_mat_11_3_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_30_sp2, lhs_mat_23_30_sp2), rhs_mat_2367ABEF_31_sp2, lhs_mat_23_31_sp2);
+
+                        __m512i iacc_mat_00_4_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_40_sp2, lhs_mat_01_40_sp2), rhs_mat_014589CD_41_sp2, lhs_mat_01_41_sp2);
+                        __m512i iacc_mat_01_4_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_40_sp2, lhs_mat_01_40_sp2), rhs_mat_2367ABEF_41_sp2, lhs_mat_01_41_sp2);
+
+                        __m512i iacc_mat_10_4_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_40_sp2, lhs_mat_23_40_sp2), rhs_mat_014589CD_41_sp2, lhs_mat_23_41_sp2);
+                        __m512i iacc_mat_11_4_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_40_sp2, lhs_mat_23_40_sp2), rhs_mat_2367ABEF_41_sp2, lhs_mat_23_41_sp2);
+
+                        __m512i iacc_mat_00_5_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_50_sp2, lhs_mat_01_50_sp2), rhs_mat_014589CD_51_sp2, lhs_mat_01_51_sp2);
+                        __m512i iacc_mat_01_5_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_50_sp2, lhs_mat_01_50_sp2), rhs_mat_2367ABEF_51_sp2, lhs_mat_01_51_sp2);
+
+                        __m512i iacc_mat_10_5_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_50_sp2, lhs_mat_23_50_sp2), rhs_mat_014589CD_51_sp2, lhs_mat_23_51_sp2);
+                        __m512i iacc_mat_11_5_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_50_sp2, lhs_mat_23_50_sp2), rhs_mat_2367ABEF_51_sp2, lhs_mat_23_51_sp2);
+
+                        __m512i iacc_mat_00_6_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_60_sp2, lhs_mat_01_60_sp2), rhs_mat_014589CD_61_sp2, lhs_mat_01_61_sp2);
+                        __m512i iacc_mat_01_6_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_60_sp2, lhs_mat_01_60_sp2), rhs_mat_2367ABEF_61_sp2, lhs_mat_01_61_sp2);
+
+                        __m512i iacc_mat_10_6_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_60_sp2, lhs_mat_23_60_sp2), rhs_mat_014589CD_61_sp2, lhs_mat_23_61_sp2);
+                        __m512i iacc_mat_11_6_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_60_sp2, lhs_mat_23_60_sp2), rhs_mat_2367ABEF_61_sp2, lhs_mat_23_61_sp2);
+
+                        __m512i iacc_mat_00_7_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_70_sp2, lhs_mat_01_70_sp2), rhs_mat_014589CD_71_sp2, lhs_mat_01_71_sp2);
+                        __m512i iacc_mat_01_7_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_70_sp2, lhs_mat_01_70_sp2), rhs_mat_2367ABEF_71_sp2, lhs_mat_01_71_sp2);
+
+                        __m512i iacc_mat_10_7_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_70_sp2, lhs_mat_23_70_sp2), rhs_mat_014589CD_71_sp2, lhs_mat_23_71_sp2);
+                        __m512i iacc_mat_11_7_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_70_sp2, lhs_mat_23_70_sp2), rhs_mat_2367ABEF_71_sp2, lhs_mat_23_71_sp2);
+
+                        // Combine results from both shuffle patterns for each output block
+                        __m512i iacc_mat_00_0 = _mm512_add_epi32(iacc_mat_00_0_sp1, iacc_mat_00_0_sp2);
+                        __m512i iacc_mat_01_0 = _mm512_add_epi32(iacc_mat_01_0_sp1, iacc_mat_01_0_sp2);
+                        __m512i iacc_mat_10_0 = _mm512_add_epi32(iacc_mat_10_0_sp1, iacc_mat_10_0_sp2);
+                        __m512i iacc_mat_11_0 = _mm512_add_epi32(iacc_mat_11_0_sp1, iacc_mat_11_0_sp2);
+
+                        __m512i iacc_mat_00_1 = _mm512_add_epi32(iacc_mat_00_1_sp1, iacc_mat_00_1_sp2);
+                        __m512i iacc_mat_01_1 = _mm512_add_epi32(iacc_mat_01_1_sp1, iacc_mat_01_1_sp2);
+                        __m512i iacc_mat_10_1 = _mm512_add_epi32(iacc_mat_10_1_sp1, iacc_mat_10_1_sp2);
+                        __m512i iacc_mat_11_1 = _mm512_add_epi32(iacc_mat_11_1_sp1, iacc_mat_11_1_sp2);
+
+                        __m512i iacc_mat_00_2 = _mm512_add_epi32(iacc_mat_00_2_sp1, iacc_mat_00_2_sp2);
+                        __m512i iacc_mat_01_2 = _mm512_add_epi32(iacc_mat_01_2_sp1, iacc_mat_01_2_sp2);
+                        __m512i iacc_mat_10_2 = _mm512_add_epi32(iacc_mat_10_2_sp1, iacc_mat_10_2_sp2);
+                        __m512i iacc_mat_11_2 = _mm512_add_epi32(iacc_mat_11_2_sp1, iacc_mat_11_2_sp2);
+
+                        __m512i iacc_mat_00_3 = _mm512_add_epi32(iacc_mat_00_3_sp1, iacc_mat_00_3_sp2);
+                        __m512i iacc_mat_01_3 = _mm512_add_epi32(iacc_mat_01_3_sp1, iacc_mat_01_3_sp2);
+                        __m512i iacc_mat_10_3 = _mm512_add_epi32(iacc_mat_10_3_sp1, iacc_mat_10_3_sp2);
+                        __m512i iacc_mat_11_3 = _mm512_add_epi32(iacc_mat_11_3_sp1, iacc_mat_11_3_sp2);
+
+                        __m512i iacc_mat_00_4 = _mm512_add_epi32(iacc_mat_00_4_sp1, iacc_mat_00_4_sp2);
+                        __m512i iacc_mat_01_4 = _mm512_add_epi32(iacc_mat_01_4_sp1, iacc_mat_01_4_sp2);
+                        __m512i iacc_mat_10_4 = _mm512_add_epi32(iacc_mat_10_4_sp1, iacc_mat_10_4_sp2);
+                        __m512i iacc_mat_11_4 = _mm512_add_epi32(iacc_mat_11_4_sp1, iacc_mat_11_4_sp2);
+
+                        __m512i iacc_mat_00_5 = _mm512_add_epi32(iacc_mat_00_5_sp1, iacc_mat_00_5_sp2);
+                        __m512i iacc_mat_01_5 = _mm512_add_epi32(iacc_mat_01_5_sp1, iacc_mat_01_5_sp2);
+                        __m512i iacc_mat_10_5 = _mm512_add_epi32(iacc_mat_10_5_sp1, iacc_mat_10_5_sp2);
+                        __m512i iacc_mat_11_5 = _mm512_add_epi32(iacc_mat_11_5_sp1, iacc_mat_11_5_sp2);
+
+                        __m512i iacc_mat_00_6 = _mm512_add_epi32(iacc_mat_00_6_sp1, iacc_mat_00_6_sp2);
+                        __m512i iacc_mat_01_6 = _mm512_add_epi32(iacc_mat_01_6_sp1, iacc_mat_01_6_sp2);
+                        __m512i iacc_mat_10_6 = _mm512_add_epi32(iacc_mat_10_6_sp1, iacc_mat_10_6_sp2);
+                        __m512i iacc_mat_11_6 = _mm512_add_epi32(iacc_mat_11_6_sp1, iacc_mat_11_6_sp2);
+
+                        __m512i iacc_mat_00_7 = _mm512_add_epi32(iacc_mat_00_7_sp1, iacc_mat_00_7_sp2);
+                        __m512i iacc_mat_01_7 = _mm512_add_epi32(iacc_mat_01_7_sp1, iacc_mat_01_7_sp2);
+                        __m512i iacc_mat_10_7 = _mm512_add_epi32(iacc_mat_10_7_sp1, iacc_mat_10_7_sp2);
+                        __m512i iacc_mat_11_7 = _mm512_add_epi32(iacc_mat_11_7_sp1, iacc_mat_11_7_sp2);
+
+                        // Output of both shuffle patterns are added in order to sum dot product outputs of all 32 values in block
+                        iacc_mat_00_0 = _mm512_mullo_epi32(iacc_mat_00_0, scale32_014589CD_0);
+                        iacc_mat_01_0 = _mm512_mullo_epi32(iacc_mat_01_0, scale32_2367ABEF_0);
+                        iacc_mat_10_0 = _mm512_mullo_epi32(iacc_mat_10_0, scale32_014589CD_0);
+                        iacc_mat_11_0 = _mm512_mullo_epi32(iacc_mat_11_0, scale32_2367ABEF_0);
+
+                        iacc_mat_00_1 = _mm512_mullo_epi32(iacc_mat_00_1, scale32_014589CD_1);
+                        iacc_mat_01_1 = _mm512_mullo_epi32(iacc_mat_01_1, scale32_2367ABEF_1);
+                        iacc_mat_10_1 = _mm512_mullo_epi32(iacc_mat_10_1, scale32_014589CD_1);
+                        iacc_mat_11_1 = _mm512_mullo_epi32(iacc_mat_11_1, scale32_2367ABEF_1);
+
+                        iacc_mat_00_2 = _mm512_mullo_epi32(iacc_mat_00_2, scale32_014589CD_2);
+                        iacc_mat_01_2 = _mm512_mullo_epi32(iacc_mat_01_2, scale32_2367ABEF_2);
+                        iacc_mat_10_2 = _mm512_mullo_epi32(iacc_mat_10_2, scale32_014589CD_2);
+                        iacc_mat_11_2 = _mm512_mullo_epi32(iacc_mat_11_2, scale32_2367ABEF_2);
+
+                        iacc_mat_00_3 = _mm512_mullo_epi32(iacc_mat_00_3, scale32_014589CD_3);
+                        iacc_mat_01_3 = _mm512_mullo_epi32(iacc_mat_01_3, scale32_2367ABEF_3);
+                        iacc_mat_10_3 = _mm512_mullo_epi32(iacc_mat_10_3, scale32_014589CD_3);
+                        iacc_mat_11_3 = _mm512_mullo_epi32(iacc_mat_11_3, scale32_2367ABEF_3);
+
+                        iacc_mat_00_4 = _mm512_mullo_epi32(iacc_mat_00_4, scale32_014589CD_4);
+                        iacc_mat_01_4 = _mm512_mullo_epi32(iacc_mat_01_4, scale32_2367ABEF_4);
+                        iacc_mat_10_4 = _mm512_mullo_epi32(iacc_mat_10_4, scale32_014589CD_4);
+                        iacc_mat_11_4 = _mm512_mullo_epi32(iacc_mat_11_4, scale32_2367ABEF_4);
+
+                        iacc_mat_00_5 = _mm512_mullo_epi32(iacc_mat_00_5, scale32_014589CD_5);
+                        iacc_mat_01_5 = _mm512_mullo_epi32(iacc_mat_01_5, scale32_2367ABEF_5);
+                        iacc_mat_10_5 = _mm512_mullo_epi32(iacc_mat_10_5, scale32_014589CD_5);
+                        iacc_mat_11_5 = _mm512_mullo_epi32(iacc_mat_11_5, scale32_2367ABEF_5);
+
+                        iacc_mat_00_6 = _mm512_mullo_epi32(iacc_mat_00_6, scale32_014589CD_6);
+                        iacc_mat_01_6 = _mm512_mullo_epi32(iacc_mat_01_6, scale32_2367ABEF_6);
+                        iacc_mat_10_6 = _mm512_mullo_epi32(iacc_mat_10_6, scale32_014589CD_6);
+                        iacc_mat_11_6 = _mm512_mullo_epi32(iacc_mat_11_6, scale32_2367ABEF_6);
+
+                        iacc_mat_00_7 = _mm512_mullo_epi32(iacc_mat_00_7, scale32_014589CD_7);
+                        iacc_mat_01_7 = _mm512_mullo_epi32(iacc_mat_01_7, scale32_2367ABEF_7);
+                        iacc_mat_10_7 = _mm512_mullo_epi32(iacc_mat_10_7, scale32_014589CD_7);
+                        iacc_mat_11_7 = _mm512_mullo_epi32(iacc_mat_11_7, scale32_2367ABEF_7);
+#else
                         __m512i iacc_mat_00_0_sp1 = _mm512_add_epi16(_mm512_maddubs_epi16(rhs_mat_014589CD_00_sp1, lhs_mat_01_00_sp1),_mm512_maddubs_epi16(rhs_mat_014589CD_01_sp1, lhs_mat_01_01_sp1));
                         __m512i iacc_mat_01_0_sp1 = _mm512_add_epi16(_mm512_maddubs_epi16(rhs_mat_2367ABEF_00_sp1, lhs_mat_01_00_sp1),_mm512_maddubs_epi16(rhs_mat_2367ABEF_01_sp1, lhs_mat_01_01_sp1));
 
@@ -6016,6 +6213,7 @@ void ggml_gemm_q2_K_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
                         iacc_mat_01_7 = _mm512_madd_epi16(iacc_mat_01_7, scale_2367ABEF_7);
                         iacc_mat_10_7 = _mm512_madd_epi16(iacc_mat_10_7, scale_014589CD_7);
                         iacc_mat_11_7 = _mm512_madd_epi16(iacc_mat_11_7, scale_2367ABEF_7);
+#endif
 
                         __m512i iacc_mat_00 = _mm512_add_epi32(_mm512_add_epi32(_mm512_add_epi32(iacc_mat_00_0, iacc_mat_00_1), _mm512_add_epi32(iacc_mat_00_2, iacc_mat_00_3)), _mm512_add_epi32(_mm512_add_epi32(iacc_mat_00_4, iacc_mat_00_5), _mm512_add_epi32(iacc_mat_00_6, iacc_mat_00_7)));
                         __m512i iacc_mat_01 = _mm512_add_epi32(_mm512_add_epi32(_mm512_add_epi32(iacc_mat_01_0, iacc_mat_01_1), _mm512_add_epi32(iacc_mat_01_2, iacc_mat_01_3)), _mm512_add_epi32(_mm512_add_epi32(iacc_mat_01_4, iacc_mat_01_5), _mm512_add_epi32(iacc_mat_01_6, iacc_mat_01_7)));
@@ -6567,6 +6765,203 @@ void ggml_gemm_q2_K_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
                     const __m512i lhs_mat_23_71_sp2 = _mm512_shuffle_epi32(lhs_mat_23_71, (_MM_PERM_ENUM)245); //A72(12-15) A72(12-15) A73(12-15) A73(12-15) A72(12-15) A72(12-15) A73(12-15) A73(12-15) A72(12-15) A72(12-15) A73(12-15) A73(12-15) A72(12-15) A72(12-15) A73(12-15) A73(12-15)
 
                     // The values arranged in shuffle patterns are operated with dot product operation within 32 bit lane i.e corresponding bytes and multiplied and added into 32 bit integers within 32 bit lane
+#if defined(__AVX512VNNI__)
+                    const __m512i scale32_014589CD_0 = _mm512_and_si512(scale_014589CD_0, _mm512_set1_epi32(0xFFFF));
+                    const __m512i scale32_2367ABEF_0 = _mm512_and_si512(scale_2367ABEF_0, _mm512_set1_epi32(0xFFFF));
+                    const __m512i scale32_014589CD_1 = _mm512_and_si512(scale_014589CD_1, _mm512_set1_epi32(0xFFFF));
+                    const __m512i scale32_2367ABEF_1 = _mm512_and_si512(scale_2367ABEF_1, _mm512_set1_epi32(0xFFFF));
+                    const __m512i scale32_014589CD_2 = _mm512_and_si512(scale_014589CD_2, _mm512_set1_epi32(0xFFFF));
+                    const __m512i scale32_2367ABEF_2 = _mm512_and_si512(scale_2367ABEF_2, _mm512_set1_epi32(0xFFFF));
+                    const __m512i scale32_014589CD_3 = _mm512_and_si512(scale_014589CD_3, _mm512_set1_epi32(0xFFFF));
+                    const __m512i scale32_2367ABEF_3 = _mm512_and_si512(scale_2367ABEF_3, _mm512_set1_epi32(0xFFFF));
+                    const __m512i scale32_014589CD_4 = _mm512_and_si512(scale_014589CD_4, _mm512_set1_epi32(0xFFFF));
+                    const __m512i scale32_2367ABEF_4 = _mm512_and_si512(scale_2367ABEF_4, _mm512_set1_epi32(0xFFFF));
+                    const __m512i scale32_014589CD_5 = _mm512_and_si512(scale_014589CD_5, _mm512_set1_epi32(0xFFFF));
+                    const __m512i scale32_2367ABEF_5 = _mm512_and_si512(scale_2367ABEF_5, _mm512_set1_epi32(0xFFFF));
+                    const __m512i scale32_014589CD_6 = _mm512_and_si512(scale_014589CD_6, _mm512_set1_epi32(0xFFFF));
+                    const __m512i scale32_2367ABEF_6 = _mm512_and_si512(scale_2367ABEF_6, _mm512_set1_epi32(0xFFFF));
+                    const __m512i scale32_014589CD_7 = _mm512_and_si512(scale_014589CD_7, _mm512_set1_epi32(0xFFFF));
+                    const __m512i scale32_2367ABEF_7 = _mm512_and_si512(scale_2367ABEF_7, _mm512_set1_epi32(0xFFFF));
+
+                    __m512i iacc_mat_00_0_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_00_sp1, lhs_mat_01_00_sp1), rhs_mat_014589CD_01_sp1, lhs_mat_01_01_sp1);
+                    __m512i iacc_mat_01_0_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_00_sp1, lhs_mat_01_00_sp1), rhs_mat_2367ABEF_01_sp1, lhs_mat_01_01_sp1);
+
+                    __m512i iacc_mat_10_0_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_00_sp1, lhs_mat_23_00_sp1), rhs_mat_014589CD_01_sp1, lhs_mat_23_01_sp1);
+                    __m512i iacc_mat_11_0_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_00_sp1, lhs_mat_23_00_sp1), rhs_mat_2367ABEF_01_sp1, lhs_mat_23_01_sp1);
+
+                    __m512i iacc_mat_00_1_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_10_sp1, lhs_mat_01_10_sp1), rhs_mat_014589CD_11_sp1, lhs_mat_01_11_sp1);
+                    __m512i iacc_mat_01_1_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_10_sp1, lhs_mat_01_10_sp1), rhs_mat_2367ABEF_11_sp1, lhs_mat_01_11_sp1);
+
+                    __m512i iacc_mat_10_1_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_10_sp1, lhs_mat_23_10_sp1), rhs_mat_014589CD_11_sp1, lhs_mat_23_11_sp1);
+                    __m512i iacc_mat_11_1_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_10_sp1, lhs_mat_23_10_sp1), rhs_mat_2367ABEF_11_sp1, lhs_mat_23_11_sp1);
+
+                    __m512i iacc_mat_00_2_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_20_sp1, lhs_mat_01_20_sp1), rhs_mat_014589CD_21_sp1, lhs_mat_01_21_sp1);
+                    __m512i iacc_mat_01_2_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_20_sp1, lhs_mat_01_20_sp1), rhs_mat_2367ABEF_21_sp1, lhs_mat_01_21_sp1);
+
+                    __m512i iacc_mat_10_2_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_20_sp1, lhs_mat_23_20_sp1), rhs_mat_014589CD_21_sp1, lhs_mat_23_21_sp1);
+                    __m512i iacc_mat_11_2_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_20_sp1, lhs_mat_23_20_sp1), rhs_mat_2367ABEF_21_sp1, lhs_mat_23_21_sp1);
+
+                    __m512i iacc_mat_00_3_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_30_sp1, lhs_mat_01_30_sp1), rhs_mat_014589CD_31_sp1, lhs_mat_01_31_sp1);
+                    __m512i iacc_mat_01_3_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_30_sp1, lhs_mat_01_30_sp1), rhs_mat_2367ABEF_31_sp1, lhs_mat_01_31_sp1);
+
+                    __m512i iacc_mat_10_3_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_30_sp1, lhs_mat_23_30_sp1), rhs_mat_014589CD_31_sp1, lhs_mat_23_31_sp1);
+                    __m512i iacc_mat_11_3_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_30_sp1, lhs_mat_23_30_sp1), rhs_mat_2367ABEF_31_sp1, lhs_mat_23_31_sp1);
+
+                    __m512i iacc_mat_00_4_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_40_sp1, lhs_mat_01_40_sp1), rhs_mat_014589CD_41_sp1, lhs_mat_01_41_sp1);
+                    __m512i iacc_mat_01_4_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_40_sp1, lhs_mat_01_40_sp1), rhs_mat_2367ABEF_41_sp1, lhs_mat_01_41_sp1);
+
+                    __m512i iacc_mat_10_4_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_40_sp1, lhs_mat_23_40_sp1), rhs_mat_014589CD_41_sp1, lhs_mat_23_41_sp1);
+                    __m512i iacc_mat_11_4_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_40_sp1, lhs_mat_23_40_sp1), rhs_mat_2367ABEF_41_sp1, lhs_mat_23_41_sp1);
+
+                    __m512i iacc_mat_00_5_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_50_sp1, lhs_mat_01_50_sp1), rhs_mat_014589CD_51_sp1, lhs_mat_01_51_sp1);
+                    __m512i iacc_mat_01_5_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_50_sp1, lhs_mat_01_50_sp1), rhs_mat_2367ABEF_51_sp1, lhs_mat_01_51_sp1);
+
+                    __m512i iacc_mat_10_5_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_50_sp1, lhs_mat_23_50_sp1), rhs_mat_014589CD_51_sp1, lhs_mat_23_51_sp1);
+                    __m512i iacc_mat_11_5_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_50_sp1, lhs_mat_23_50_sp1), rhs_mat_2367ABEF_51_sp1, lhs_mat_23_51_sp1);
+
+                    __m512i iacc_mat_00_6_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_60_sp1, lhs_mat_01_60_sp1), rhs_mat_014589CD_61_sp1, lhs_mat_01_61_sp1);
+                    __m512i iacc_mat_01_6_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_60_sp1, lhs_mat_01_60_sp1), rhs_mat_2367ABEF_61_sp1, lhs_mat_01_61_sp1);
+
+                    __m512i iacc_mat_10_6_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_60_sp1, lhs_mat_23_60_sp1), rhs_mat_014589CD_61_sp1, lhs_mat_23_61_sp1);
+                    __m512i iacc_mat_11_6_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_60_sp1, lhs_mat_23_60_sp1), rhs_mat_2367ABEF_61_sp1, lhs_mat_23_61_sp1);
+
+                    __m512i iacc_mat_00_7_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_70_sp1, lhs_mat_01_70_sp1), rhs_mat_014589CD_71_sp1, lhs_mat_01_71_sp1);
+                    __m512i iacc_mat_01_7_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_70_sp1, lhs_mat_01_70_sp1), rhs_mat_2367ABEF_71_sp1, lhs_mat_01_71_sp1);
+
+                    __m512i iacc_mat_10_7_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_70_sp1, lhs_mat_23_70_sp1), rhs_mat_014589CD_71_sp1, lhs_mat_23_71_sp1);
+                    __m512i iacc_mat_11_7_sp1 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_70_sp1, lhs_mat_23_70_sp1), rhs_mat_2367ABEF_71_sp1, lhs_mat_23_71_sp1);
+
+
+                    __m512i iacc_mat_00_0_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_00_sp2, lhs_mat_01_00_sp2), rhs_mat_014589CD_01_sp2, lhs_mat_01_01_sp2);
+                    __m512i iacc_mat_01_0_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_00_sp2, lhs_mat_01_00_sp2), rhs_mat_2367ABEF_01_sp2, lhs_mat_01_01_sp2);
+
+                    __m512i iacc_mat_10_0_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_00_sp2, lhs_mat_23_00_sp2), rhs_mat_014589CD_01_sp2, lhs_mat_23_01_sp2);
+                    __m512i iacc_mat_11_0_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_00_sp2, lhs_mat_23_00_sp2), rhs_mat_2367ABEF_01_sp2, lhs_mat_23_01_sp2);
+
+                    __m512i iacc_mat_00_1_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_10_sp2, lhs_mat_01_10_sp2), rhs_mat_014589CD_11_sp2, lhs_mat_01_11_sp2);
+                    __m512i iacc_mat_01_1_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_10_sp2, lhs_mat_01_10_sp2), rhs_mat_2367ABEF_11_sp2, lhs_mat_01_11_sp2);
+
+                    __m512i iacc_mat_10_1_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_10_sp2, lhs_mat_23_10_sp2), rhs_mat_014589CD_11_sp2, lhs_mat_23_11_sp2);
+                    __m512i iacc_mat_11_1_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_10_sp2, lhs_mat_23_10_sp2), rhs_mat_2367ABEF_11_sp2, lhs_mat_23_11_sp2);
+
+                    __m512i iacc_mat_00_2_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_20_sp2, lhs_mat_01_20_sp2), rhs_mat_014589CD_21_sp2, lhs_mat_01_21_sp2);
+                    __m512i iacc_mat_01_2_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_20_sp2, lhs_mat_01_20_sp2), rhs_mat_2367ABEF_21_sp2, lhs_mat_01_21_sp2);
+
+                    __m512i iacc_mat_10_2_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_20_sp2, lhs_mat_23_20_sp2), rhs_mat_014589CD_21_sp2, lhs_mat_23_21_sp2);
+                    __m512i iacc_mat_11_2_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_20_sp2, lhs_mat_23_20_sp2), rhs_mat_2367ABEF_21_sp2, lhs_mat_23_21_sp2);
+
+                    __m512i iacc_mat_00_3_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_30_sp2, lhs_mat_01_30_sp2), rhs_mat_014589CD_31_sp2, lhs_mat_01_31_sp2);
+                    __m512i iacc_mat_01_3_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_30_sp2, lhs_mat_01_30_sp2), rhs_mat_2367ABEF_31_sp2, lhs_mat_01_31_sp2);
+
+                    __m512i iacc_mat_10_3_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_30_sp2, lhs_mat_23_30_sp2), rhs_mat_014589CD_31_sp2, lhs_mat_23_31_sp2);
+                    __m512i iacc_mat_11_3_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_30_sp2, lhs_mat_23_30_sp2), rhs_mat_2367ABEF_31_sp2, lhs_mat_23_31_sp2);
+
+                    __m512i iacc_mat_00_4_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_40_sp2, lhs_mat_01_40_sp2), rhs_mat_014589CD_41_sp2, lhs_mat_01_41_sp2);
+                    __m512i iacc_mat_01_4_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_40_sp2, lhs_mat_01_40_sp2), rhs_mat_2367ABEF_41_sp2, lhs_mat_01_41_sp2);
+
+                    __m512i iacc_mat_10_4_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_40_sp2, lhs_mat_23_40_sp2), rhs_mat_014589CD_41_sp2, lhs_mat_23_41_sp2);
+                    __m512i iacc_mat_11_4_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_40_sp2, lhs_mat_23_40_sp2), rhs_mat_2367ABEF_41_sp2, lhs_mat_23_41_sp2);
+
+                    __m512i iacc_mat_00_5_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_50_sp2, lhs_mat_01_50_sp2), rhs_mat_014589CD_51_sp2, lhs_mat_01_51_sp2);
+                    __m512i iacc_mat_01_5_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_50_sp2, lhs_mat_01_50_sp2), rhs_mat_2367ABEF_51_sp2, lhs_mat_01_51_sp2);
+
+                    __m512i iacc_mat_10_5_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_50_sp2, lhs_mat_23_50_sp2), rhs_mat_014589CD_51_sp2, lhs_mat_23_51_sp2);
+                    __m512i iacc_mat_11_5_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_50_sp2, lhs_mat_23_50_sp2), rhs_mat_2367ABEF_51_sp2, lhs_mat_23_51_sp2);
+
+                    __m512i iacc_mat_00_6_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_60_sp2, lhs_mat_01_60_sp2), rhs_mat_014589CD_61_sp2, lhs_mat_01_61_sp2);
+                    __m512i iacc_mat_01_6_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_60_sp2, lhs_mat_01_60_sp2), rhs_mat_2367ABEF_61_sp2, lhs_mat_01_61_sp2);
+
+                    __m512i iacc_mat_10_6_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_60_sp2, lhs_mat_23_60_sp2), rhs_mat_014589CD_61_sp2, lhs_mat_23_61_sp2);
+                    __m512i iacc_mat_11_6_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_60_sp2, lhs_mat_23_60_sp2), rhs_mat_2367ABEF_61_sp2, lhs_mat_23_61_sp2);
+
+                    __m512i iacc_mat_00_7_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_70_sp2, lhs_mat_01_70_sp2), rhs_mat_014589CD_71_sp2, lhs_mat_01_71_sp2);
+                    __m512i iacc_mat_01_7_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_70_sp2, lhs_mat_01_70_sp2), rhs_mat_2367ABEF_71_sp2, lhs_mat_01_71_sp2);
+
+                    __m512i iacc_mat_10_7_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_014589CD_70_sp2, lhs_mat_23_70_sp2), rhs_mat_014589CD_71_sp2, lhs_mat_23_71_sp2);
+                    __m512i iacc_mat_11_7_sp2 = _mm512_dpbusd_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), rhs_mat_2367ABEF_70_sp2, lhs_mat_23_70_sp2), rhs_mat_2367ABEF_71_sp2, lhs_mat_23_71_sp2);
+
+                    // Combine results from both shuffle patterns for each output block
+                    __m512i iacc_mat_00_0 = _mm512_add_epi32(iacc_mat_00_0_sp1, iacc_mat_00_0_sp2);
+                    __m512i iacc_mat_01_0 = _mm512_add_epi32(iacc_mat_01_0_sp1, iacc_mat_01_0_sp2);
+                    __m512i iacc_mat_10_0 = _mm512_add_epi32(iacc_mat_10_0_sp1, iacc_mat_10_0_sp2);
+                    __m512i iacc_mat_11_0 = _mm512_add_epi32(iacc_mat_11_0_sp1, iacc_mat_11_0_sp2);
+
+                    __m512i iacc_mat_00_1 = _mm512_add_epi32(iacc_mat_00_1_sp1, iacc_mat_00_1_sp2);
+                    __m512i iacc_mat_01_1 = _mm512_add_epi32(iacc_mat_01_1_sp1, iacc_mat_01_1_sp2);
+                    __m512i iacc_mat_10_1 = _mm512_add_epi32(iacc_mat_10_1_sp1, iacc_mat_10_1_sp2);
+                    __m512i iacc_mat_11_1 = _mm512_add_epi32(iacc_mat_11_1_sp1, iacc_mat_11_1_sp2);
+
+                    __m512i iacc_mat_00_2 = _mm512_add_epi32(iacc_mat_00_2_sp1, iacc_mat_00_2_sp2);
+                    __m512i iacc_mat_01_2 = _mm512_add_epi32(iacc_mat_01_2_sp1, iacc_mat_01_2_sp2);
+                    __m512i iacc_mat_10_2 = _mm512_add_epi32(iacc_mat_10_2_sp1, iacc_mat_10_2_sp2);
+                    __m512i iacc_mat_11_2 = _mm512_add_epi32(iacc_mat_11_2_sp1, iacc_mat_11_2_sp2);
+
+                    __m512i iacc_mat_00_3 = _mm512_add_epi32(iacc_mat_00_3_sp1, iacc_mat_00_3_sp2);
+                    __m512i iacc_mat_01_3 = _mm512_add_epi32(iacc_mat_01_3_sp1, iacc_mat_01_3_sp2);
+                    __m512i iacc_mat_10_3 = _mm512_add_epi32(iacc_mat_10_3_sp1, iacc_mat_10_3_sp2);
+                    __m512i iacc_mat_11_3 = _mm512_add_epi32(iacc_mat_11_3_sp1, iacc_mat_11_3_sp2);
+
+                    __m512i iacc_mat_00_4 = _mm512_add_epi32(iacc_mat_00_4_sp1, iacc_mat_00_4_sp2);
+                    __m512i iacc_mat_01_4 = _mm512_add_epi32(iacc_mat_01_4_sp1, iacc_mat_01_4_sp2);
+                    __m512i iacc_mat_10_4 = _mm512_add_epi32(iacc_mat_10_4_sp1, iacc_mat_10_4_sp2);
+                    __m512i iacc_mat_11_4 = _mm512_add_epi32(iacc_mat_11_4_sp1, iacc_mat_11_4_sp2);
+
+                    __m512i iacc_mat_00_5 = _mm512_add_epi32(iacc_mat_00_5_sp1, iacc_mat_00_5_sp2);
+                    __m512i iacc_mat_01_5 = _mm512_add_epi32(iacc_mat_01_5_sp1, iacc_mat_01_5_sp2);
+                    __m512i iacc_mat_10_5 = _mm512_add_epi32(iacc_mat_10_5_sp1, iacc_mat_10_5_sp2);
+                    __m512i iacc_mat_11_5 = _mm512_add_epi32(iacc_mat_11_5_sp1, iacc_mat_11_5_sp2);
+
+                    __m512i iacc_mat_00_6 = _mm512_add_epi32(iacc_mat_00_6_sp1, iacc_mat_00_6_sp2);
+                    __m512i iacc_mat_01_6 = _mm512_add_epi32(iacc_mat_01_6_sp1, iacc_mat_01_6_sp2);
+                    __m512i iacc_mat_10_6 = _mm512_add_epi32(iacc_mat_10_6_sp1, iacc_mat_10_6_sp2);
+                    __m512i iacc_mat_11_6 = _mm512_add_epi32(iacc_mat_11_6_sp1, iacc_mat_11_6_sp2);
+
+                    __m512i iacc_mat_00_7 = _mm512_add_epi32(iacc_mat_00_7_sp1, iacc_mat_00_7_sp2);
+                    __m512i iacc_mat_01_7 = _mm512_add_epi32(iacc_mat_01_7_sp1, iacc_mat_01_7_sp2);
+                    __m512i iacc_mat_10_7 = _mm512_add_epi32(iacc_mat_10_7_sp1, iacc_mat_10_7_sp2);
+                    __m512i iacc_mat_11_7 = _mm512_add_epi32(iacc_mat_11_7_sp1, iacc_mat_11_7_sp2);
+
+                    // Output of both shuffle patterns are added in order to sum dot product outputs of all 32 values in block
+                    iacc_mat_00_0 = _mm512_mullo_epi32(iacc_mat_00_0, scale32_014589CD_0);
+                    iacc_mat_01_0 = _mm512_mullo_epi32(iacc_mat_01_0, scale32_2367ABEF_0);
+                    iacc_mat_10_0 = _mm512_mullo_epi32(iacc_mat_10_0, scale32_014589CD_0);
+                    iacc_mat_11_0 = _mm512_mullo_epi32(iacc_mat_11_0, scale32_2367ABEF_0);
+
+                    iacc_mat_00_1 = _mm512_mullo_epi32(iacc_mat_00_1, scale32_014589CD_1);
+                    iacc_mat_01_1 = _mm512_mullo_epi32(iacc_mat_01_1, scale32_2367ABEF_1);
+                    iacc_mat_10_1 = _mm512_mullo_epi32(iacc_mat_10_1, scale32_014589CD_1);
+                    iacc_mat_11_1 = _mm512_mullo_epi32(iacc_mat_11_1, scale32_2367ABEF_1);
+
+                    iacc_mat_00_2 = _mm512_mullo_epi32(iacc_mat_00_2, scale32_014589CD_2);
+                    iacc_mat_01_2 = _mm512_mullo_epi32(iacc_mat_01_2, scale32_2367ABEF_2);
+                    iacc_mat_10_2 = _mm512_mullo_epi32(iacc_mat_10_2, scale32_014589CD_2);
+                    iacc_mat_11_2 = _mm512_mullo_epi32(iacc_mat_11_2, scale32_2367ABEF_2);
+
+                    iacc_mat_00_3 = _mm512_mullo_epi32(iacc_mat_00_3, scale32_014589CD_3);
+                    iacc_mat_01_3 = _mm512_mullo_epi32(iacc_mat_01_3, scale32_2367ABEF_3);
+                    iacc_mat_10_3 = _mm512_mullo_epi32(iacc_mat_10_3, scale32_014589CD_3);
+                    iacc_mat_11_3 = _mm512_mullo_epi32(iacc_mat_11_3, scale32_2367ABEF_3);
+
+                    iacc_mat_00_4 = _mm512_mullo_epi32(iacc_mat_00_4, scale32_014589CD_4);
+                    iacc_mat_01_4 = _mm512_mullo_epi32(iacc_mat_01_4, scale32_2367ABEF_4);
+                    iacc_mat_10_4 = _mm512_mullo_epi32(iacc_mat_10_4, scale32_014589CD_4);
+                    iacc_mat_11_4 = _mm512_mullo_epi32(iacc_mat_11_4, scale32_2367ABEF_4);
+
+                    iacc_mat_00_5 = _mm512_mullo_epi32(iacc_mat_00_5, scale32_014589CD_5);
+                    iacc_mat_01_5 = _mm512_mullo_epi32(iacc_mat_01_5, scale32_2367ABEF_5);
+                    iacc_mat_10_5 = _mm512_mullo_epi32(iacc_mat_10_5, scale32_014589CD_5);
+                    iacc_mat_11_5 = _mm512_mullo_epi32(iacc_mat_11_5, scale32_2367ABEF_5);
+
+                    iacc_mat_00_6 = _mm512_mullo_epi32(iacc_mat_00_6, scale32_014589CD_6);
+                    iacc_mat_01_6 = _mm512_mullo_epi32(iacc_mat_01_6, scale32_2367ABEF_6);
+                    iacc_mat_10_6 = _mm512_mullo_epi32(iacc_mat_10_6, scale32_014589CD_6);
+                    iacc_mat_11_6 = _mm512_mullo_epi32(iacc_mat_11_6, scale32_2367ABEF_6);
+
+                    iacc_mat_00_7 = _mm512_mullo_epi32(iacc_mat_00_7, scale32_014589CD_7);
+                    iacc_mat_01_7 = _mm512_mullo_epi32(iacc_mat_01_7, scale32_2367ABEF_7);
+                    iacc_mat_10_7 = _mm512_mullo_epi32(iacc_mat_10_7, scale32_014589CD_7);
+                    iacc_mat_11_7 = _mm512_mullo_epi32(iacc_mat_11_7, scale32_2367ABEF_7);
+#else
                     __m512i iacc_mat_00_0_sp1 = _mm512_add_epi16(_mm512_maddubs_epi16(rhs_mat_014589CD_00_sp1, lhs_mat_01_00_sp1),_mm512_maddubs_epi16(rhs_mat_014589CD_01_sp1, lhs_mat_01_01_sp1));
                     __m512i iacc_mat_01_0_sp1 = _mm512_add_epi16(_mm512_maddubs_epi16(rhs_mat_2367ABEF_00_sp1, lhs_mat_01_00_sp1),_mm512_maddubs_epi16(rhs_mat_2367ABEF_01_sp1, lhs_mat_01_01_sp1));
 
@@ -6745,6 +7140,7 @@ void ggml_gemm_q2_K_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
                     iacc_mat_01_7 = _mm512_madd_epi16(iacc_mat_01_7, scale_2367ABEF_7);
                     iacc_mat_10_7 = _mm512_madd_epi16(iacc_mat_10_7, scale_014589CD_7);
                     iacc_mat_11_7 = _mm512_madd_epi16(iacc_mat_11_7, scale_2367ABEF_7);
+#endif
 
                     __m512i iacc_mat_00 = _mm512_add_epi32(_mm512_add_epi32(_mm512_add_epi32(iacc_mat_00_0, iacc_mat_00_1), _mm512_add_epi32(iacc_mat_00_2, iacc_mat_00_3)), _mm512_add_epi32(_mm512_add_epi32(iacc_mat_00_4, iacc_mat_00_5), _mm512_add_epi32(iacc_mat_00_6, iacc_mat_00_7)));
                     __m512i iacc_mat_01 = _mm512_add_epi32(_mm512_add_epi32(_mm512_add_epi32(iacc_mat_01_0, iacc_mat_01_1), _mm512_add_epi32(iacc_mat_01_2, iacc_mat_01_3)), _mm512_add_epi32(_mm512_add_epi32(iacc_mat_01_4, iacc_mat_01_5), _mm512_add_epi32(iacc_mat_01_6, iacc_mat_01_7)));
@@ -7248,6 +7644,399 @@ void ggml_gemm_q2_K_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
                         const __m256i lhs_mat_23_71_sp2 = _mm256_shuffle_epi32(lhs_mat_23_71, 245); //A72(12-15) A73(12-15) A72(12-15) A73(12-15) A72(12-15) A73(12-15) A72(12-15) A73(12-15)
 
                         // The values arranged in shuffle patterns are operated with dot product operation within 32 bit lane i.e corresponding bytes and multiplied and added into 32 bit integers within 32 bit lane
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+                        const __m256i scale32_0145_0 = _mm256_and_si256(scale_0145_0, _mm256_set1_epi32(0xFFFF));
+                        const __m256i scale32_2367_0 = _mm256_and_si256(scale_2367_0, _mm256_set1_epi32(0xFFFF));
+                        const __m256i scale32_0145_1 = _mm256_and_si256(scale_0145_1, _mm256_set1_epi32(0xFFFF));
+                        const __m256i scale32_2367_1 = _mm256_and_si256(scale_2367_1, _mm256_set1_epi32(0xFFFF));
+                        const __m256i scale32_0145_2 = _mm256_and_si256(scale_0145_2, _mm256_set1_epi32(0xFFFF));
+                        const __m256i scale32_2367_2 = _mm256_and_si256(scale_2367_2, _mm256_set1_epi32(0xFFFF));
+                        const __m256i scale32_0145_3 = _mm256_and_si256(scale_0145_3, _mm256_set1_epi32(0xFFFF));
+                        const __m256i scale32_2367_3 = _mm256_and_si256(scale_2367_3, _mm256_set1_epi32(0xFFFF));
+                        const __m256i scale32_0145_4 = _mm256_and_si256(scale_0145_4, _mm256_set1_epi32(0xFFFF));
+                        const __m256i scale32_2367_4 = _mm256_and_si256(scale_2367_4, _mm256_set1_epi32(0xFFFF));
+                        const __m256i scale32_0145_5 = _mm256_and_si256(scale_0145_5, _mm256_set1_epi32(0xFFFF));
+                        const __m256i scale32_2367_5 = _mm256_and_si256(scale_2367_5, _mm256_set1_epi32(0xFFFF));
+                        const __m256i scale32_0145_6 = _mm256_and_si256(scale_0145_6, _mm256_set1_epi32(0xFFFF));
+                        const __m256i scale32_2367_6 = _mm256_and_si256(scale_2367_6, _mm256_set1_epi32(0xFFFF));
+                        const __m256i scale32_0145_7 = _mm256_and_si256(scale_0145_7, _mm256_set1_epi32(0xFFFF));
+                        const __m256i scale32_2367_7 = _mm256_and_si256(scale_2367_7, _mm256_set1_epi32(0xFFFF));
+
+                        __m256i iacc_mat_00_0_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_00_sp1, lhs_mat_01_00_sp1), rhs_mat_0145_01_sp1, lhs_mat_01_01_sp1);
+                        __m256i iacc_mat_01_0_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_00_sp1, lhs_mat_01_00_sp1), rhs_mat_2367_01_sp1, lhs_mat_01_01_sp1);
+
+                        __m256i iacc_mat_10_0_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_00_sp1, lhs_mat_23_00_sp1), rhs_mat_0145_01_sp1, lhs_mat_23_01_sp1);
+                        __m256i iacc_mat_11_0_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_00_sp1, lhs_mat_23_00_sp1), rhs_mat_2367_01_sp1, lhs_mat_23_01_sp1);
+
+                        __m256i iacc_mat_00_1_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_10_sp1, lhs_mat_01_10_sp1), rhs_mat_0145_11_sp1, lhs_mat_01_11_sp1);
+                        __m256i iacc_mat_01_1_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_10_sp1, lhs_mat_01_10_sp1), rhs_mat_2367_11_sp1, lhs_mat_01_11_sp1);
+
+                        __m256i iacc_mat_10_1_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_10_sp1, lhs_mat_23_10_sp1), rhs_mat_0145_11_sp1, lhs_mat_23_11_sp1);
+                        __m256i iacc_mat_11_1_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_10_sp1, lhs_mat_23_10_sp1), rhs_mat_2367_11_sp1, lhs_mat_23_11_sp1);
+
+                        __m256i iacc_mat_00_2_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_20_sp1, lhs_mat_01_20_sp1), rhs_mat_0145_21_sp1, lhs_mat_01_21_sp1);
+                        __m256i iacc_mat_01_2_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_20_sp1, lhs_mat_01_20_sp1), rhs_mat_2367_21_sp1, lhs_mat_01_21_sp1);
+
+                        __m256i iacc_mat_10_2_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_20_sp1, lhs_mat_23_20_sp1), rhs_mat_0145_21_sp1, lhs_mat_23_21_sp1);
+                        __m256i iacc_mat_11_2_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_20_sp1, lhs_mat_23_20_sp1), rhs_mat_2367_21_sp1, lhs_mat_23_21_sp1);
+
+                        __m256i iacc_mat_00_3_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_30_sp1, lhs_mat_01_30_sp1), rhs_mat_0145_31_sp1, lhs_mat_01_31_sp1);
+                        __m256i iacc_mat_01_3_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_30_sp1, lhs_mat_01_30_sp1), rhs_mat_2367_31_sp1, lhs_mat_01_31_sp1);
+
+                        __m256i iacc_mat_10_3_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_30_sp1, lhs_mat_23_30_sp1), rhs_mat_0145_31_sp1, lhs_mat_23_31_sp1);
+                        __m256i iacc_mat_11_3_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_30_sp1, lhs_mat_23_30_sp1), rhs_mat_2367_31_sp1, lhs_mat_23_31_sp1);
+
+                        __m256i iacc_mat_00_4_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_40_sp1, lhs_mat_01_40_sp1), rhs_mat_0145_41_sp1, lhs_mat_01_41_sp1);
+                        __m256i iacc_mat_01_4_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_40_sp1, lhs_mat_01_40_sp1), rhs_mat_2367_41_sp1, lhs_mat_01_41_sp1);
+
+                        __m256i iacc_mat_10_4_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_40_sp1, lhs_mat_23_40_sp1), rhs_mat_0145_41_sp1, lhs_mat_23_41_sp1);
+                        __m256i iacc_mat_11_4_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_40_sp1, lhs_mat_23_40_sp1), rhs_mat_2367_41_sp1, lhs_mat_23_41_sp1);
+
+                        __m256i iacc_mat_00_5_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_50_sp1, lhs_mat_01_50_sp1), rhs_mat_0145_51_sp1, lhs_mat_01_51_sp1);
+                        __m256i iacc_mat_01_5_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_50_sp1, lhs_mat_01_50_sp1), rhs_mat_2367_51_sp1, lhs_mat_01_51_sp1);
+
+                        __m256i iacc_mat_10_5_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_50_sp1, lhs_mat_23_50_sp1), rhs_mat_0145_51_sp1, lhs_mat_23_51_sp1);
+                        __m256i iacc_mat_11_5_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_50_sp1, lhs_mat_23_50_sp1), rhs_mat_2367_51_sp1, lhs_mat_23_51_sp1);
+
+                        __m256i iacc_mat_00_6_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_60_sp1, lhs_mat_01_60_sp1), rhs_mat_0145_61_sp1, lhs_mat_01_61_sp1);
+                        __m256i iacc_mat_01_6_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_60_sp1, lhs_mat_01_60_sp1), rhs_mat_2367_61_sp1, lhs_mat_01_61_sp1);
+
+                        __m256i iacc_mat_10_6_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_60_sp1, lhs_mat_23_60_sp1), rhs_mat_0145_61_sp1, lhs_mat_23_61_sp1);
+                        __m256i iacc_mat_11_6_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_60_sp1, lhs_mat_23_60_sp1), rhs_mat_2367_61_sp1, lhs_mat_23_61_sp1);
+
+                        __m256i iacc_mat_00_7_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_70_sp1, lhs_mat_01_70_sp1), rhs_mat_0145_71_sp1, lhs_mat_01_71_sp1);
+                        __m256i iacc_mat_01_7_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_70_sp1, lhs_mat_01_70_sp1), rhs_mat_2367_71_sp1, lhs_mat_01_71_sp1);
+
+                        __m256i iacc_mat_10_7_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_70_sp1, lhs_mat_23_70_sp1), rhs_mat_0145_71_sp1, lhs_mat_23_71_sp1);
+                        __m256i iacc_mat_11_7_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_70_sp1, lhs_mat_23_70_sp1), rhs_mat_2367_71_sp1, lhs_mat_23_71_sp1);
+
+
+                        __m256i iacc_mat_00_0_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_00_sp2, lhs_mat_01_00_sp2), rhs_mat_0145_01_sp2, lhs_mat_01_01_sp2);
+                        __m256i iacc_mat_01_0_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_00_sp2, lhs_mat_01_00_sp2), rhs_mat_2367_01_sp2, lhs_mat_01_01_sp2);
+
+                        __m256i iacc_mat_10_0_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_00_sp2, lhs_mat_23_00_sp2), rhs_mat_0145_01_sp2, lhs_mat_23_01_sp2);
+                        __m256i iacc_mat_11_0_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_00_sp2, lhs_mat_23_00_sp2), rhs_mat_2367_01_sp2, lhs_mat_23_01_sp2);
+
+                        __m256i iacc_mat_00_1_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_10_sp2, lhs_mat_01_10_sp2), rhs_mat_0145_11_sp2, lhs_mat_01_11_sp2);
+                        __m256i iacc_mat_01_1_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_10_sp2, lhs_mat_01_10_sp2), rhs_mat_2367_11_sp2, lhs_mat_01_11_sp2);
+
+                        __m256i iacc_mat_10_1_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_10_sp2, lhs_mat_23_10_sp2), rhs_mat_0145_11_sp2, lhs_mat_23_11_sp2);
+                        __m256i iacc_mat_11_1_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_10_sp2, lhs_mat_23_10_sp2), rhs_mat_2367_11_sp2, lhs_mat_23_11_sp2);
+
+                        __m256i iacc_mat_00_2_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_20_sp2, lhs_mat_01_20_sp2), rhs_mat_0145_21_sp2, lhs_mat_01_21_sp2);
+                        __m256i iacc_mat_01_2_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_20_sp2, lhs_mat_01_20_sp2), rhs_mat_2367_21_sp2, lhs_mat_01_21_sp2);
+
+                        __m256i iacc_mat_10_2_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_20_sp2, lhs_mat_23_20_sp2), rhs_mat_0145_21_sp2, lhs_mat_23_21_sp2);
+                        __m256i iacc_mat_11_2_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_20_sp2, lhs_mat_23_20_sp2), rhs_mat_2367_21_sp2, lhs_mat_23_21_sp2);
+
+                        __m256i iacc_mat_00_3_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_30_sp2, lhs_mat_01_30_sp2), rhs_mat_0145_31_sp2, lhs_mat_01_31_sp2);
+                        __m256i iacc_mat_01_3_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_30_sp2, lhs_mat_01_30_sp2), rhs_mat_2367_31_sp2, lhs_mat_01_31_sp2);
+
+                        __m256i iacc_mat_10_3_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_30_sp2, lhs_mat_23_30_sp2), rhs_mat_0145_31_sp2, lhs_mat_23_31_sp2);
+                        __m256i iacc_mat_11_3_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_30_sp2, lhs_mat_23_30_sp2), rhs_mat_2367_31_sp2, lhs_mat_23_31_sp2);
+
+                        __m256i iacc_mat_00_4_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_40_sp2, lhs_mat_01_40_sp2), rhs_mat_0145_41_sp2, lhs_mat_01_41_sp2);
+                        __m256i iacc_mat_01_4_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_40_sp2, lhs_mat_01_40_sp2), rhs_mat_2367_41_sp2, lhs_mat_01_41_sp2);
+
+                        __m256i iacc_mat_10_4_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_40_sp2, lhs_mat_23_40_sp2), rhs_mat_0145_41_sp2, lhs_mat_23_41_sp2);
+                        __m256i iacc_mat_11_4_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_40_sp2, lhs_mat_23_40_sp2), rhs_mat_2367_41_sp2, lhs_mat_23_41_sp2);
+
+                        __m256i iacc_mat_00_5_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_50_sp2, lhs_mat_01_50_sp2), rhs_mat_0145_51_sp2, lhs_mat_01_51_sp2);
+                        __m256i iacc_mat_01_5_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_50_sp2, lhs_mat_01_50_sp2), rhs_mat_2367_51_sp2, lhs_mat_01_51_sp2);
+
+                        __m256i iacc_mat_10_5_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_50_sp2, lhs_mat_23_50_sp2), rhs_mat_0145_51_sp2, lhs_mat_23_51_sp2);
+                        __m256i iacc_mat_11_5_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_50_sp2, lhs_mat_23_50_sp2), rhs_mat_2367_51_sp2, lhs_mat_23_51_sp2);
+
+                        __m256i iacc_mat_00_6_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_60_sp2, lhs_mat_01_60_sp2), rhs_mat_0145_61_sp2, lhs_mat_01_61_sp2);
+                        __m256i iacc_mat_01_6_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_60_sp2, lhs_mat_01_60_sp2), rhs_mat_2367_61_sp2, lhs_mat_01_61_sp2);
+
+                        __m256i iacc_mat_10_6_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_60_sp2, lhs_mat_23_60_sp2), rhs_mat_0145_61_sp2, lhs_mat_23_61_sp2);
+                        __m256i iacc_mat_11_6_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_60_sp2, lhs_mat_23_60_sp2), rhs_mat_2367_61_sp2, lhs_mat_23_61_sp2);
+
+                        __m256i iacc_mat_00_7_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_70_sp2, lhs_mat_01_70_sp2), rhs_mat_0145_71_sp2, lhs_mat_01_71_sp2);
+                        __m256i iacc_mat_01_7_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_70_sp2, lhs_mat_01_70_sp2), rhs_mat_2367_71_sp2, lhs_mat_01_71_sp2);
+
+                        __m256i iacc_mat_10_7_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_70_sp2, lhs_mat_23_70_sp2), rhs_mat_0145_71_sp2, lhs_mat_23_71_sp2);
+                        __m256i iacc_mat_11_7_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_70_sp2, lhs_mat_23_70_sp2), rhs_mat_2367_71_sp2, lhs_mat_23_71_sp2);
+
+                        // Combine results from both shuffle patterns for each output block
+                        __m256i iacc_mat_00_0 = _mm256_add_epi32(iacc_mat_00_0_sp1, iacc_mat_00_0_sp2);
+                        __m256i iacc_mat_01_0 = _mm256_add_epi32(iacc_mat_01_0_sp1, iacc_mat_01_0_sp2);
+                        __m256i iacc_mat_10_0 = _mm256_add_epi32(iacc_mat_10_0_sp1, iacc_mat_10_0_sp2);
+                        __m256i iacc_mat_11_0 = _mm256_add_epi32(iacc_mat_11_0_sp1, iacc_mat_11_0_sp2);
+
+                        __m256i iacc_mat_00_1 = _mm256_add_epi32(iacc_mat_00_1_sp1, iacc_mat_00_1_sp2);
+                        __m256i iacc_mat_01_1 = _mm256_add_epi32(iacc_mat_01_1_sp1, iacc_mat_01_1_sp2);
+                        __m256i iacc_mat_10_1 = _mm256_add_epi32(iacc_mat_10_1_sp1, iacc_mat_10_1_sp2);
+                        __m256i iacc_mat_11_1 = _mm256_add_epi32(iacc_mat_11_1_sp1, iacc_mat_11_1_sp2);
+
+                        __m256i iacc_mat_00_2 = _mm256_add_epi32(iacc_mat_00_2_sp1, iacc_mat_00_2_sp2);
+                        __m256i iacc_mat_01_2 = _mm256_add_epi32(iacc_mat_01_2_sp1, iacc_mat_01_2_sp2);
+                        __m256i iacc_mat_10_2 = _mm256_add_epi32(iacc_mat_10_2_sp1, iacc_mat_10_2_sp2);
+                        __m256i iacc_mat_11_2 = _mm256_add_epi32(iacc_mat_11_2_sp1, iacc_mat_11_2_sp2);
+
+                        __m256i iacc_mat_00_3 = _mm256_add_epi32(iacc_mat_00_3_sp1, iacc_mat_00_3_sp2);
+                        __m256i iacc_mat_01_3 = _mm256_add_epi32(iacc_mat_01_3_sp1, iacc_mat_01_3_sp2);
+                        __m256i iacc_mat_10_3 = _mm256_add_epi32(iacc_mat_10_3_sp1, iacc_mat_10_3_sp2);
+                        __m256i iacc_mat_11_3 = _mm256_add_epi32(iacc_mat_11_3_sp1, iacc_mat_11_3_sp2);
+
+                        __m256i iacc_mat_00_4 = _mm256_add_epi32(iacc_mat_00_4_sp1, iacc_mat_00_4_sp2);
+                        __m256i iacc_mat_01_4 = _mm256_add_epi32(iacc_mat_01_4_sp1, iacc_mat_01_4_sp2);
+                        __m256i iacc_mat_10_4 = _mm256_add_epi32(iacc_mat_10_4_sp1, iacc_mat_10_4_sp2);
+                        __m256i iacc_mat_11_4 = _mm256_add_epi32(iacc_mat_11_4_sp1, iacc_mat_11_4_sp2);
+
+                        __m256i iacc_mat_00_5 = _mm256_add_epi32(iacc_mat_00_5_sp1, iacc_mat_00_5_sp2);
+                        __m256i iacc_mat_01_5 = _mm256_add_epi32(iacc_mat_01_5_sp1, iacc_mat_01_5_sp2);
+                        __m256i iacc_mat_10_5 = _mm256_add_epi32(iacc_mat_10_5_sp1, iacc_mat_10_5_sp2);
+                        __m256i iacc_mat_11_5 = _mm256_add_epi32(iacc_mat_11_5_sp1, iacc_mat_11_5_sp2);
+
+                        __m256i iacc_mat_00_6 = _mm256_add_epi32(iacc_mat_00_6_sp1, iacc_mat_00_6_sp2);
+                        __m256i iacc_mat_01_6 = _mm256_add_epi32(iacc_mat_01_6_sp1, iacc_mat_01_6_sp2);
+                        __m256i iacc_mat_10_6 = _mm256_add_epi32(iacc_mat_10_6_sp1, iacc_mat_10_6_sp2);
+                        __m256i iacc_mat_11_6 = _mm256_add_epi32(iacc_mat_11_6_sp1, iacc_mat_11_6_sp2);
+
+                        __m256i iacc_mat_00_7 = _mm256_add_epi32(iacc_mat_00_7_sp1, iacc_mat_00_7_sp2);
+                        __m256i iacc_mat_01_7 = _mm256_add_epi32(iacc_mat_01_7_sp1, iacc_mat_01_7_sp2);
+                        __m256i iacc_mat_10_7 = _mm256_add_epi32(iacc_mat_10_7_sp1, iacc_mat_10_7_sp2);
+                        __m256i iacc_mat_11_7 = _mm256_add_epi32(iacc_mat_11_7_sp1, iacc_mat_11_7_sp2);
+
+                        // Output of both shuffle patterns are added in order to sum dot product outputs of all 32 values in block
+                        iacc_mat_00_0 = _mm256_mullo_epi32(iacc_mat_00_0, scale32_0145_0);
+                        iacc_mat_01_0 = _mm256_mullo_epi32(iacc_mat_01_0, scale32_2367_0);
+                        iacc_mat_10_0 = _mm256_mullo_epi32(iacc_mat_10_0, scale32_0145_0);
+                        iacc_mat_11_0 = _mm256_mullo_epi32(iacc_mat_11_0, scale32_2367_0);
+
+                        iacc_mat_00_1 = _mm256_mullo_epi32(iacc_mat_00_1, scale32_0145_1);
+                        iacc_mat_01_1 = _mm256_mullo_epi32(iacc_mat_01_1, scale32_2367_1);
+                        iacc_mat_10_1 = _mm256_mullo_epi32(iacc_mat_10_1, scale32_0145_1);
+                        iacc_mat_11_1 = _mm256_mullo_epi32(iacc_mat_11_1, scale32_2367_1);
+
+                        iacc_mat_00_2 = _mm256_mullo_epi32(iacc_mat_00_2, scale32_0145_2);
+                        iacc_mat_01_2 = _mm256_mullo_epi32(iacc_mat_01_2, scale32_2367_2);
+                        iacc_mat_10_2 = _mm256_mullo_epi32(iacc_mat_10_2, scale32_0145_2);
+                        iacc_mat_11_2 = _mm256_mullo_epi32(iacc_mat_11_2, scale32_2367_2);
+
+                        iacc_mat_00_3 = _mm256_mullo_epi32(iacc_mat_00_3, scale32_0145_3);
+                        iacc_mat_01_3 = _mm256_mullo_epi32(iacc_mat_01_3, scale32_2367_3);
+                        iacc_mat_10_3 = _mm256_mullo_epi32(iacc_mat_10_3, scale32_0145_3);
+                        iacc_mat_11_3 = _mm256_mullo_epi32(iacc_mat_11_3, scale32_2367_3);
+
+                        iacc_mat_00_4 = _mm256_mullo_epi32(iacc_mat_00_4, scale32_0145_4);
+                        iacc_mat_01_4 = _mm256_mullo_epi32(iacc_mat_01_4, scale32_2367_4);
+                        iacc_mat_10_4 = _mm256_mullo_epi32(iacc_mat_10_4, scale32_0145_4);
+                        iacc_mat_11_4 = _mm256_mullo_epi32(iacc_mat_11_4, scale32_2367_4);
+
+                        iacc_mat_00_5 = _mm256_mullo_epi32(iacc_mat_00_5, scale32_0145_5);
+                        iacc_mat_01_5 = _mm256_mullo_epi32(iacc_mat_01_5, scale32_2367_5);
+                        iacc_mat_10_5 = _mm256_mullo_epi32(iacc_mat_10_5, scale32_0145_5);
+                        iacc_mat_11_5 = _mm256_mullo_epi32(iacc_mat_11_5, scale32_2367_5);
+
+                        iacc_mat_00_6 = _mm256_mullo_epi32(iacc_mat_00_6, scale32_0145_6);
+                        iacc_mat_01_6 = _mm256_mullo_epi32(iacc_mat_01_6, scale32_2367_6);
+                        iacc_mat_10_6 = _mm256_mullo_epi32(iacc_mat_10_6, scale32_0145_6);
+                        iacc_mat_11_6 = _mm256_mullo_epi32(iacc_mat_11_6, scale32_2367_6);
+
+                        iacc_mat_00_7 = _mm256_mullo_epi32(iacc_mat_00_7, scale32_0145_7);
+                        iacc_mat_01_7 = _mm256_mullo_epi32(iacc_mat_01_7, scale32_2367_7);
+                        iacc_mat_10_7 = _mm256_mullo_epi32(iacc_mat_10_7, scale32_0145_7);
+                        iacc_mat_11_7 = _mm256_mullo_epi32(iacc_mat_11_7, scale32_2367_7);
+#elif defined(__AVXVNNI__)
+                        const __m256i scale32_0145_0 = _mm256_and_si256(scale_0145_0, _mm256_set1_epi32(0xFFFF));
+                        const __m256i scale32_2367_0 = _mm256_and_si256(scale_2367_0, _mm256_set1_epi32(0xFFFF));
+                        const __m256i scale32_0145_1 = _mm256_and_si256(scale_0145_1, _mm256_set1_epi32(0xFFFF));
+                        const __m256i scale32_2367_1 = _mm256_and_si256(scale_2367_1, _mm256_set1_epi32(0xFFFF));
+                        const __m256i scale32_0145_2 = _mm256_and_si256(scale_0145_2, _mm256_set1_epi32(0xFFFF));
+                        const __m256i scale32_2367_2 = _mm256_and_si256(scale_2367_2, _mm256_set1_epi32(0xFFFF));
+                        const __m256i scale32_0145_3 = _mm256_and_si256(scale_0145_3, _mm256_set1_epi32(0xFFFF));
+                        const __m256i scale32_2367_3 = _mm256_and_si256(scale_2367_3, _mm256_set1_epi32(0xFFFF));
+                        const __m256i scale32_0145_4 = _mm256_and_si256(scale_0145_4, _mm256_set1_epi32(0xFFFF));
+                        const __m256i scale32_2367_4 = _mm256_and_si256(scale_2367_4, _mm256_set1_epi32(0xFFFF));
+                        const __m256i scale32_0145_5 = _mm256_and_si256(scale_0145_5, _mm256_set1_epi32(0xFFFF));
+                        const __m256i scale32_2367_5 = _mm256_and_si256(scale_2367_5, _mm256_set1_epi32(0xFFFF));
+                        const __m256i scale32_0145_6 = _mm256_and_si256(scale_0145_6, _mm256_set1_epi32(0xFFFF));
+                        const __m256i scale32_2367_6 = _mm256_and_si256(scale_2367_6, _mm256_set1_epi32(0xFFFF));
+                        const __m256i scale32_0145_7 = _mm256_and_si256(scale_0145_7, _mm256_set1_epi32(0xFFFF));
+                        const __m256i scale32_2367_7 = _mm256_and_si256(scale_2367_7, _mm256_set1_epi32(0xFFFF));
+
+                        __m256i iacc_mat_00_0_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_00_sp1, lhs_mat_01_00_sp1), rhs_mat_0145_01_sp1, lhs_mat_01_01_sp1);
+                        __m256i iacc_mat_01_0_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_00_sp1, lhs_mat_01_00_sp1), rhs_mat_2367_01_sp1, lhs_mat_01_01_sp1);
+
+                        __m256i iacc_mat_10_0_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_00_sp1, lhs_mat_23_00_sp1), rhs_mat_0145_01_sp1, lhs_mat_23_01_sp1);
+                        __m256i iacc_mat_11_0_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_00_sp1, lhs_mat_23_00_sp1), rhs_mat_2367_01_sp1, lhs_mat_23_01_sp1);
+
+                        __m256i iacc_mat_00_1_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_10_sp1, lhs_mat_01_10_sp1), rhs_mat_0145_11_sp1, lhs_mat_01_11_sp1);
+                        __m256i iacc_mat_01_1_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_10_sp1, lhs_mat_01_10_sp1), rhs_mat_2367_11_sp1, lhs_mat_01_11_sp1);
+
+                        __m256i iacc_mat_10_1_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_10_sp1, lhs_mat_23_10_sp1), rhs_mat_0145_11_sp1, lhs_mat_23_11_sp1);
+                        __m256i iacc_mat_11_1_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_10_sp1, lhs_mat_23_10_sp1), rhs_mat_2367_11_sp1, lhs_mat_23_11_sp1);
+
+                        __m256i iacc_mat_00_2_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_20_sp1, lhs_mat_01_20_sp1), rhs_mat_0145_21_sp1, lhs_mat_01_21_sp1);
+                        __m256i iacc_mat_01_2_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_20_sp1, lhs_mat_01_20_sp1), rhs_mat_2367_21_sp1, lhs_mat_01_21_sp1);
+
+                        __m256i iacc_mat_10_2_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_20_sp1, lhs_mat_23_20_sp1), rhs_mat_0145_21_sp1, lhs_mat_23_21_sp1);
+                        __m256i iacc_mat_11_2_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_20_sp1, lhs_mat_23_20_sp1), rhs_mat_2367_21_sp1, lhs_mat_23_21_sp1);
+
+                        __m256i iacc_mat_00_3_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_30_sp1, lhs_mat_01_30_sp1), rhs_mat_0145_31_sp1, lhs_mat_01_31_sp1);
+                        __m256i iacc_mat_01_3_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_30_sp1, lhs_mat_01_30_sp1), rhs_mat_2367_31_sp1, lhs_mat_01_31_sp1);
+
+                        __m256i iacc_mat_10_3_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_30_sp1, lhs_mat_23_30_sp1), rhs_mat_0145_31_sp1, lhs_mat_23_31_sp1);
+                        __m256i iacc_mat_11_3_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_30_sp1, lhs_mat_23_30_sp1), rhs_mat_2367_31_sp1, lhs_mat_23_31_sp1);
+
+                        __m256i iacc_mat_00_4_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_40_sp1, lhs_mat_01_40_sp1), rhs_mat_0145_41_sp1, lhs_mat_01_41_sp1);
+                        __m256i iacc_mat_01_4_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_40_sp1, lhs_mat_01_40_sp1), rhs_mat_2367_41_sp1, lhs_mat_01_41_sp1);
+
+                        __m256i iacc_mat_10_4_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_40_sp1, lhs_mat_23_40_sp1), rhs_mat_0145_41_sp1, lhs_mat_23_41_sp1);
+                        __m256i iacc_mat_11_4_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_40_sp1, lhs_mat_23_40_sp1), rhs_mat_2367_41_sp1, lhs_mat_23_41_sp1);
+
+                        __m256i iacc_mat_00_5_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_50_sp1, lhs_mat_01_50_sp1), rhs_mat_0145_51_sp1, lhs_mat_01_51_sp1);
+                        __m256i iacc_mat_01_5_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_50_sp1, lhs_mat_01_50_sp1), rhs_mat_2367_51_sp1, lhs_mat_01_51_sp1);
+
+                        __m256i iacc_mat_10_5_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_50_sp1, lhs_mat_23_50_sp1), rhs_mat_0145_51_sp1, lhs_mat_23_51_sp1);
+                        __m256i iacc_mat_11_5_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_50_sp1, lhs_mat_23_50_sp1), rhs_mat_2367_51_sp1, lhs_mat_23_51_sp1);
+
+                        __m256i iacc_mat_00_6_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_60_sp1, lhs_mat_01_60_sp1), rhs_mat_0145_61_sp1, lhs_mat_01_61_sp1);
+                        __m256i iacc_mat_01_6_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_60_sp1, lhs_mat_01_60_sp1), rhs_mat_2367_61_sp1, lhs_mat_01_61_sp1);
+
+                        __m256i iacc_mat_10_6_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_60_sp1, lhs_mat_23_60_sp1), rhs_mat_0145_61_sp1, lhs_mat_23_61_sp1);
+                        __m256i iacc_mat_11_6_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_60_sp1, lhs_mat_23_60_sp1), rhs_mat_2367_61_sp1, lhs_mat_23_61_sp1);
+
+                        __m256i iacc_mat_00_7_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_70_sp1, lhs_mat_01_70_sp1), rhs_mat_0145_71_sp1, lhs_mat_01_71_sp1);
+                        __m256i iacc_mat_01_7_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_70_sp1, lhs_mat_01_70_sp1), rhs_mat_2367_71_sp1, lhs_mat_01_71_sp1);
+
+                        __m256i iacc_mat_10_7_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_70_sp1, lhs_mat_23_70_sp1), rhs_mat_0145_71_sp1, lhs_mat_23_71_sp1);
+                        __m256i iacc_mat_11_7_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_70_sp1, lhs_mat_23_70_sp1), rhs_mat_2367_71_sp1, lhs_mat_23_71_sp1);
+
+
+                        __m256i iacc_mat_00_0_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_00_sp2, lhs_mat_01_00_sp2), rhs_mat_0145_01_sp2, lhs_mat_01_01_sp2);
+                        __m256i iacc_mat_01_0_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_00_sp2, lhs_mat_01_00_sp2), rhs_mat_2367_01_sp2, lhs_mat_01_01_sp2);
+
+                        __m256i iacc_mat_10_0_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_00_sp2, lhs_mat_23_00_sp2), rhs_mat_0145_01_sp2, lhs_mat_23_01_sp2);
+                        __m256i iacc_mat_11_0_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_00_sp2, lhs_mat_23_00_sp2), rhs_mat_2367_01_sp2, lhs_mat_23_01_sp2);
+
+                        __m256i iacc_mat_00_1_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_10_sp2, lhs_mat_01_10_sp2), rhs_mat_0145_11_sp2, lhs_mat_01_11_sp2);
+                        __m256i iacc_mat_01_1_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_10_sp2, lhs_mat_01_10_sp2), rhs_mat_2367_11_sp2, lhs_mat_01_11_sp2);
+
+                        __m256i iacc_mat_10_1_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_10_sp2, lhs_mat_23_10_sp2), rhs_mat_0145_11_sp2, lhs_mat_23_11_sp2);
+                        __m256i iacc_mat_11_1_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_10_sp2, lhs_mat_23_10_sp2), rhs_mat_2367_11_sp2, lhs_mat_23_11_sp2);
+
+                        __m256i iacc_mat_00_2_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_20_sp2, lhs_mat_01_20_sp2), rhs_mat_0145_21_sp2, lhs_mat_01_21_sp2);
+                        __m256i iacc_mat_01_2_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_20_sp2, lhs_mat_01_20_sp2), rhs_mat_2367_21_sp2, lhs_mat_01_21_sp2);
+
+                        __m256i iacc_mat_10_2_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_20_sp2, lhs_mat_23_20_sp2), rhs_mat_0145_21_sp2, lhs_mat_23_21_sp2);
+                        __m256i iacc_mat_11_2_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_20_sp2, lhs_mat_23_20_sp2), rhs_mat_2367_21_sp2, lhs_mat_23_21_sp2);
+
+                        __m256i iacc_mat_00_3_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_30_sp2, lhs_mat_01_30_sp2), rhs_mat_0145_31_sp2, lhs_mat_01_31_sp2);
+                        __m256i iacc_mat_01_3_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_30_sp2, lhs_mat_01_30_sp2), rhs_mat_2367_31_sp2, lhs_mat_01_31_sp2);
+
+                        __m256i iacc_mat_10_3_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_30_sp2, lhs_mat_23_30_sp2), rhs_mat_0145_31_sp2, lhs_mat_23_31_sp2);
+                        __m256i iacc_mat_11_3_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_30_sp2, lhs_mat_23_30_sp2), rhs_mat_2367_31_sp2, lhs_mat_23_31_sp2);
+
+                        __m256i iacc_mat_00_4_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_40_sp2, lhs_mat_01_40_sp2), rhs_mat_0145_41_sp2, lhs_mat_01_41_sp2);
+                        __m256i iacc_mat_01_4_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_40_sp2, lhs_mat_01_40_sp2), rhs_mat_2367_41_sp2, lhs_mat_01_41_sp2);
+
+                        __m256i iacc_mat_10_4_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_40_sp2, lhs_mat_23_40_sp2), rhs_mat_0145_41_sp2, lhs_mat_23_41_sp2);
+                        __m256i iacc_mat_11_4_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_40_sp2, lhs_mat_23_40_sp2), rhs_mat_2367_41_sp2, lhs_mat_23_41_sp2);
+
+                        __m256i iacc_mat_00_5_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_50_sp2, lhs_mat_01_50_sp2), rhs_mat_0145_51_sp2, lhs_mat_01_51_sp2);
+                        __m256i iacc_mat_01_5_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_50_sp2, lhs_mat_01_50_sp2), rhs_mat_2367_51_sp2, lhs_mat_01_51_sp2);
+
+                        __m256i iacc_mat_10_5_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_50_sp2, lhs_mat_23_50_sp2), rhs_mat_0145_51_sp2, lhs_mat_23_51_sp2);
+                        __m256i iacc_mat_11_5_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_50_sp2, lhs_mat_23_50_sp2), rhs_mat_2367_51_sp2, lhs_mat_23_51_sp2);
+
+                        __m256i iacc_mat_00_6_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_60_sp2, lhs_mat_01_60_sp2), rhs_mat_0145_61_sp2, lhs_mat_01_61_sp2);
+                        __m256i iacc_mat_01_6_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_60_sp2, lhs_mat_01_60_sp2), rhs_mat_2367_61_sp2, lhs_mat_01_61_sp2);
+
+                        __m256i iacc_mat_10_6_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_60_sp2, lhs_mat_23_60_sp2), rhs_mat_0145_61_sp2, lhs_mat_23_61_sp2);
+                        __m256i iacc_mat_11_6_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_60_sp2, lhs_mat_23_60_sp2), rhs_mat_2367_61_sp2, lhs_mat_23_61_sp2);
+
+                        __m256i iacc_mat_00_7_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_70_sp2, lhs_mat_01_70_sp2), rhs_mat_0145_71_sp2, lhs_mat_01_71_sp2);
+                        __m256i iacc_mat_01_7_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_70_sp2, lhs_mat_01_70_sp2), rhs_mat_2367_71_sp2, lhs_mat_01_71_sp2);
+
+                        __m256i iacc_mat_10_7_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_70_sp2, lhs_mat_23_70_sp2), rhs_mat_0145_71_sp2, lhs_mat_23_71_sp2);
+                        __m256i iacc_mat_11_7_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_70_sp2, lhs_mat_23_70_sp2), rhs_mat_2367_71_sp2, lhs_mat_23_71_sp2);
+
+                        // Combine results from both shuffle patterns for each output block
+                        __m256i iacc_mat_00_0 = _mm256_add_epi32(iacc_mat_00_0_sp1, iacc_mat_00_0_sp2);
+                        __m256i iacc_mat_01_0 = _mm256_add_epi32(iacc_mat_01_0_sp1, iacc_mat_01_0_sp2);
+                        __m256i iacc_mat_10_0 = _mm256_add_epi32(iacc_mat_10_0_sp1, iacc_mat_10_0_sp2);
+                        __m256i iacc_mat_11_0 = _mm256_add_epi32(iacc_mat_11_0_sp1, iacc_mat_11_0_sp2);
+
+                        __m256i iacc_mat_00_1 = _mm256_add_epi32(iacc_mat_00_1_sp1, iacc_mat_00_1_sp2);
+                        __m256i iacc_mat_01_1 = _mm256_add_epi32(iacc_mat_01_1_sp1, iacc_mat_01_1_sp2);
+                        __m256i iacc_mat_10_1 = _mm256_add_epi32(iacc_mat_10_1_sp1, iacc_mat_10_1_sp2);
+                        __m256i iacc_mat_11_1 = _mm256_add_epi32(iacc_mat_11_1_sp1, iacc_mat_11_1_sp2);
+
+                        __m256i iacc_mat_00_2 = _mm256_add_epi32(iacc_mat_00_2_sp1, iacc_mat_00_2_sp2);
+                        __m256i iacc_mat_01_2 = _mm256_add_epi32(iacc_mat_01_2_sp1, iacc_mat_01_2_sp2);
+                        __m256i iacc_mat_10_2 = _mm256_add_epi32(iacc_mat_10_2_sp1, iacc_mat_10_2_sp2);
+                        __m256i iacc_mat_11_2 = _mm256_add_epi32(iacc_mat_11_2_sp1, iacc_mat_11_2_sp2);
+
+                        __m256i iacc_mat_00_3 = _mm256_add_epi32(iacc_mat_00_3_sp1, iacc_mat_00_3_sp2);
+                        __m256i iacc_mat_01_3 = _mm256_add_epi32(iacc_mat_01_3_sp1, iacc_mat_01_3_sp2);
+                        __m256i iacc_mat_10_3 = _mm256_add_epi32(iacc_mat_10_3_sp1, iacc_mat_10_3_sp2);
+                        __m256i iacc_mat_11_3 = _mm256_add_epi32(iacc_mat_11_3_sp1, iacc_mat_11_3_sp2);
+
+                        __m256i iacc_mat_00_4 = _mm256_add_epi32(iacc_mat_00_4_sp1, iacc_mat_00_4_sp2);
+                        __m256i iacc_mat_01_4 = _mm256_add_epi32(iacc_mat_01_4_sp1, iacc_mat_01_4_sp2);
+                        __m256i iacc_mat_10_4 = _mm256_add_epi32(iacc_mat_10_4_sp1, iacc_mat_10_4_sp2);
+                        __m256i iacc_mat_11_4 = _mm256_add_epi32(iacc_mat_11_4_sp1, iacc_mat_11_4_sp2);
+
+                        __m256i iacc_mat_00_5 = _mm256_add_epi32(iacc_mat_00_5_sp1, iacc_mat_00_5_sp2);
+                        __m256i iacc_mat_01_5 = _mm256_add_epi32(iacc_mat_01_5_sp1, iacc_mat_01_5_sp2);
+                        __m256i iacc_mat_10_5 = _mm256_add_epi32(iacc_mat_10_5_sp1, iacc_mat_10_5_sp2);
+                        __m256i iacc_mat_11_5 = _mm256_add_epi32(iacc_mat_11_5_sp1, iacc_mat_11_5_sp2);
+
+                        __m256i iacc_mat_00_6 = _mm256_add_epi32(iacc_mat_00_6_sp1, iacc_mat_00_6_sp2);
+                        __m256i iacc_mat_01_6 = _mm256_add_epi32(iacc_mat_01_6_sp1, iacc_mat_01_6_sp2);
+                        __m256i iacc_mat_10_6 = _mm256_add_epi32(iacc_mat_10_6_sp1, iacc_mat_10_6_sp2);
+                        __m256i iacc_mat_11_6 = _mm256_add_epi32(iacc_mat_11_6_sp1, iacc_mat_11_6_sp2);
+
+                        __m256i iacc_mat_00_7 = _mm256_add_epi32(iacc_mat_00_7_sp1, iacc_mat_00_7_sp2);
+                        __m256i iacc_mat_01_7 = _mm256_add_epi32(iacc_mat_01_7_sp1, iacc_mat_01_7_sp2);
+                        __m256i iacc_mat_10_7 = _mm256_add_epi32(iacc_mat_10_7_sp1, iacc_mat_10_7_sp2);
+                        __m256i iacc_mat_11_7 = _mm256_add_epi32(iacc_mat_11_7_sp1, iacc_mat_11_7_sp2);
+
+                        // Output of both shuffle patterns are added in order to sum dot product outputs of all 32 values in block
+                        iacc_mat_00_0 = _mm256_mullo_epi32(iacc_mat_00_0, scale32_0145_0);
+                        iacc_mat_01_0 = _mm256_mullo_epi32(iacc_mat_01_0, scale32_2367_0);
+                        iacc_mat_10_0 = _mm256_mullo_epi32(iacc_mat_10_0, scale32_0145_0);
+                        iacc_mat_11_0 = _mm256_mullo_epi32(iacc_mat_11_0, scale32_2367_0);
+
+                        iacc_mat_00_1 = _mm256_mullo_epi32(iacc_mat_00_1, scale32_0145_1);
+                        iacc_mat_01_1 = _mm256_mullo_epi32(iacc_mat_01_1, scale32_2367_1);
+                        iacc_mat_10_1 = _mm256_mullo_epi32(iacc_mat_10_1, scale32_0145_1);
+                        iacc_mat_11_1 = _mm256_mullo_epi32(iacc_mat_11_1, scale32_2367_1);
+
+                        iacc_mat_00_2 = _mm256_mullo_epi32(iacc_mat_00_2, scale32_0145_2);
+                        iacc_mat_01_2 = _mm256_mullo_epi32(iacc_mat_01_2, scale32_2367_2);
+                        iacc_mat_10_2 = _mm256_mullo_epi32(iacc_mat_10_2, scale32_0145_2);
+                        iacc_mat_11_2 = _mm256_mullo_epi32(iacc_mat_11_2, scale32_2367_2);
+
+                        iacc_mat_00_3 = _mm256_mullo_epi32(iacc_mat_00_3, scale32_0145_3);
+                        iacc_mat_01_3 = _mm256_mullo_epi32(iacc_mat_01_3, scale32_2367_3);
+                        iacc_mat_10_3 = _mm256_mullo_epi32(iacc_mat_10_3, scale32_0145_3);
+                        iacc_mat_11_3 = _mm256_mullo_epi32(iacc_mat_11_3, scale32_2367_3);
+
+                        iacc_mat_00_4 = _mm256_mullo_epi32(iacc_mat_00_4, scale32_0145_4);
+                        iacc_mat_01_4 = _mm256_mullo_epi32(iacc_mat_01_4, scale32_2367_4);
+                        iacc_mat_10_4 = _mm256_mullo_epi32(iacc_mat_10_4, scale32_0145_4);
+                        iacc_mat_11_4 = _mm256_mullo_epi32(iacc_mat_11_4, scale32_2367_4);
+
+                        iacc_mat_00_5 = _mm256_mullo_epi32(iacc_mat_00_5, scale32_0145_5);
+                        iacc_mat_01_5 = _mm256_mullo_epi32(iacc_mat_01_5, scale32_2367_5);
+                        iacc_mat_10_5 = _mm256_mullo_epi32(iacc_mat_10_5, scale32_0145_5);
+                        iacc_mat_11_5 = _mm256_mullo_epi32(iacc_mat_11_5, scale32_2367_5);
+
+                        iacc_mat_00_6 = _mm256_mullo_epi32(iacc_mat_00_6, scale32_0145_6);
+                        iacc_mat_01_6 = _mm256_mullo_epi32(iacc_mat_01_6, scale32_2367_6);
+                        iacc_mat_10_6 = _mm256_mullo_epi32(iacc_mat_10_6, scale32_0145_6);
+                        iacc_mat_11_6 = _mm256_mullo_epi32(iacc_mat_11_6, scale32_2367_6);
+
+                        iacc_mat_00_7 = _mm256_mullo_epi32(iacc_mat_00_7, scale32_0145_7);
+                        iacc_mat_01_7 = _mm256_mullo_epi32(iacc_mat_01_7, scale32_2367_7);
+                        iacc_mat_10_7 = _mm256_mullo_epi32(iacc_mat_10_7, scale32_0145_7);
+                        iacc_mat_11_7 = _mm256_mullo_epi32(iacc_mat_11_7, scale32_2367_7);
+#else
                         __m256i iacc_mat_00_0_sp1 = _mm256_add_epi16(_mm256_maddubs_epi16(rhs_mat_0145_00_sp1, lhs_mat_01_00_sp1),_mm256_maddubs_epi16(rhs_mat_0145_01_sp1, lhs_mat_01_01_sp1));
                         __m256i iacc_mat_01_0_sp1 = _mm256_add_epi16(_mm256_maddubs_epi16(rhs_mat_2367_00_sp1, lhs_mat_01_00_sp1),_mm256_maddubs_epi16(rhs_mat_2367_01_sp1, lhs_mat_01_01_sp1));
 
@@ -7426,6 +8215,7 @@ void ggml_gemm_q2_K_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
                         iacc_mat_01_7 = _mm256_madd_epi16(iacc_mat_01_7, scale_2367_7);
                         iacc_mat_10_7 = _mm256_madd_epi16(iacc_mat_10_7, scale_0145_7);
                         iacc_mat_11_7 = _mm256_madd_epi16(iacc_mat_11_7, scale_2367_7);
+#endif
 
                         __m256i iacc_mat_00 = _mm256_add_epi32(_mm256_add_epi32(_mm256_add_epi32(iacc_mat_00_0, iacc_mat_00_1), _mm256_add_epi32(iacc_mat_00_2, iacc_mat_00_3)), _mm256_add_epi32(_mm256_add_epi32(iacc_mat_00_4, iacc_mat_00_5), _mm256_add_epi32(iacc_mat_00_6, iacc_mat_00_7)));
                         __m256i iacc_mat_01 = _mm256_add_epi32(_mm256_add_epi32(_mm256_add_epi32(iacc_mat_01_0, iacc_mat_01_1), _mm256_add_epi32(iacc_mat_01_2, iacc_mat_01_3)), _mm256_add_epi32(_mm256_add_epi32(iacc_mat_01_4, iacc_mat_01_5), _mm256_add_epi32(iacc_mat_01_6, iacc_mat_01_7)));
@@ -7920,6 +8710,399 @@ void ggml_gemm_q2_K_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
                     const __m256i lhs_mat_23_71_sp2 = _mm256_shuffle_epi32(lhs_mat_23_71, 245); //A72(12-15) A73(12-15) A72(12-15) A73(12-15) A72(12-15) A73(12-15) A72(12-15) A73(12-15)
 
                     // The values arranged in shuffle patterns are operated with dot product operation within 32 bit lane i.e corresponding bytes and multiplied and added into 32 bit integers within 32 bit lane
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+                    const __m256i scale32_0145_0 = _mm256_and_si256(scale_0145_0, _mm256_set1_epi32(0xFFFF));
+                    const __m256i scale32_2367_0 = _mm256_and_si256(scale_2367_0, _mm256_set1_epi32(0xFFFF));
+                    const __m256i scale32_0145_1 = _mm256_and_si256(scale_0145_1, _mm256_set1_epi32(0xFFFF));
+                    const __m256i scale32_2367_1 = _mm256_and_si256(scale_2367_1, _mm256_set1_epi32(0xFFFF));
+                    const __m256i scale32_0145_2 = _mm256_and_si256(scale_0145_2, _mm256_set1_epi32(0xFFFF));
+                    const __m256i scale32_2367_2 = _mm256_and_si256(scale_2367_2, _mm256_set1_epi32(0xFFFF));
+                    const __m256i scale32_0145_3 = _mm256_and_si256(scale_0145_3, _mm256_set1_epi32(0xFFFF));
+                    const __m256i scale32_2367_3 = _mm256_and_si256(scale_2367_3, _mm256_set1_epi32(0xFFFF));
+                    const __m256i scale32_0145_4 = _mm256_and_si256(scale_0145_4, _mm256_set1_epi32(0xFFFF));
+                    const __m256i scale32_2367_4 = _mm256_and_si256(scale_2367_4, _mm256_set1_epi32(0xFFFF));
+                    const __m256i scale32_0145_5 = _mm256_and_si256(scale_0145_5, _mm256_set1_epi32(0xFFFF));
+                    const __m256i scale32_2367_5 = _mm256_and_si256(scale_2367_5, _mm256_set1_epi32(0xFFFF));
+                    const __m256i scale32_0145_6 = _mm256_and_si256(scale_0145_6, _mm256_set1_epi32(0xFFFF));
+                    const __m256i scale32_2367_6 = _mm256_and_si256(scale_2367_6, _mm256_set1_epi32(0xFFFF));
+                    const __m256i scale32_0145_7 = _mm256_and_si256(scale_0145_7, _mm256_set1_epi32(0xFFFF));
+                    const __m256i scale32_2367_7 = _mm256_and_si256(scale_2367_7, _mm256_set1_epi32(0xFFFF));
+
+                    __m256i iacc_mat_00_0_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_00_sp1, lhs_mat_01_00_sp1), rhs_mat_0145_01_sp1, lhs_mat_01_01_sp1);
+                    __m256i iacc_mat_01_0_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_00_sp1, lhs_mat_01_00_sp1), rhs_mat_2367_01_sp1, lhs_mat_01_01_sp1);
+
+                    __m256i iacc_mat_10_0_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_00_sp1, lhs_mat_23_00_sp1), rhs_mat_0145_01_sp1, lhs_mat_23_01_sp1);
+                    __m256i iacc_mat_11_0_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_00_sp1, lhs_mat_23_00_sp1), rhs_mat_2367_01_sp1, lhs_mat_23_01_sp1);
+
+                    __m256i iacc_mat_00_1_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_10_sp1, lhs_mat_01_10_sp1), rhs_mat_0145_11_sp1, lhs_mat_01_11_sp1);
+                    __m256i iacc_mat_01_1_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_10_sp1, lhs_mat_01_10_sp1), rhs_mat_2367_11_sp1, lhs_mat_01_11_sp1);
+
+                    __m256i iacc_mat_10_1_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_10_sp1, lhs_mat_23_10_sp1), rhs_mat_0145_11_sp1, lhs_mat_23_11_sp1);
+                    __m256i iacc_mat_11_1_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_10_sp1, lhs_mat_23_10_sp1), rhs_mat_2367_11_sp1, lhs_mat_23_11_sp1);
+
+                    __m256i iacc_mat_00_2_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_20_sp1, lhs_mat_01_20_sp1), rhs_mat_0145_21_sp1, lhs_mat_01_21_sp1);
+                    __m256i iacc_mat_01_2_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_20_sp1, lhs_mat_01_20_sp1), rhs_mat_2367_21_sp1, lhs_mat_01_21_sp1);
+
+                    __m256i iacc_mat_10_2_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_20_sp1, lhs_mat_23_20_sp1), rhs_mat_0145_21_sp1, lhs_mat_23_21_sp1);
+                    __m256i iacc_mat_11_2_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_20_sp1, lhs_mat_23_20_sp1), rhs_mat_2367_21_sp1, lhs_mat_23_21_sp1);
+
+                    __m256i iacc_mat_00_3_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_30_sp1, lhs_mat_01_30_sp1), rhs_mat_0145_31_sp1, lhs_mat_01_31_sp1);
+                    __m256i iacc_mat_01_3_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_30_sp1, lhs_mat_01_30_sp1), rhs_mat_2367_31_sp1, lhs_mat_01_31_sp1);
+
+                    __m256i iacc_mat_10_3_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_30_sp1, lhs_mat_23_30_sp1), rhs_mat_0145_31_sp1, lhs_mat_23_31_sp1);
+                    __m256i iacc_mat_11_3_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_30_sp1, lhs_mat_23_30_sp1), rhs_mat_2367_31_sp1, lhs_mat_23_31_sp1);
+
+                    __m256i iacc_mat_00_4_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_40_sp1, lhs_mat_01_40_sp1), rhs_mat_0145_41_sp1, lhs_mat_01_41_sp1);
+                    __m256i iacc_mat_01_4_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_40_sp1, lhs_mat_01_40_sp1), rhs_mat_2367_41_sp1, lhs_mat_01_41_sp1);
+
+                    __m256i iacc_mat_10_4_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_40_sp1, lhs_mat_23_40_sp1), rhs_mat_0145_41_sp1, lhs_mat_23_41_sp1);
+                    __m256i iacc_mat_11_4_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_40_sp1, lhs_mat_23_40_sp1), rhs_mat_2367_41_sp1, lhs_mat_23_41_sp1);
+
+                    __m256i iacc_mat_00_5_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_50_sp1, lhs_mat_01_50_sp1), rhs_mat_0145_51_sp1, lhs_mat_01_51_sp1);
+                    __m256i iacc_mat_01_5_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_50_sp1, lhs_mat_01_50_sp1), rhs_mat_2367_51_sp1, lhs_mat_01_51_sp1);
+
+                    __m256i iacc_mat_10_5_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_50_sp1, lhs_mat_23_50_sp1), rhs_mat_0145_51_sp1, lhs_mat_23_51_sp1);
+                    __m256i iacc_mat_11_5_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_50_sp1, lhs_mat_23_50_sp1), rhs_mat_2367_51_sp1, lhs_mat_23_51_sp1);
+
+                    __m256i iacc_mat_00_6_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_60_sp1, lhs_mat_01_60_sp1), rhs_mat_0145_61_sp1, lhs_mat_01_61_sp1);
+                    __m256i iacc_mat_01_6_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_60_sp1, lhs_mat_01_60_sp1), rhs_mat_2367_61_sp1, lhs_mat_01_61_sp1);
+
+                    __m256i iacc_mat_10_6_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_60_sp1, lhs_mat_23_60_sp1), rhs_mat_0145_61_sp1, lhs_mat_23_61_sp1);
+                    __m256i iacc_mat_11_6_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_60_sp1, lhs_mat_23_60_sp1), rhs_mat_2367_61_sp1, lhs_mat_23_61_sp1);
+
+                    __m256i iacc_mat_00_7_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_70_sp1, lhs_mat_01_70_sp1), rhs_mat_0145_71_sp1, lhs_mat_01_71_sp1);
+                    __m256i iacc_mat_01_7_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_70_sp1, lhs_mat_01_70_sp1), rhs_mat_2367_71_sp1, lhs_mat_01_71_sp1);
+
+                    __m256i iacc_mat_10_7_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_70_sp1, lhs_mat_23_70_sp1), rhs_mat_0145_71_sp1, lhs_mat_23_71_sp1);
+                    __m256i iacc_mat_11_7_sp1 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_70_sp1, lhs_mat_23_70_sp1), rhs_mat_2367_71_sp1, lhs_mat_23_71_sp1);
+
+
+                    __m256i iacc_mat_00_0_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_00_sp2, lhs_mat_01_00_sp2), rhs_mat_0145_01_sp2, lhs_mat_01_01_sp2);
+                    __m256i iacc_mat_01_0_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_00_sp2, lhs_mat_01_00_sp2), rhs_mat_2367_01_sp2, lhs_mat_01_01_sp2);
+
+                    __m256i iacc_mat_10_0_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_00_sp2, lhs_mat_23_00_sp2), rhs_mat_0145_01_sp2, lhs_mat_23_01_sp2);
+                    __m256i iacc_mat_11_0_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_00_sp2, lhs_mat_23_00_sp2), rhs_mat_2367_01_sp2, lhs_mat_23_01_sp2);
+
+                    __m256i iacc_mat_00_1_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_10_sp2, lhs_mat_01_10_sp2), rhs_mat_0145_11_sp2, lhs_mat_01_11_sp2);
+                    __m256i iacc_mat_01_1_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_10_sp2, lhs_mat_01_10_sp2), rhs_mat_2367_11_sp2, lhs_mat_01_11_sp2);
+
+                    __m256i iacc_mat_10_1_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_10_sp2, lhs_mat_23_10_sp2), rhs_mat_0145_11_sp2, lhs_mat_23_11_sp2);
+                    __m256i iacc_mat_11_1_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_10_sp2, lhs_mat_23_10_sp2), rhs_mat_2367_11_sp2, lhs_mat_23_11_sp2);
+
+                    __m256i iacc_mat_00_2_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_20_sp2, lhs_mat_01_20_sp2), rhs_mat_0145_21_sp2, lhs_mat_01_21_sp2);
+                    __m256i iacc_mat_01_2_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_20_sp2, lhs_mat_01_20_sp2), rhs_mat_2367_21_sp2, lhs_mat_01_21_sp2);
+
+                    __m256i iacc_mat_10_2_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_20_sp2, lhs_mat_23_20_sp2), rhs_mat_0145_21_sp2, lhs_mat_23_21_sp2);
+                    __m256i iacc_mat_11_2_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_20_sp2, lhs_mat_23_20_sp2), rhs_mat_2367_21_sp2, lhs_mat_23_21_sp2);
+
+                    __m256i iacc_mat_00_3_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_30_sp2, lhs_mat_01_30_sp2), rhs_mat_0145_31_sp2, lhs_mat_01_31_sp2);
+                    __m256i iacc_mat_01_3_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_30_sp2, lhs_mat_01_30_sp2), rhs_mat_2367_31_sp2, lhs_mat_01_31_sp2);
+
+                    __m256i iacc_mat_10_3_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_30_sp2, lhs_mat_23_30_sp2), rhs_mat_0145_31_sp2, lhs_mat_23_31_sp2);
+                    __m256i iacc_mat_11_3_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_30_sp2, lhs_mat_23_30_sp2), rhs_mat_2367_31_sp2, lhs_mat_23_31_sp2);
+
+                    __m256i iacc_mat_00_4_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_40_sp2, lhs_mat_01_40_sp2), rhs_mat_0145_41_sp2, lhs_mat_01_41_sp2);
+                    __m256i iacc_mat_01_4_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_40_sp2, lhs_mat_01_40_sp2), rhs_mat_2367_41_sp2, lhs_mat_01_41_sp2);
+
+                    __m256i iacc_mat_10_4_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_40_sp2, lhs_mat_23_40_sp2), rhs_mat_0145_41_sp2, lhs_mat_23_41_sp2);
+                    __m256i iacc_mat_11_4_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_40_sp2, lhs_mat_23_40_sp2), rhs_mat_2367_41_sp2, lhs_mat_23_41_sp2);
+
+                    __m256i iacc_mat_00_5_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_50_sp2, lhs_mat_01_50_sp2), rhs_mat_0145_51_sp2, lhs_mat_01_51_sp2);
+                    __m256i iacc_mat_01_5_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_50_sp2, lhs_mat_01_50_sp2), rhs_mat_2367_51_sp2, lhs_mat_01_51_sp2);
+
+                    __m256i iacc_mat_10_5_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_50_sp2, lhs_mat_23_50_sp2), rhs_mat_0145_51_sp2, lhs_mat_23_51_sp2);
+                    __m256i iacc_mat_11_5_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_50_sp2, lhs_mat_23_50_sp2), rhs_mat_2367_51_sp2, lhs_mat_23_51_sp2);
+
+                    __m256i iacc_mat_00_6_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_60_sp2, lhs_mat_01_60_sp2), rhs_mat_0145_61_sp2, lhs_mat_01_61_sp2);
+                    __m256i iacc_mat_01_6_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_60_sp2, lhs_mat_01_60_sp2), rhs_mat_2367_61_sp2, lhs_mat_01_61_sp2);
+
+                    __m256i iacc_mat_10_6_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_60_sp2, lhs_mat_23_60_sp2), rhs_mat_0145_61_sp2, lhs_mat_23_61_sp2);
+                    __m256i iacc_mat_11_6_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_60_sp2, lhs_mat_23_60_sp2), rhs_mat_2367_61_sp2, lhs_mat_23_61_sp2);
+
+                    __m256i iacc_mat_00_7_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_70_sp2, lhs_mat_01_70_sp2), rhs_mat_0145_71_sp2, lhs_mat_01_71_sp2);
+                    __m256i iacc_mat_01_7_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_70_sp2, lhs_mat_01_70_sp2), rhs_mat_2367_71_sp2, lhs_mat_01_71_sp2);
+
+                    __m256i iacc_mat_10_7_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_0145_70_sp2, lhs_mat_23_70_sp2), rhs_mat_0145_71_sp2, lhs_mat_23_71_sp2);
+                    __m256i iacc_mat_11_7_sp2 = _mm256_dpbusd_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), rhs_mat_2367_70_sp2, lhs_mat_23_70_sp2), rhs_mat_2367_71_sp2, lhs_mat_23_71_sp2);
+
+                    // Combine results from both shuffle patterns for each output block.
+                    __m256i iacc_mat_00_0 = _mm256_add_epi32(iacc_mat_00_0_sp1, iacc_mat_00_0_sp2);
+                    __m256i iacc_mat_01_0 = _mm256_add_epi32(iacc_mat_01_0_sp1, iacc_mat_01_0_sp2);
+                    __m256i iacc_mat_10_0 = _mm256_add_epi32(iacc_mat_10_0_sp1, iacc_mat_10_0_sp2);
+                    __m256i iacc_mat_11_0 = _mm256_add_epi32(iacc_mat_11_0_sp1, iacc_mat_11_0_sp2);
+
+                    __m256i iacc_mat_00_1 = _mm256_add_epi32(iacc_mat_00_1_sp1, iacc_mat_00_1_sp2);
+                    __m256i iacc_mat_01_1 = _mm256_add_epi32(iacc_mat_01_1_sp1, iacc_mat_01_1_sp2);
+                    __m256i iacc_mat_10_1 = _mm256_add_epi32(iacc_mat_10_1_sp1, iacc_mat_10_1_sp2);
+                    __m256i iacc_mat_11_1 = _mm256_add_epi32(iacc_mat_11_1_sp1, iacc_mat_11_1_sp2);
+
+                    __m256i iacc_mat_00_2 = _mm256_add_epi32(iacc_mat_00_2_sp1, iacc_mat_00_2_sp2);
+                    __m256i iacc_mat_01_2 = _mm256_add_epi32(iacc_mat_01_2_sp1, iacc_mat_01_2_sp2);
+                    __m256i iacc_mat_10_2 = _mm256_add_epi32(iacc_mat_10_2_sp1, iacc_mat_10_2_sp2);
+                    __m256i iacc_mat_11_2 = _mm256_add_epi32(iacc_mat_11_2_sp1, iacc_mat_11_2_sp2);
+
+                    __m256i iacc_mat_00_3 = _mm256_add_epi32(iacc_mat_00_3_sp1, iacc_mat_00_3_sp2);
+                    __m256i iacc_mat_01_3 = _mm256_add_epi32(iacc_mat_01_3_sp1, iacc_mat_01_3_sp2);
+                    __m256i iacc_mat_10_3 = _mm256_add_epi32(iacc_mat_10_3_sp1, iacc_mat_10_3_sp2);
+                    __m256i iacc_mat_11_3 = _mm256_add_epi32(iacc_mat_11_3_sp1, iacc_mat_11_3_sp2);
+
+                    __m256i iacc_mat_00_4 = _mm256_add_epi32(iacc_mat_00_4_sp1, iacc_mat_00_4_sp2);
+                    __m256i iacc_mat_01_4 = _mm256_add_epi32(iacc_mat_01_4_sp1, iacc_mat_01_4_sp2);
+                    __m256i iacc_mat_10_4 = _mm256_add_epi32(iacc_mat_10_4_sp1, iacc_mat_10_4_sp2);
+                    __m256i iacc_mat_11_4 = _mm256_add_epi32(iacc_mat_11_4_sp1, iacc_mat_11_4_sp2);
+
+                    __m256i iacc_mat_00_5 = _mm256_add_epi32(iacc_mat_00_5_sp1, iacc_mat_00_5_sp2);
+                    __m256i iacc_mat_01_5 = _mm256_add_epi32(iacc_mat_01_5_sp1, iacc_mat_01_5_sp2);
+                    __m256i iacc_mat_10_5 = _mm256_add_epi32(iacc_mat_10_5_sp1, iacc_mat_10_5_sp2);
+                    __m256i iacc_mat_11_5 = _mm256_add_epi32(iacc_mat_11_5_sp1, iacc_mat_11_5_sp2);
+
+                    __m256i iacc_mat_00_6 = _mm256_add_epi32(iacc_mat_00_6_sp1, iacc_mat_00_6_sp2);
+                    __m256i iacc_mat_01_6 = _mm256_add_epi32(iacc_mat_01_6_sp1, iacc_mat_01_6_sp2);
+                    __m256i iacc_mat_10_6 = _mm256_add_epi32(iacc_mat_10_6_sp1, iacc_mat_10_6_sp2);
+                    __m256i iacc_mat_11_6 = _mm256_add_epi32(iacc_mat_11_6_sp1, iacc_mat_11_6_sp2);
+
+                    __m256i iacc_mat_00_7 = _mm256_add_epi32(iacc_mat_00_7_sp1, iacc_mat_00_7_sp2);
+                    __m256i iacc_mat_01_7 = _mm256_add_epi32(iacc_mat_01_7_sp1, iacc_mat_01_7_sp2);
+                    __m256i iacc_mat_10_7 = _mm256_add_epi32(iacc_mat_10_7_sp1, iacc_mat_10_7_sp2);
+                    __m256i iacc_mat_11_7 = _mm256_add_epi32(iacc_mat_11_7_sp1, iacc_mat_11_7_sp2);
+
+                    // Output of both shuffle patterns are added in order to sum dot product outputs of all 32 values in block
+                    iacc_mat_00_0 = _mm256_mullo_epi32(iacc_mat_00_0, scale32_0145_0);
+                    iacc_mat_01_0 = _mm256_mullo_epi32(iacc_mat_01_0, scale32_2367_0);
+                    iacc_mat_10_0 = _mm256_mullo_epi32(iacc_mat_10_0, scale32_0145_0);
+                    iacc_mat_11_0 = _mm256_mullo_epi32(iacc_mat_11_0, scale32_2367_0);
+
+                    iacc_mat_00_1 = _mm256_mullo_epi32(iacc_mat_00_1, scale32_0145_1);
+                    iacc_mat_01_1 = _mm256_mullo_epi32(iacc_mat_01_1, scale32_2367_1);
+                    iacc_mat_10_1 = _mm256_mullo_epi32(iacc_mat_10_1, scale32_0145_1);
+                    iacc_mat_11_1 = _mm256_mullo_epi32(iacc_mat_11_1, scale32_2367_1);
+
+                    iacc_mat_00_2 = _mm256_mullo_epi32(iacc_mat_00_2, scale32_0145_2);
+                    iacc_mat_01_2 = _mm256_mullo_epi32(iacc_mat_01_2, scale32_2367_2);
+                    iacc_mat_10_2 = _mm256_mullo_epi32(iacc_mat_10_2, scale32_0145_2);
+                    iacc_mat_11_2 = _mm256_mullo_epi32(iacc_mat_11_2, scale32_2367_2);
+
+                    iacc_mat_00_3 = _mm256_mullo_epi32(iacc_mat_00_3, scale32_0145_3);
+                    iacc_mat_01_3 = _mm256_mullo_epi32(iacc_mat_01_3, scale32_2367_3);
+                    iacc_mat_10_3 = _mm256_mullo_epi32(iacc_mat_10_3, scale32_0145_3);
+                    iacc_mat_11_3 = _mm256_mullo_epi32(iacc_mat_11_3, scale32_2367_3);
+
+                    iacc_mat_00_4 = _mm256_mullo_epi32(iacc_mat_00_4, scale32_0145_4);
+                    iacc_mat_01_4 = _mm256_mullo_epi32(iacc_mat_01_4, scale32_2367_4);
+                    iacc_mat_10_4 = _mm256_mullo_epi32(iacc_mat_10_4, scale32_0145_4);
+                    iacc_mat_11_4 = _mm256_mullo_epi32(iacc_mat_11_4, scale32_2367_4);
+
+                    iacc_mat_00_5 = _mm256_mullo_epi32(iacc_mat_00_5, scale32_0145_5);
+                    iacc_mat_01_5 = _mm256_mullo_epi32(iacc_mat_01_5, scale32_2367_5);
+                    iacc_mat_10_5 = _mm256_mullo_epi32(iacc_mat_10_5, scale32_0145_5);
+                    iacc_mat_11_5 = _mm256_mullo_epi32(iacc_mat_11_5, scale32_2367_5);
+
+                    iacc_mat_00_6 = _mm256_mullo_epi32(iacc_mat_00_6, scale32_0145_6);
+                    iacc_mat_01_6 = _mm256_mullo_epi32(iacc_mat_01_6, scale32_2367_6);
+                    iacc_mat_10_6 = _mm256_mullo_epi32(iacc_mat_10_6, scale32_0145_6);
+                    iacc_mat_11_6 = _mm256_mullo_epi32(iacc_mat_11_6, scale32_2367_6);
+
+                    iacc_mat_00_7 = _mm256_mullo_epi32(iacc_mat_00_7, scale32_0145_7);
+                    iacc_mat_01_7 = _mm256_mullo_epi32(iacc_mat_01_7, scale32_2367_7);
+                    iacc_mat_10_7 = _mm256_mullo_epi32(iacc_mat_10_7, scale32_0145_7);
+                    iacc_mat_11_7 = _mm256_mullo_epi32(iacc_mat_11_7, scale32_2367_7);
+#elif defined(__AVXVNNI__)
+                    const __m256i scale32_0145_0 = _mm256_and_si256(scale_0145_0, _mm256_set1_epi32(0xFFFF));
+                    const __m256i scale32_2367_0 = _mm256_and_si256(scale_2367_0, _mm256_set1_epi32(0xFFFF));
+                    const __m256i scale32_0145_1 = _mm256_and_si256(scale_0145_1, _mm256_set1_epi32(0xFFFF));
+                    const __m256i scale32_2367_1 = _mm256_and_si256(scale_2367_1, _mm256_set1_epi32(0xFFFF));
+                    const __m256i scale32_0145_2 = _mm256_and_si256(scale_0145_2, _mm256_set1_epi32(0xFFFF));
+                    const __m256i scale32_2367_2 = _mm256_and_si256(scale_2367_2, _mm256_set1_epi32(0xFFFF));
+                    const __m256i scale32_0145_3 = _mm256_and_si256(scale_0145_3, _mm256_set1_epi32(0xFFFF));
+                    const __m256i scale32_2367_3 = _mm256_and_si256(scale_2367_3, _mm256_set1_epi32(0xFFFF));
+                    const __m256i scale32_0145_4 = _mm256_and_si256(scale_0145_4, _mm256_set1_epi32(0xFFFF));
+                    const __m256i scale32_2367_4 = _mm256_and_si256(scale_2367_4, _mm256_set1_epi32(0xFFFF));
+                    const __m256i scale32_0145_5 = _mm256_and_si256(scale_0145_5, _mm256_set1_epi32(0xFFFF));
+                    const __m256i scale32_2367_5 = _mm256_and_si256(scale_2367_5, _mm256_set1_epi32(0xFFFF));
+                    const __m256i scale32_0145_6 = _mm256_and_si256(scale_0145_6, _mm256_set1_epi32(0xFFFF));
+                    const __m256i scale32_2367_6 = _mm256_and_si256(scale_2367_6, _mm256_set1_epi32(0xFFFF));
+                    const __m256i scale32_0145_7 = _mm256_and_si256(scale_0145_7, _mm256_set1_epi32(0xFFFF));
+                    const __m256i scale32_2367_7 = _mm256_and_si256(scale_2367_7, _mm256_set1_epi32(0xFFFF));
+
+                    __m256i iacc_mat_00_0_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_00_sp1, lhs_mat_01_00_sp1), rhs_mat_0145_01_sp1, lhs_mat_01_01_sp1);
+                    __m256i iacc_mat_01_0_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_00_sp1, lhs_mat_01_00_sp1), rhs_mat_2367_01_sp1, lhs_mat_01_01_sp1);
+
+                    __m256i iacc_mat_10_0_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_00_sp1, lhs_mat_23_00_sp1), rhs_mat_0145_01_sp1, lhs_mat_23_01_sp1);
+                    __m256i iacc_mat_11_0_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_00_sp1, lhs_mat_23_00_sp1), rhs_mat_2367_01_sp1, lhs_mat_23_01_sp1);
+
+                    __m256i iacc_mat_00_1_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_10_sp1, lhs_mat_01_10_sp1), rhs_mat_0145_11_sp1, lhs_mat_01_11_sp1);
+                    __m256i iacc_mat_01_1_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_10_sp1, lhs_mat_01_10_sp1), rhs_mat_2367_11_sp1, lhs_mat_01_11_sp1);
+
+                    __m256i iacc_mat_10_1_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_10_sp1, lhs_mat_23_10_sp1), rhs_mat_0145_11_sp1, lhs_mat_23_11_sp1);
+                    __m256i iacc_mat_11_1_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_10_sp1, lhs_mat_23_10_sp1), rhs_mat_2367_11_sp1, lhs_mat_23_11_sp1);
+
+                    __m256i iacc_mat_00_2_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_20_sp1, lhs_mat_01_20_sp1), rhs_mat_0145_21_sp1, lhs_mat_01_21_sp1);
+                    __m256i iacc_mat_01_2_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_20_sp1, lhs_mat_01_20_sp1), rhs_mat_2367_21_sp1, lhs_mat_01_21_sp1);
+
+                    __m256i iacc_mat_10_2_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_20_sp1, lhs_mat_23_20_sp1), rhs_mat_0145_21_sp1, lhs_mat_23_21_sp1);
+                    __m256i iacc_mat_11_2_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_20_sp1, lhs_mat_23_20_sp1), rhs_mat_2367_21_sp1, lhs_mat_23_21_sp1);
+
+                    __m256i iacc_mat_00_3_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_30_sp1, lhs_mat_01_30_sp1), rhs_mat_0145_31_sp1, lhs_mat_01_31_sp1);
+                    __m256i iacc_mat_01_3_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_30_sp1, lhs_mat_01_30_sp1), rhs_mat_2367_31_sp1, lhs_mat_01_31_sp1);
+
+                    __m256i iacc_mat_10_3_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_30_sp1, lhs_mat_23_30_sp1), rhs_mat_0145_31_sp1, lhs_mat_23_31_sp1);
+                    __m256i iacc_mat_11_3_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_30_sp1, lhs_mat_23_30_sp1), rhs_mat_2367_31_sp1, lhs_mat_23_31_sp1);
+
+                    __m256i iacc_mat_00_4_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_40_sp1, lhs_mat_01_40_sp1), rhs_mat_0145_41_sp1, lhs_mat_01_41_sp1);
+                    __m256i iacc_mat_01_4_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_40_sp1, lhs_mat_01_40_sp1), rhs_mat_2367_41_sp1, lhs_mat_01_41_sp1);
+
+                    __m256i iacc_mat_10_4_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_40_sp1, lhs_mat_23_40_sp1), rhs_mat_0145_41_sp1, lhs_mat_23_41_sp1);
+                    __m256i iacc_mat_11_4_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_40_sp1, lhs_mat_23_40_sp1), rhs_mat_2367_41_sp1, lhs_mat_23_41_sp1);
+
+                    __m256i iacc_mat_00_5_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_50_sp1, lhs_mat_01_50_sp1), rhs_mat_0145_51_sp1, lhs_mat_01_51_sp1);
+                    __m256i iacc_mat_01_5_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_50_sp1, lhs_mat_01_50_sp1), rhs_mat_2367_51_sp1, lhs_mat_01_51_sp1);
+
+                    __m256i iacc_mat_10_5_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_50_sp1, lhs_mat_23_50_sp1), rhs_mat_0145_51_sp1, lhs_mat_23_51_sp1);
+                    __m256i iacc_mat_11_5_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_50_sp1, lhs_mat_23_50_sp1), rhs_mat_2367_51_sp1, lhs_mat_23_51_sp1);
+
+                    __m256i iacc_mat_00_6_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_60_sp1, lhs_mat_01_60_sp1), rhs_mat_0145_61_sp1, lhs_mat_01_61_sp1);
+                    __m256i iacc_mat_01_6_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_60_sp1, lhs_mat_01_60_sp1), rhs_mat_2367_61_sp1, lhs_mat_01_61_sp1);
+
+                    __m256i iacc_mat_10_6_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_60_sp1, lhs_mat_23_60_sp1), rhs_mat_0145_61_sp1, lhs_mat_23_61_sp1);
+                    __m256i iacc_mat_11_6_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_60_sp1, lhs_mat_23_60_sp1), rhs_mat_2367_61_sp1, lhs_mat_23_61_sp1);
+
+                    __m256i iacc_mat_00_7_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_70_sp1, lhs_mat_01_70_sp1), rhs_mat_0145_71_sp1, lhs_mat_01_71_sp1);
+                    __m256i iacc_mat_01_7_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_70_sp1, lhs_mat_01_70_sp1), rhs_mat_2367_71_sp1, lhs_mat_01_71_sp1);
+
+                    __m256i iacc_mat_10_7_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_70_sp1, lhs_mat_23_70_sp1), rhs_mat_0145_71_sp1, lhs_mat_23_71_sp1);
+                    __m256i iacc_mat_11_7_sp1 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_70_sp1, lhs_mat_23_70_sp1), rhs_mat_2367_71_sp1, lhs_mat_23_71_sp1);
+
+
+                    __m256i iacc_mat_00_0_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_00_sp2, lhs_mat_01_00_sp2), rhs_mat_0145_01_sp2, lhs_mat_01_01_sp2);
+                    __m256i iacc_mat_01_0_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_00_sp2, lhs_mat_01_00_sp2), rhs_mat_2367_01_sp2, lhs_mat_01_01_sp2);
+
+                    __m256i iacc_mat_10_0_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_00_sp2, lhs_mat_23_00_sp2), rhs_mat_0145_01_sp2, lhs_mat_23_01_sp2);
+                    __m256i iacc_mat_11_0_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_00_sp2, lhs_mat_23_00_sp2), rhs_mat_2367_01_sp2, lhs_mat_23_01_sp2);
+
+                    __m256i iacc_mat_00_1_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_10_sp2, lhs_mat_01_10_sp2), rhs_mat_0145_11_sp2, lhs_mat_01_11_sp2);
+                    __m256i iacc_mat_01_1_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_10_sp2, lhs_mat_01_10_sp2), rhs_mat_2367_11_sp2, lhs_mat_01_11_sp2);
+
+                    __m256i iacc_mat_10_1_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_10_sp2, lhs_mat_23_10_sp2), rhs_mat_0145_11_sp2, lhs_mat_23_11_sp2);
+                    __m256i iacc_mat_11_1_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_10_sp2, lhs_mat_23_10_sp2), rhs_mat_2367_11_sp2, lhs_mat_23_11_sp2);
+
+                    __m256i iacc_mat_00_2_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_20_sp2, lhs_mat_01_20_sp2), rhs_mat_0145_21_sp2, lhs_mat_01_21_sp2);
+                    __m256i iacc_mat_01_2_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_20_sp2, lhs_mat_01_20_sp2), rhs_mat_2367_21_sp2, lhs_mat_01_21_sp2);
+
+                    __m256i iacc_mat_10_2_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_20_sp2, lhs_mat_23_20_sp2), rhs_mat_0145_21_sp2, lhs_mat_23_21_sp2);
+                    __m256i iacc_mat_11_2_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_20_sp2, lhs_mat_23_20_sp2), rhs_mat_2367_21_sp2, lhs_mat_23_21_sp2);
+
+                    __m256i iacc_mat_00_3_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_30_sp2, lhs_mat_01_30_sp2), rhs_mat_0145_31_sp2, lhs_mat_01_31_sp2);
+                    __m256i iacc_mat_01_3_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_30_sp2, lhs_mat_01_30_sp2), rhs_mat_2367_31_sp2, lhs_mat_01_31_sp2);
+
+                    __m256i iacc_mat_10_3_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_30_sp2, lhs_mat_23_30_sp2), rhs_mat_0145_31_sp2, lhs_mat_23_31_sp2);
+                    __m256i iacc_mat_11_3_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_30_sp2, lhs_mat_23_30_sp2), rhs_mat_2367_31_sp2, lhs_mat_23_31_sp2);
+
+                    __m256i iacc_mat_00_4_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_40_sp2, lhs_mat_01_40_sp2), rhs_mat_0145_41_sp2, lhs_mat_01_41_sp2);
+                    __m256i iacc_mat_01_4_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_40_sp2, lhs_mat_01_40_sp2), rhs_mat_2367_41_sp2, lhs_mat_01_41_sp2);
+
+                    __m256i iacc_mat_10_4_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_40_sp2, lhs_mat_23_40_sp2), rhs_mat_0145_41_sp2, lhs_mat_23_41_sp2);
+                    __m256i iacc_mat_11_4_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_40_sp2, lhs_mat_23_40_sp2), rhs_mat_2367_41_sp2, lhs_mat_23_41_sp2);
+
+                    __m256i iacc_mat_00_5_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_50_sp2, lhs_mat_01_50_sp2), rhs_mat_0145_51_sp2, lhs_mat_01_51_sp2);
+                    __m256i iacc_mat_01_5_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_50_sp2, lhs_mat_01_50_sp2), rhs_mat_2367_51_sp2, lhs_mat_01_51_sp2);
+
+                    __m256i iacc_mat_10_5_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_50_sp2, lhs_mat_23_50_sp2), rhs_mat_0145_51_sp2, lhs_mat_23_51_sp2);
+                    __m256i iacc_mat_11_5_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_50_sp2, lhs_mat_23_50_sp2), rhs_mat_2367_51_sp2, lhs_mat_23_51_sp2);
+
+                    __m256i iacc_mat_00_6_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_60_sp2, lhs_mat_01_60_sp2), rhs_mat_0145_61_sp2, lhs_mat_01_61_sp2);
+                    __m256i iacc_mat_01_6_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_60_sp2, lhs_mat_01_60_sp2), rhs_mat_2367_61_sp2, lhs_mat_01_61_sp2);
+
+                    __m256i iacc_mat_10_6_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_60_sp2, lhs_mat_23_60_sp2), rhs_mat_0145_61_sp2, lhs_mat_23_61_sp2);
+                    __m256i iacc_mat_11_6_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_60_sp2, lhs_mat_23_60_sp2), rhs_mat_2367_61_sp2, lhs_mat_23_61_sp2);
+
+                    __m256i iacc_mat_00_7_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_70_sp2, lhs_mat_01_70_sp2), rhs_mat_0145_71_sp2, lhs_mat_01_71_sp2);
+                    __m256i iacc_mat_01_7_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_70_sp2, lhs_mat_01_70_sp2), rhs_mat_2367_71_sp2, lhs_mat_01_71_sp2);
+
+                    __m256i iacc_mat_10_7_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_0145_70_sp2, lhs_mat_23_70_sp2), rhs_mat_0145_71_sp2, lhs_mat_23_71_sp2);
+                    __m256i iacc_mat_11_7_sp2 = _mm256_dpbusd_avx_epi32(_mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), rhs_mat_2367_70_sp2, lhs_mat_23_70_sp2), rhs_mat_2367_71_sp2, lhs_mat_23_71_sp2);
+
+                    // Combine results from both shuffle patterns for each output block.
+                    __m256i iacc_mat_00_0 = _mm256_add_epi32(iacc_mat_00_0_sp1, iacc_mat_00_0_sp2);
+                    __m256i iacc_mat_01_0 = _mm256_add_epi32(iacc_mat_01_0_sp1, iacc_mat_01_0_sp2);
+                    __m256i iacc_mat_10_0 = _mm256_add_epi32(iacc_mat_10_0_sp1, iacc_mat_10_0_sp2);
+                    __m256i iacc_mat_11_0 = _mm256_add_epi32(iacc_mat_11_0_sp1, iacc_mat_11_0_sp2);
+
+                    __m256i iacc_mat_00_1 = _mm256_add_epi32(iacc_mat_00_1_sp1, iacc_mat_00_1_sp2);
+                    __m256i iacc_mat_01_1 = _mm256_add_epi32(iacc_mat_01_1_sp1, iacc_mat_01_1_sp2);
+                    __m256i iacc_mat_10_1 = _mm256_add_epi32(iacc_mat_10_1_sp1, iacc_mat_10_1_sp2);
+                    __m256i iacc_mat_11_1 = _mm256_add_epi32(iacc_mat_11_1_sp1, iacc_mat_11_1_sp2);
+
+                    __m256i iacc_mat_00_2 = _mm256_add_epi32(iacc_mat_00_2_sp1, iacc_mat_00_2_sp2);
+                    __m256i iacc_mat_01_2 = _mm256_add_epi32(iacc_mat_01_2_sp1, iacc_mat_01_2_sp2);
+                    __m256i iacc_mat_10_2 = _mm256_add_epi32(iacc_mat_10_2_sp1, iacc_mat_10_2_sp2);
+                    __m256i iacc_mat_11_2 = _mm256_add_epi32(iacc_mat_11_2_sp1, iacc_mat_11_2_sp2);
+
+                    __m256i iacc_mat_00_3 = _mm256_add_epi32(iacc_mat_00_3_sp1, iacc_mat_00_3_sp2);
+                    __m256i iacc_mat_01_3 = _mm256_add_epi32(iacc_mat_01_3_sp1, iacc_mat_01_3_sp2);
+                    __m256i iacc_mat_10_3 = _mm256_add_epi32(iacc_mat_10_3_sp1, iacc_mat_10_3_sp2);
+                    __m256i iacc_mat_11_3 = _mm256_add_epi32(iacc_mat_11_3_sp1, iacc_mat_11_3_sp2);
+
+                    __m256i iacc_mat_00_4 = _mm256_add_epi32(iacc_mat_00_4_sp1, iacc_mat_00_4_sp2);
+                    __m256i iacc_mat_01_4 = _mm256_add_epi32(iacc_mat_01_4_sp1, iacc_mat_01_4_sp2);
+                    __m256i iacc_mat_10_4 = _mm256_add_epi32(iacc_mat_10_4_sp1, iacc_mat_10_4_sp2);
+                    __m256i iacc_mat_11_4 = _mm256_add_epi32(iacc_mat_11_4_sp1, iacc_mat_11_4_sp2);
+
+                    __m256i iacc_mat_00_5 = _mm256_add_epi32(iacc_mat_00_5_sp1, iacc_mat_00_5_sp2);
+                    __m256i iacc_mat_01_5 = _mm256_add_epi32(iacc_mat_01_5_sp1, iacc_mat_01_5_sp2);
+                    __m256i iacc_mat_10_5 = _mm256_add_epi32(iacc_mat_10_5_sp1, iacc_mat_10_5_sp2);
+                    __m256i iacc_mat_11_5 = _mm256_add_epi32(iacc_mat_11_5_sp1, iacc_mat_11_5_sp2);
+
+                    __m256i iacc_mat_00_6 = _mm256_add_epi32(iacc_mat_00_6_sp1, iacc_mat_00_6_sp2);
+                    __m256i iacc_mat_01_6 = _mm256_add_epi32(iacc_mat_01_6_sp1, iacc_mat_01_6_sp2);
+                    __m256i iacc_mat_10_6 = _mm256_add_epi32(iacc_mat_10_6_sp1, iacc_mat_10_6_sp2);
+                    __m256i iacc_mat_11_6 = _mm256_add_epi32(iacc_mat_11_6_sp1, iacc_mat_11_6_sp2);
+
+                    __m256i iacc_mat_00_7 = _mm256_add_epi32(iacc_mat_00_7_sp1, iacc_mat_00_7_sp2);
+                    __m256i iacc_mat_01_7 = _mm256_add_epi32(iacc_mat_01_7_sp1, iacc_mat_01_7_sp2);
+                    __m256i iacc_mat_10_7 = _mm256_add_epi32(iacc_mat_10_7_sp1, iacc_mat_10_7_sp2);
+                    __m256i iacc_mat_11_7 = _mm256_add_epi32(iacc_mat_11_7_sp1, iacc_mat_11_7_sp2);
+
+                    // Output of both shuffle patterns are added in order to sum dot product outputs of all 32 values in block
+                    iacc_mat_00_0 = _mm256_mullo_epi32(iacc_mat_00_0, scale32_0145_0);
+                    iacc_mat_01_0 = _mm256_mullo_epi32(iacc_mat_01_0, scale32_2367_0);
+                    iacc_mat_10_0 = _mm256_mullo_epi32(iacc_mat_10_0, scale32_0145_0);
+                    iacc_mat_11_0 = _mm256_mullo_epi32(iacc_mat_11_0, scale32_2367_0);
+
+                    iacc_mat_00_1 = _mm256_mullo_epi32(iacc_mat_00_1, scale32_0145_1);
+                    iacc_mat_01_1 = _mm256_mullo_epi32(iacc_mat_01_1, scale32_2367_1);
+                    iacc_mat_10_1 = _mm256_mullo_epi32(iacc_mat_10_1, scale32_0145_1);
+                    iacc_mat_11_1 = _mm256_mullo_epi32(iacc_mat_11_1, scale32_2367_1);
+
+                    iacc_mat_00_2 = _mm256_mullo_epi32(iacc_mat_00_2, scale32_0145_2);
+                    iacc_mat_01_2 = _mm256_mullo_epi32(iacc_mat_01_2, scale32_2367_2);
+                    iacc_mat_10_2 = _mm256_mullo_epi32(iacc_mat_10_2, scale32_0145_2);
+                    iacc_mat_11_2 = _mm256_mullo_epi32(iacc_mat_11_2, scale32_2367_2);
+
+                    iacc_mat_00_3 = _mm256_mullo_epi32(iacc_mat_00_3, scale32_0145_3);
+                    iacc_mat_01_3 = _mm256_mullo_epi32(iacc_mat_01_3, scale32_2367_3);
+                    iacc_mat_10_3 = _mm256_mullo_epi32(iacc_mat_10_3, scale32_0145_3);
+                    iacc_mat_11_3 = _mm256_mullo_epi32(iacc_mat_11_3, scale32_2367_3);
+
+                    iacc_mat_00_4 = _mm256_mullo_epi32(iacc_mat_00_4, scale32_0145_4);
+                    iacc_mat_01_4 = _mm256_mullo_epi32(iacc_mat_01_4, scale32_2367_4);
+                    iacc_mat_10_4 = _mm256_mullo_epi32(iacc_mat_10_4, scale32_0145_4);
+                    iacc_mat_11_4 = _mm256_mullo_epi32(iacc_mat_11_4, scale32_2367_4);
+
+                    iacc_mat_00_5 = _mm256_mullo_epi32(iacc_mat_00_5, scale32_0145_5);
+                    iacc_mat_01_5 = _mm256_mullo_epi32(iacc_mat_01_5, scale32_2367_5);
+                    iacc_mat_10_5 = _mm256_mullo_epi32(iacc_mat_10_5, scale32_0145_5);
+                    iacc_mat_11_5 = _mm256_mullo_epi32(iacc_mat_11_5, scale32_2367_5);
+
+                    iacc_mat_00_6 = _mm256_mullo_epi32(iacc_mat_00_6, scale32_0145_6);
+                    iacc_mat_01_6 = _mm256_mullo_epi32(iacc_mat_01_6, scale32_2367_6);
+                    iacc_mat_10_6 = _mm256_mullo_epi32(iacc_mat_10_6, scale32_0145_6);
+                    iacc_mat_11_6 = _mm256_mullo_epi32(iacc_mat_11_6, scale32_2367_6);
+
+                    iacc_mat_00_7 = _mm256_mullo_epi32(iacc_mat_00_7, scale32_0145_7);
+                    iacc_mat_01_7 = _mm256_mullo_epi32(iacc_mat_01_7, scale32_2367_7);
+                    iacc_mat_10_7 = _mm256_mullo_epi32(iacc_mat_10_7, scale32_0145_7);
+                    iacc_mat_11_7 = _mm256_mullo_epi32(iacc_mat_11_7, scale32_2367_7);
+#else
                     __m256i iacc_mat_00_0_sp1 = _mm256_add_epi16(_mm256_maddubs_epi16(rhs_mat_0145_00_sp1, lhs_mat_01_00_sp1),_mm256_maddubs_epi16(rhs_mat_0145_01_sp1, lhs_mat_01_01_sp1));
                     __m256i iacc_mat_01_0_sp1 = _mm256_add_epi16(_mm256_maddubs_epi16(rhs_mat_2367_00_sp1, lhs_mat_01_00_sp1),_mm256_maddubs_epi16(rhs_mat_2367_01_sp1, lhs_mat_01_01_sp1));
 
@@ -8098,6 +9281,7 @@ void ggml_gemm_q2_K_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
                     iacc_mat_01_7 = _mm256_madd_epi16(iacc_mat_01_7, scale_2367_7);
                     iacc_mat_10_7 = _mm256_madd_epi16(iacc_mat_10_7, scale_0145_7);
                     iacc_mat_11_7 = _mm256_madd_epi16(iacc_mat_11_7, scale_2367_7);
+#endif
 
                     __m256i iacc_mat_00 = _mm256_add_epi32(_mm256_add_epi32(_mm256_add_epi32(iacc_mat_00_0, iacc_mat_00_1), _mm256_add_epi32(iacc_mat_00_2, iacc_mat_00_3)), _mm256_add_epi32(_mm256_add_epi32(iacc_mat_00_4, iacc_mat_00_5), _mm256_add_epi32(iacc_mat_00_6, iacc_mat_00_7)));
                     __m256i iacc_mat_01 = _mm256_add_epi32(_mm256_add_epi32(_mm256_add_epi32(iacc_mat_01_0, iacc_mat_01_1), _mm256_add_epi32(iacc_mat_01_2, iacc_mat_01_3)), _mm256_add_epi32(_mm256_add_epi32(iacc_mat_01_4, iacc_mat_01_5), _mm256_add_epi32(iacc_mat_01_6, iacc_mat_01_7)));
