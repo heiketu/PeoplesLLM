@@ -1623,6 +1623,11 @@ bool llama_kv_cache_dsv4_raw_context::next() {
         return false;
     }
 
+    if (replay && i_next < n_kv_replay.size() && n_kv_replay[i_next] != 0) {
+        // replay walks reuse the first walk's per-tile n_kv (see rewind)
+        n_kv = n_kv_replay[i_next];
+    }
+
     return true;
 }
 
@@ -1631,7 +1636,11 @@ void llama_kv_cache_dsv4_raw_context::rewind(bool replay) {
     this->replay = replay;
 
     if (replay && !sinfos_read.empty()) {
-        n_kv = kv_swa->get_n_kv(sinfos_read[0]);
+        if (!n_kv_replay.empty() && n_kv_replay[0] != 0) {
+            n_kv = n_kv_replay[0];
+        } else {
+            n_kv = kv_swa->get_n_kv(sinfos_read[0]);
+        }
     }
 }
 
@@ -1655,6 +1664,13 @@ bool llama_kv_cache_dsv4_raw_context::apply() {
     if (!ubatches_write.empty()) {
         kv_swa->apply_ubatch(sinfos_write[i_next], ubatches_write[i_next]);
         n_kv = kv_swa->get_n_kv(sinfos_read[i_next]);
+
+        // remember the n_kv this tile was computed with so replay walks can
+        // rebuild byte-identical graph inputs (see n_kv_replay)
+        if (n_kv_replay.size() < ubatches.size()) {
+            n_kv_replay.resize(ubatches.size(), 0);
+        }
+        n_kv_replay[i_next] = n_kv;
     }
 
     return res;

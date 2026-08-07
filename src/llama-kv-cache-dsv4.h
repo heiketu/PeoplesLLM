@@ -233,6 +233,14 @@ private:
 
     uint32_t n_kv = 0;
 
+    // per-tile n_kv captured during the first (non-replay) walk. Replay walks
+    // must reuse these exact values: recomputing n_kv from the live cell
+    // metadata would see the end-of-walk occupancy instead of the occupancy
+    // the tile was first computed with. With a compact SWA ring the metadata
+    // positions no longer match the rows the replayed graph writes/reads, so
+    // a regenerated KQ mask (cache size mismatch) masks out the fresh rows.
+    std::vector<uint32_t> n_kv_replay;
+
     bool replay = false;
     mutable bool input_replay_cache_enabled = false;
     mutable std::vector<std::vector<uint8_t>> kq_mask_replay_cache;

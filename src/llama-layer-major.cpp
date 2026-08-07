@@ -629,15 +629,22 @@ int llama_context::decode_layer_major(const llama_batch & batch_inp, uint32_t n_
     // The layer-major walk replays every tile once per layer with the memory
     // context in replay mode, where apply() skips the KV/compressor state
     // bookkeeping. With a compact (ring) raw SWA cache (swa_full=false, the
-    // llama-server default) the DSV4 compressor stays active across tiles and
-    // the first tile of every layer past the first reads the previous layer
-    // walk's leftover ring/compressor state, deterministically corrupting
-    // that tile's attention output (garbage generation for some prompts).
-    // The full-size SWA cache keeps compression inert and is bit-exact
-    // against the chunked reference. Decline until the compact-cache replay
-    // semantics are wired; the chunked path handles the ring correctly.
+    // llama-server default) the ring fills up during the first walk, so a
+    // replay that recomputed n_kv from the live cell metadata would see the
+    // end-of-walk occupancy and regenerate the tile-0 KQ mask against stale
+    // cell positions, deterministically corrupting that tile's attention
+    // output (garbage generation for some prompts). The raw context instead
+    // captures the first walk's per-tile n_kv and replays it exactly, which
+    // keeps every tile's graph inputs byte-identical across layers
+    // (llama_kv_cache_dsv4_raw_context::n_kv_replay).
+    // LLAMA_LAYER_MAJOR_RING_COMPAT=0 restores the old behavior: decline
+    // layer-major on compact rings and let the chunked path handle them.
+    static const bool ring_compat = []() {
+        const char * value = getenv("LLAMA_LAYER_MAJOR_RING_COMPAT");
+        return value == nullptr || atoi(value) != 0;
+    }();
     const llama_kv_cache_iswa * raw = kv_dsv4->get_raw();
-    if (raw && raw->get_swa() && raw->get_base() &&
+    if (!ring_compat && raw && raw->get_swa() && raw->get_base() &&
             raw->get_swa()->get_size() < raw->get_base()->get_size()) {
         LLAMA_LOG_INFO("%s: ineligible: layer-major requires a full-size raw SWA cache (swa cells %u < %u)\n",
                 __func__, raw->get_swa()->get_size(), raw->get_base()->get_size());
