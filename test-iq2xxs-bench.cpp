@@ -30,7 +30,7 @@ static bench_result bench_mmid(ggml_backend_t backend, int k, int m, int n_mats,
     for (auto & b : w) {
         uint64_t * p = (uint64_t *) b.qs;
         for (size_t i = 0; i < sizeof(b.qs) / 8; i++) p[i] = ru();
-        b.d = ggml_fp32_to_fp16(0.01f * (float) (ru() % 200 - 100));
+        b.d = ggml_fp32_to_fp16(0.01f * (float) ((int) (ru() % 200) - 100));
     }
     std::vector<float> act((size_t) k * n_tokens);
     for (auto & v : act) v = 0.5f * ((float) (ru() % 2000) / 1000.0f - 1.0f);

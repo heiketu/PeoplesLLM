@@ -68,11 +68,16 @@ int main(void) {
         for (size_t k = 0; k < sizeof(x[i].qs) / 8; k++) {
             p[k] = rng_u64();
         }
-        x[i].d = ggml_fp32_to_fp16(0.01f * (float) (rng_u64() % 200 - 100));
+        x[i].d = ggml_fp32_to_fp16(0.01f * (float) ((int) (rng_u64() % 200) - 100));
     }
     for (int g = 0; g < nc / 8; g++) {
         for (int b = 0; b < nb; b++) {
-            repack8(&x[(size_t) (g * 8) * nb + b * 8], &xr[(size_t) g * nb + b]);
+            // 8 consecutive ROWS, same block index (matches repack_iq2_xxs_to_iq2_xxs_8_bl)
+            block_iq2_xxs tmp[8];
+            for (int i = 0; i < 8; i++) {
+                tmp[i] = x[(size_t) (g * 8 + i) * nb + b];
+            }
+            repack8(tmp, &xr[(size_t) g * nb + b]);
         }
     }
 
@@ -116,14 +121,15 @@ int main(void) {
 
     int fails = 0;
     #define CHECK(name, got, want, count) do { \
-        double maxrel = 0; \
+        double maxrel = 0; int nnan = 0; \
         for (int i = 0; i < (count); i++) { \
             double a = (got)[i], b = (want)[i]; \
+            if (!isfinite(a) || !isfinite(b)) { nnan++; continue; } \
             double rel = fabs(a - b) / (fabs(b) + 1e-6); \
             if (rel > maxrel) maxrel = rel; \
         } \
-        printf("%-40s maxrel=%.3e %s\n", name, maxrel, maxrel < 1e-4 ? "OK" : "FAIL"); \
-        if (maxrel >= 1e-4) fails++; \
+        printf("%-40s maxrel=%.3e nan=%d %s\n", name, maxrel, nnan, (maxrel < 1e-4 && nnan == 0) ? "OK" : "FAIL"); \
+        if (maxrel >= 1e-4 || nnan != 0) fails++; \
     } while (0)
 
     // 1. existing SIMD vec_dot vs generic vec_dot

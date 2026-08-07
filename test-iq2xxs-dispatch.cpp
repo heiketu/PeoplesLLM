@@ -37,7 +37,7 @@ int main(void) {
     for (auto & b : w) {
         uint64_t * p = (uint64_t *) b.qs;
         for (size_t i = 0; i < sizeof(b.qs) / 8; i++) p[i] = ru();
-        b.d = ggml_fp32_to_fp16(0.01f * (float) (ru() % 200 - 100));
+        b.d = ggml_fp32_to_fp16(0.01f * (float) ((int) (ru() % 200) - 100));
     }
     std::vector<float> act(k * n_tokens);
     for (auto & v : act) v = 0.5f * ((float) (ru() % 2000) / 1000.0f - 1.0f);
@@ -105,12 +105,19 @@ int main(void) {
     std::vector<float> r0(ggml_nelements(d_ref)), r1(ggml_nelements(d_rp));
     ggml_backend_tensor_get(d_ref, r0.data(), 0, ggml_nbytes(d_ref));
     ggml_backend_tensor_get(d_rp, r1.data(), 0, ggml_nbytes(d_rp));
-    double maxrel = 0;
+    double maxrel = 0, maxabs = 0, rms0 = 0; int nnan = 0;
     for (size_t i = 0; i < r0.size(); i++) {
-        double rel = fabs(r0[i] - r1[i]) / (fabs(r0[i]) + 1e-6);
+        if (!isfinite(r0[i]) || !isfinite(r1[i])) { nnan++; continue; }
+        rms0 += (double) r0[i] * r0[i];
+        double ad = fabs(r0[i] - r1[i]);
+        double rel = ad / (fabs(r0[i]) + 1e-6);
         if (rel > maxrel) maxrel = rel;
+        if (ad > maxabs) maxabs = ad;
     }
-    printf("MUL_MAT_ID repack vs vec_dot path: maxrel=%.3e %s\n", maxrel, maxrel < 1e-4 ? "OK" : "FAIL");
+    rms0 = sqrt(rms0 / (r0.size() - nnan));
+    double noise0 = maxabs / rms0;
+    printf("MUL_MAT_ID repack vs vec_dot path: maxrel=%.3e maxabs/rms=%.1e nan=%d %s\n", maxrel, noise0, nnan, (noise0 < 1e-5 && nnan == 0) ? "OK" : "FAIL");
+    if (nnan || noise0 >= 1e-5) return 1;
 
     // ---- MUL_MAT (2d) through the repack path ----
     struct ggml_tensor * a2 = ggml_new_tensor_2d(ctx2, GGML_TYPE_IQ2_XXS, k, m);
@@ -134,17 +141,24 @@ int main(void) {
     // reference for mul_mat: reuse vec_dot directly
     const int nb = k / QK_K;
     block_q8_K * q8 = (block_q8_K *) malloc(sizeof(block_q8_K) * nb * n_tokens);
-    double maxrel2 = 0;
+    double maxrel2 = 0, maxabs2 = 0, rms2 = 0; int nnan2 = 0;
     for (int t = 0; t < n_tokens; t++) {
         quantize_row_q8_K(act.data() + (size_t) t * k, q8 + (size_t) t * nb, k);
         for (int row = 0; row < m; row++) {
             float ref;
             ggml_vec_dot_iq2_xxs_q8_K(k, &ref, 0, &w[(size_t) row * nb], 0, q8 + (size_t) t * nb, 0, 1);
-            double rel = fabs(ref - r2[(size_t) row * n_tokens + t]) / (fabs(ref) + 1e-6);
+            float got = r2[(size_t) t * m + row];
+            if (!isfinite(ref) || !isfinite(got)) { nnan2++; continue; }
+            rms2 += (double) ref * ref;
+            double ad = fabs(ref - got);
+            double rel = ad / (fabs(ref) + 1e-6);
             if (rel > maxrel2) maxrel2 = rel;
+            if (ad > maxabs2) maxabs2 = ad;
         }
     }
-    printf("MUL_MAT repack vs vec_dot path:      maxrel=%.3e %s\n", maxrel2, maxrel2 < 1e-4 ? "OK" : "FAIL");
+    rms2 = sqrt(rms2 / (m * n_tokens - nnan2));
+    double noise2 = maxabs2 / rms2;
+    printf("MUL_MAT repack vs vec_dot path:      maxrel=%.3e maxabs/rms=%.1e nan=%d %s\n", maxrel2, noise2, nnan2, (noise2 < 1e-5 && nnan2 == 0) ? "OK" : "FAIL");
 
-    return (maxrel < 1e-4 && maxrel2 < 1e-4) ? 0 : 1;
+    return (noise0 < 1e-5 && noise2 < 1e-5 && nnan2 == 0) ? 0 : 1;
 }
