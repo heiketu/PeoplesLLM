@@ -351,6 +351,10 @@ extern "C" {
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
 
+    // Enable/disable op offload for the next graph split - op offload is only profitable
+    // for large batches, so the caller should disable it for small (decode-size) graphs
+    GGML_API void                 ggml_backend_sched_set_op_offload(ggml_backend_sched_t sched, bool op_offload);
+
     //
     // Meta backend
     //

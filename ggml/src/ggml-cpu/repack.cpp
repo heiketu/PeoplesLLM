@@ -6590,8 +6590,14 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
         }
     } else if (cur->type == GGML_TYPE_IQ2_XXS) {
         // the 8x8 kernels are only implemented for AVX512 with VNNI (vpdpbusd/vpdpwssd)
-        // and VBMI (vpermb sign expansion); same requirement as IQ2_XS below
-        if (ggml_cpu_has_avx512() && ggml_cpu_has_avx512_vnni() && ggml_cpu_has_avx512_vbmi()) {
+        // and VBMI (vpermb sign expansion); same requirement as IQ2_XS below.
+        // GGML_REPACK_IQ2_XXS=0 disables the repack (debug/A-B knob, default on)
+        static const bool iq2_xxs_repack_enabled = []() {
+            const char * e = getenv("GGML_REPACK_IQ2_XXS");
+            return !e || atoi(e) != 0;
+        }();
+        if (iq2_xxs_repack_enabled &&
+                ggml_cpu_has_avx512() && ggml_cpu_has_avx512_vnni() && ggml_cpu_has_avx512_vbmi()) {
             if (cur->ne[1] % 8 == 0) {
                 return &iq2_xxs_8x8_q8_K;
             }

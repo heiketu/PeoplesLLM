@@ -1526,6 +1526,10 @@ llm_graph_result * llama_context::process_ubatch(
     llama_layer_major_ubatch_profile * profile = layer_input ? layer_input->profile : nullptr;
     int64_t profile_start_us = profile ? ggml_time_us() : 0;
 
+    // debug: per-phase wall time for plain decode (env LLAMA_DECODE_TIMING)
+    static const bool pu_prof = getenv("LLAMA_DECODE_TIMING") != nullptr;
+    const int64_t pu_t0 = pu_prof ? ggml_time_us() : 0;
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1604,6 +1608,7 @@ llm_graph_result * llama_context::process_ubatch(
             return nullptr;
         }
     }
+    const int64_t pu_t2 = pu_prof ? ggml_time_us() : 0;
     if (profile) {
         const int64_t now_us = ggml_time_us();
         profile->graph_prepare_us += now_us - profile_start_us;
@@ -1674,6 +1679,8 @@ llm_graph_result * llama_context::process_ubatch(
         profile_start_us = now_us;
     }
 
+    const int64_t pu_t3 = pu_prof ? ggml_time_us() : 0;
+
     static const bool nan_dbg = []() {
         const char * env = getenv("LLAMA_NAN_DEBUG");
         return env && atoi(env) > 0;
@@ -1683,7 +1690,23 @@ llm_graph_result * llama_context::process_ubatch(
         ggml_backend_sched_set_eval_callback(sched.get(), llama_nan_dbg_eval_cb, &nan_ctx);
     }
 
+    // op offload is only profitable for large batches: a single op that wins the offload
+    // check (e.g. flash attn with nrows(output) >= min_batch via the sinks weight) becomes
+    // a seed that pulls the adjacent CPU ops - incl. their host weights, such as the dsv4
+    // attn_wo_a matrices at ~34 MiB/layer - onto the device, re-copying them on every
+    // graph evaluation (~1.5 GiB/token at decode, ~3x slowdown). keep it off for small
+    // (decode-size) graphs; 32 matches the default GGML_OP_OFFLOAD_MIN_BATCH
+    ggml_backend_sched_set_op_offload(sched.get(), cparams.op_offload && ubatch.n_tokens >= 32);
+
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (pu_prof) {
+        const int64_t pu_t4 = ggml_time_us();
+        fprintf(stderr, "[ubatch-prof] nt=%d apply+prep=%.2f set_inputs=%.2f compute=%.2f ms\n",
+                (int) ubatch.n_tokens,
+                (pu_t2 - pu_t0) / 1000.0,
+                (pu_t3 - pu_t2) / 1000.0,
+                (pu_t4 - pu_t3) / 1000.0);
+    }
     if (profile) {
         profile->submit_us += ggml_time_us() - profile_start_us;
     }

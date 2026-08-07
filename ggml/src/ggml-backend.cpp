@@ -977,7 +977,7 @@ static void ggml_sched_timing_report(const ggml_backend_sched_t sched) {
         post_sum_us += timing->post_us[i];
     }
 
-    GGML_LOG_INFO(
+    fprintf(stderr,
         "sched_timing_summary: splits=%d samples=%llu avg_total=%.4f ms avg_input=%.4f ms "
         "avg_graph_submit=%.4f ms avg_post=%.4f ms skip=%llu\n",
         timing->n_splits, (unsigned long long) timing->count,
@@ -988,7 +988,7 @@ static void ggml_sched_timing_report(const ggml_backend_sched_t sched) {
         (unsigned long long) ggml_sched_timing_skip());
 
     for (int i = 0; i < timing->n_splits; ++i) {
-        GGML_LOG_INFO(
+        fprintf(stderr,
             "sched_timing_split: split=%d backend=%s inputs=%d avg_input=%.4f ms "
             "avg_graph_submit=%.4f ms avg_post=%.4f ms label=%s\n",
             i, timing->backend_names[i].c_str(), timing->n_inputs[i],
@@ -1114,16 +1114,16 @@ static void ggml_backend_sched_print_assignments(ggml_backend_sched_t sched, str
     for (int i = 0; i < graph->n_nodes; i++) {
         if (cur_split < sched->n_splits && i == sched->splits[cur_split].i_start) {
             ggml_backend_t split_backend = sched->backends[sched->splits[cur_split].backend_id];
-            GGML_LOG_DEBUG("\n## SPLIT #%d: %s # %d inputs", cur_split, ggml_backend_name(split_backend),
+            fprintf(stderr, "\n## SPLIT #%d: %s # %d inputs", cur_split, ggml_backend_name(split_backend),
                 sched->splits[cur_split].n_inputs);
             for (int j = 0; j < sched->splits[cur_split].n_inputs; j++) {
                 if (j == 0) {
-                    GGML_LOG_DEBUG(": ");
+                    fprintf(stderr, ": ");
                 }
-                GGML_LOG_DEBUG("[%s (%5.5s)] ", sched->splits[cur_split].inputs[j]->name,
+                fprintf(stderr, "[%s (%5.5s)] ", sched->splits[cur_split].inputs[j]->name,
                     fmt_size(ggml_nbytes(sched->splits[cur_split].inputs[j])));
             }
-            GGML_LOG_DEBUG("\n");
+            fprintf(stderr, "\n");
             cur_split++;
         }
         struct ggml_tensor * node = graph->nodes[i];
@@ -1132,7 +1132,7 @@ static void ggml_backend_sched_print_assignments(ggml_backend_sched_t sched, str
         }
         if (sched->debug > 1) {
             ggml_backend_t tensor_backend = ggml_backend_sched_get_tensor_backend(sched, node);
-            GGML_LOG_DEBUG("node #%3d (%10.10s): %20.20s (%5.5s) [%5.5s %8.8s] use=%d,c=%d:", i, ggml_op_desc(node), node->name,
+            fprintf(stderr, "node #%3d (%10.10s): %20.20s (%5.5s) [%5.5s %8.8s] use=%d,c=%d:", i, ggml_op_desc(node), node->name,
                 fmt_size(ggml_nbytes(node)), tensor_backend ? ggml_backend_name(tensor_backend) : "NULL", GET_CAUSE(node),
                 graph->use_counts[ggml_hash_find(&graph->visited_hash_set, node)], node->flags & GGML_TENSOR_FLAG_COMPUTE ? 1 : 0);
             for (int j = 0; j < GGML_MAX_SRC; j++) {
@@ -1141,10 +1141,10 @@ static void ggml_backend_sched_print_assignments(ggml_backend_sched_t sched, str
                     continue;
                 }
                 ggml_backend_t src_backend = ggml_backend_sched_get_tensor_backend(sched, src);
-                GGML_LOG_DEBUG(" %20.20s (%5.5s) [%5.5s %8.8s]", src->name,
+                fprintf(stderr, " %20.20s (%5.5s) [%5.5s %8.8s]", src->name,
                     fmt_size(ggml_nbytes(src)), src_backend ? ggml_backend_name(src_backend) : "NULL", GET_CAUSE(src));
             }
-            GGML_LOG_DEBUG("\n");
+            fprintf(stderr, "\n");
         }
     }
 }
@@ -2308,7 +2308,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     if (profile_enabled) {
         const int64_t total_us = ggml_time_us() - profile_start_us;
-        GGML_LOG_INFO("sched_profile: splits %d, total %.3f ms, setup %.3f ms, inputs %.3f ms, graph %.3f ms, refill %.3f ms, user %.3f ms, wait %.3f ms, moe_pp %.3f ms, moe_legacy %.3f ms, other %.3f ms\n",
+        fprintf(stderr, "sched_profile: splits %d, total %.3f ms, setup %.3f ms, inputs %.3f ms, graph %.3f ms, refill %.3f ms, user %.3f ms, wait %.3f ms, moe_pp %.3f ms, moe_legacy %.3f ms, other %.3f ms\n",
                 sched->n_splits, total_us/1000.0, setup_us/1000.0,
                 input_us/1000.0, graph_us/1000.0, refill_us/1000.0,
                 user_input_us/1000.0, input_wait_us/1000.0, moe_pp_us/1000.0,
@@ -2317,7 +2317,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             if (backend_splits[backend_id] == 0 && backend_input_us[backend_id] == 0) {
                 continue;
             }
-            GGML_LOG_INFO("sched_profile_backend: backend %s, splits %d, inputs %.3f ms, graph %.3f ms\n",
+            fprintf(stderr, "sched_profile_backend: backend %s, splits %d, inputs %.3f ms, graph %.3f ms\n",
                     ggml_backend_name(sched->backends[backend_id]), backend_splits[backend_id],
                     backend_input_us[backend_id]/1000.0, backend_graph_us[backend_id]/1000.0);
         }
@@ -2326,7 +2326,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 if (transfer_bytes[src_id][dst_id] == 0) {
                     continue;
                 }
-                GGML_LOG_INFO("sched_profile_transfer: src %s, dst %s, time %.3f ms, bytes %.3f MiB\n",
+                fprintf(stderr, "sched_profile_transfer: src %s, dst %s, time %.3f ms, bytes %.3f MiB\n",
                         ggml_backend_name(sched->backends[src_id]),
                         ggml_backend_name(sched->backends[dst_id]),
                         transfer_us[src_id][dst_id]/1000.0,
@@ -2535,6 +2535,11 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_eval = callback;
     sched->callback_eval_user_data = user_data;
+}
+
+void ggml_backend_sched_set_op_offload(ggml_backend_sched_t sched, bool op_offload) {
+    GGML_ASSERT(sched);
+    sched->op_offload = op_offload;
 }
 
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {

@@ -4863,6 +4863,12 @@ struct ggml_threadpool * ggml_threadpool_new(struct ggml_threadpool_params * tpp
 enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
     ggml_cpu_init();
 
+    // debug: phase timing for decode graphs (env GGML_OP_TIMING=1)
+    static int gc_prof = -1;
+    if (gc_prof < 0) { const char * e = getenv("GGML_OP_TIMING"); gc_prof = (e && atoi(e)) ? 1 : 0; }
+    const int64_t gc_t0 = gc_prof ? ggml_time_us() : 0;
+    int64_t gc_t1 = 0, gc_t2 = 0;
+
     GGML_ASSERT(cplan);
     GGML_ASSERT(cplan->n_threads > 0);
     GGML_ASSERT(cplan->work_size == 0 || cplan->work_data != NULL);
@@ -4900,6 +4906,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     }
 
 #ifdef GGML_USE_OPENMP
+    gc_t1 = gc_prof ? ggml_time_us() : 0;
     if (n_threads > 1) {
         #pragma omp parallel num_threads(n_threads)
         {
@@ -4938,11 +4945,13 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     ggml_numa_barrier_setup(n_threads);
 
     // Kick all threads to start the new graph
+    gc_t1 = gc_prof ? ggml_time_us() : 0;
     ggml_graph_compute_kickoff(threadpool, n_threads);
 
     // This is a work thread too
     ggml_graph_compute_thread(&threadpool->workers[0]);
 #endif
+    gc_t2 = gc_prof ? ggml_time_us() : 0;
 
     // don't leave affinity set on the main thread
     clear_numa_thread_affinity();
@@ -4953,6 +4962,15 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 
     if (disposable_threadpool) {
         ggml_threadpool_free(threadpool);
+    }
+
+    if (gc_prof && cgraph->n_batch <= 32) {
+        fprintf(stderr, "[gc-prof] nodes=%d absorb=%.2f kick=%.2f loop=%.2f post=%.2f ms\n",
+                cgraph->n_nodes,
+                (gc_t1 - gc_t0) / 1000.0,
+                0.0,
+                (gc_t2 - gc_t1) / 1000.0,
+                (ggml_time_us() - gc_t2) / 1000.0);
     }
 
     return ret;
