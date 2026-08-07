@@ -71,6 +71,12 @@ DeepSeek-V4 284B（Q3_K），GPU 卸载 14 层专家，72 线程：
 
 行窗 EP 与 mirror 双双反超主线：**PP 2.1-2.2×、TG +9%**；行窗 EP 额外省一半专家内存。PP 优先或单路场景 isolate 配置 pp512 可达 370 tok/s。
 
+### vs 主线全档复测（2026-08-07，DSV4-Flash 284B mxfp4 生产形态）
+
+![vs mainline 2026-08-07](docs/benchmarks/vs_mainline_20260807.png)
+
+主线 `e9fa0781f` vs 本分支（含 Q2_K/mxfp4 VNNI dpbusd 化），同机同口径 llama-bench A/B。**GPU 卸载（-ngl 99 -ncmoe 99 EP，生产形态）：PP 全档 +40~59%（pp2048 265.1 vs 166.5、pp8192 257.7 vs 164.5、pp16384 227.5 vs 163.1）、TG +20%（23.3 vs 19.5）**；纯 CPU（-ngl 0）：PP +48%（135.1 vs 91.3），TG 已知回归（3.7 vs 8.1，−54%，EP 无关系，隔离定位中——GPU 卸载为生产场景，不受影响）。Q2_K repack 经 dpbusd 化后 PP 164→218（+33% 端到端），仍略落后 no-repack（244），Q2_K 建议维持 `--no-repack`。
+
 ### GLM-5.2 745B：IQ traits + gemm 分流
 
 ![GLM traits](docs/benchmarks/glm_traits.png)

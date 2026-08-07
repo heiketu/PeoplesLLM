@@ -71,6 +71,12 @@ DeepSeek-V4 284B (Q3_K), 14 expert layers on GPU, 72 threads:
 
 Both row-window EP and mirror beat upstream: **PP 2.1-2.2×, TG +9%**; row-window EP additionally halves expert memory. For PP-first or single-socket scenarios the isolate config reaches pp512 370 tok/s.
 
+### Full-range re-measurement vs upstream (2026-08-07, DSV4-Flash 284B mxfp4, production shape)
+
+![vs mainline 2026-08-07](docs/benchmarks/vs_mainline_20260807.png)
+
+Upstream `e9fa0781f` vs this branch (incl. Q2_K/mxfp4 VNNI dpbusd conversion), same-machine same-methodology llama-bench A/B. **GPU offload (-ngl 99 -ncmoe 99 EP, production shape): PP +40~59% across the board (pp2048 265.1 vs 166.5, pp8192 257.7 vs 164.5, pp16384 227.5 vs 163.1), TG +20% (23.3 vs 19.5)**. Pure CPU (-ngl 0): PP +48% (135.1 vs 91.3); TG is a known regression (3.7 vs 8.1, -54%, unrelated to EP, root-cause isolation in progress — production is GPU-offload and unaffected). Q2_K repack after dpbusd conversion improved end-to-end PP 164→218 (+33%) but still trails --no-repack (244), so Q2_K keeps the `--no-repack` recommendation.
+
 ### GLM-5.2 745B: IQ traits + gemm dispatch
 
 ![GLM traits](docs/benchmarks/glm_traits.png)
