@@ -1,5 +1,6 @@
 #include "llama.h"
 #include "../src/llama-ext.h"
+#include "../src/llama-layer-major.h"
 #include "ggml-backend.h"
 #include "repack.h"
 
@@ -8,6 +9,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
+#include <utility>
 #include <vector>
 
 #ifdef GGML_USE_CUDA
@@ -39,6 +42,31 @@ static bool compare_logits(const char * label, const std::vector<float> & a, con
 }
 
 int main(int argc, char ** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--ep-plan-test") == 0) {
+#if defined(_WIN32)
+        _putenv_s("GGML_CUDA_MOE_PP_EP_OWNER_EXPERTS", "");
+#else
+        unsetenv("GGML_CUDA_MOE_PP_EP_OWNER_EXPERTS");
+#endif
+        const llama_moe_pp_ep_plan equal = llama_moe_pp_ep_plan_make(256);
+        bool ok = !equal.asymmetric && equal.expert_begin[0] == 0 && equal.expert_count[0] == 128 &&
+            equal.expert_begin[1] == 128 && equal.expert_count[1] == 128 &&
+            llama_moe_pp_ep_device_rank(equal, 0, 1) == 0 &&
+            llama_moe_pp_ep_device_rank(equal, 1, 1) == 1;
+#if defined(_WIN32)
+        _putenv_s("GGML_CUDA_MOE_PP_EP_OWNER_EXPERTS", "96");
+#else
+        setenv("GGML_CUDA_MOE_PP_EP_OWNER_EXPERTS", "96", 1);
+#endif
+        const llama_moe_pp_ep_plan asymmetric = llama_moe_pp_ep_plan_make(256);
+        ok = ok && asymmetric.asymmetric && asymmetric.expert_begin[0] == 0 && asymmetric.expert_count[0] == 96 &&
+            asymmetric.expert_begin[1] == 96 && asymmetric.expert_count[1] == 160 &&
+            llama_moe_pp_ep_device_rank(asymmetric, 0, 1) == 1 &&
+            llama_moe_pp_ep_device_rank(asymmetric, 1, 1) == 0;
+        printf("MoE PP EP plan test: %s\n", ok ? "PASS" : "FAIL");
+        return ok ? 0 : 1;
+    }
+
     if (argc < 2) {
         printf("usage: %s MODEL [N_TOKENS=8] [TILE=4] [N_GPU_LAYERS=999] "
                "[BENCH_CPU_REPACK|BENCH_GPU_STREAM|BENCH_GPU_STREAM_REPACK|CHECK_CPU_REPACK] [N_THREADS=72] [N_GEN=0]\n", argv[0]);
@@ -105,8 +133,7 @@ int main(int argc, char ** argv) {
             overrides[0].buft = ggml_backend_dev_host_buffer_type(gpu);
         }
         mparams.tensor_buft_overrides = overrides;
-        mparams.use_mmap = false;
-        mparams.use_direct_io = true;
+        mparams.load_mode = LLAMA_LOAD_MODE_DIRECT_IO;
         mparams.use_extra_bufts = true;
     }
     llama_model * model = llama_model_load_from_file(argv[1], mparams);
@@ -153,7 +180,52 @@ int main(int argc, char ** argv) {
     }
 
     if (benchmark) {
-        llama_context * ctx = llama_init_from_model(model, cparams);
+        // Run a token/tile sweep without reloading the (potentially 140+ GiB)
+        // model. Example: LLAMA_BENCH_CASES=8192:8192,16384:8192,32768:8192.
+        // Each case gets a fresh context so KV/cache state cannot leak between
+        // measurements; the immutable model and pinned expert weights stay.
+        std::vector<std::pair<int32_t, int32_t>> benchmark_cases = {{n_tokens, n_ubatch}};
+        if (const char * env = getenv("LLAMA_BENCH_CASES")) {
+            benchmark_cases.clear();
+            const std::string cases(env);
+            size_t begin = 0;
+            while (begin < cases.size()) {
+                const size_t end = cases.find(',', begin);
+                const std::string item = cases.substr(begin, end == std::string::npos ? end : end - begin);
+                int32_t case_tokens = 0;
+                int32_t case_ubatch = 0;
+                char trailing = '\0';
+                if (sscanf(item.c_str(), "%d:%d%c", &case_tokens, &case_ubatch, &trailing) != 2 ||
+                        case_tokens < 2 || case_ubatch < 1 || case_ubatch > case_tokens) {
+                    fprintf(stderr, "invalid LLAMA_BENCH_CASES item '%s' (expected TOKENS:UBATCH)\n", item.c_str());
+                    llama_model_free(model);
+                    llama_backend_free();
+                    return 1;
+                }
+                benchmark_cases.emplace_back(case_tokens, case_ubatch);
+                if (end == std::string::npos) {
+                    break;
+                }
+                begin = end + 1;
+            }
+            if (benchmark_cases.empty()) {
+                fprintf(stderr, "LLAMA_BENCH_CASES contains no cases\n");
+                llama_model_free(model);
+                llama_backend_free();
+                return 1;
+            }
+        }
+
+        bool benchmark_ok = true;
+        for (const auto & benchmark_case : benchmark_cases) {
+        const int32_t n_tokens = benchmark_case.first;
+        const int32_t n_ubatch = benchmark_case.second;
+        llama_context_params case_cparams = cparams;
+        case_cparams.n_ctx = std::max(case_cparams.n_ctx, (uint32_t) (n_tokens + n_gen + 2));
+        case_cparams.n_batch = std::max(case_cparams.n_batch, (uint32_t) n_ubatch);
+        case_cparams.n_ubatch = n_ubatch;
+
+        llama_context * ctx = llama_init_from_model(model, case_cparams);
         if (!ctx) {
             fprintf(stderr, "failed to create benchmark context\n");
             llama_model_free(model);
@@ -308,9 +380,11 @@ int main(int argc, char ** argv) {
 
         llama_free(ctx);
         threadpool_free_fn(threadpool);
+        benchmark_ok = benchmark_ok && rc == 0 && generation_ok;
+        }
         llama_model_free(model);
         llama_backend_free();
-        return rc == 0 && generation_ok ? 0 : 1;
+        return benchmark_ok ? 0 : 1;
     }
 
     llama_context * ctx_ref = llama_init_from_model(model, cparams);

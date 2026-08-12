@@ -654,6 +654,10 @@ static void ggml_op_prof_dump(void) {
 }
 __attribute__((destructor)) static void ggml_op_prof_atexit(void) { ggml_op_prof_dump(); }
 
+void ggml_backend_cpu_op_timing_dump(void) {
+    ggml_op_prof_dump();
+}
+
 
 
 static struct {
@@ -3435,7 +3439,7 @@ static bool ggml_thread_apply_priority(int32_t prio) {
     return true;
 }
 
-#elif defined(__gnu_linux__)
+#elif defined(__linux__)
 // TODO: this may not work on BSD, to be verified
 
 static bool ggml_thread_apply_affinity(const bool * mask) {

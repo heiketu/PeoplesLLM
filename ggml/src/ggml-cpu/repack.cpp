@@ -6,6 +6,7 @@
 #include "ggml-impl.h"
 #include "ggml-cpu.h"
 #include "ggml-cpu-impl.h"
+#include "ggml-shard-plan.h"
 #include "simd-mappings.h"
 #include "traits.h"
 #include <atomic>
@@ -1565,6 +1566,57 @@ void ggml_gemv_iq4_nl_4x4_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs
     }
 }
 
+void ggml_gemv_iq4_xs_8x8_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+    const int qk = QK8_0;
+    const int nb = n / qk;          // q8_0 blocks per row
+    const int ns = n / QK_K;        // iq4_xs super-blocks per row
+    const int ncols_interleaved = 8;
+
+    assert(nr == 1);
+    assert(n % QK_K == 0);
+    assert(nc % ncols_interleaved == 0);
+
+    UNUSED(bs);
+    UNUSED(nr);
+
+    float sumf[8];
+
+    const block_q8_0 * a_ptr = (const block_q8_0 *) vy;
+    for (int x = 0; x < nc / ncols_interleaved; x++) {
+        const block_iq4_xsx8 * b_ptr = (const block_iq4_xsx8 *) vx + (x * ns);
+
+        for (int j = 0; j < ncols_interleaved; j++) sumf[j] = 0.0;
+        for (int l = 0; l < nb; l++) {
+            const int g = l % (QK_K / QK8_0); // sub-block index inside the super-block
+            const block_iq4_xsx8 * b = b_ptr + (l / (QK_K / QK8_0));
+
+            // combined sub-block scales, same packing as vec_dot_iq4_xs_q8_K
+            float dl[8];
+            for (int j = 0; j < ncols_interleaved; j++) {
+                const int lo = (g & 1) ? (b->scales_l[j][g >> 1] >> 4) : (b->scales_l[j][g >> 1] & 0xF);
+                const int ls = lo | (((b->scales_h[j] >> (2 * g)) & 0x3) << 4);
+                dl[j] = GGML_CPU_FP16_TO_FP32(b->d[j]) * (ls - 32);
+            }
+
+            for (int j = 0; j < ncols_interleaved; j++) {
+                int sumi = 0;
+                // sub-block g = 16 bytes per row = two interleaved 8-byte chunks;
+                // byte j of the sub-block holds value j (low nibble) and j+16 (high)
+                for (int h2 = 0; h2 < 2; h2++) {
+                    const uint8_t * qs = b->qs + (((g * 2 + h2) * ncols_interleaved + j) * 8);
+                    for (int i = 0; i < 8; ++i) {
+                        const int v0 = kvalues_iq4nl[qs[i] & 0x0F];
+                        const int v1 = kvalues_iq4nl[qs[i] >> 4];
+                        sumi += (v0 * a_ptr[l].qs[h2 * 8 + i]) + (v1 * a_ptr[l].qs[h2 * 8 + i + QK8_0 / 2]);
+                    }
+                }
+                sumf[j] += sumi * dl[j] * GGML_CPU_FP16_TO_FP32(a_ptr[l].d);
+            }
+        }
+        for (int j = 0; j < ncols_interleaved; j++) s[x * ncols_interleaved + j] = sumf[j];
+    }
+}
+
 void ggml_gemv_iq4_nl_8x8_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
     const int qk = QK8_0;
     const int nb = n / qk;
@@ -2933,6 +2985,62 @@ void ggml_gemm_iq4_nl_4x4_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs
     }
 }
 
+void ggml_gemm_iq4_xs_8x8_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+    const int qk = QK8_0;
+    const int nb = n / qk;          // q8_0 blocks per row
+    const int ns = n / QK_K;        // iq4_xs super-blocks per row
+    const int ncols_interleaved = 8;
+
+    assert(n % QK_K == 0);
+    assert(nr % 4 == 0);
+    assert(nc % ncols_interleaved == 0);
+
+    float sumf[4][8];
+    int sumi;
+
+    for (int y = 0; y < nr / 4; y++) {
+        const block_q8_0x4 * a_ptr = (const block_q8_0x4 *) vy + (y * nb);
+        for (int x = 0; x < nc / ncols_interleaved; x++) {
+            const block_iq4_xsx8 * b_ptr = (const block_iq4_xsx8 *) vx + (x * ns);
+            for (int m = 0; m < 4; m++) {
+                for (int j = 0; j < ncols_interleaved; j++) sumf[m][j] = 0.0;
+            }
+            for (int l = 0; l < nb; l++) {
+                const int g = l % (QK_K / QK8_0);
+                const block_iq4_xsx8 * b = b_ptr + (l / (QK_K / QK8_0));
+
+                // combined sub-block scales, same packing as vec_dot_iq4_xs_q8_K
+                float dl[8];
+                for (int j = 0; j < ncols_interleaved; j++) {
+                    const int lo = (g & 1) ? (b->scales_l[j][g >> 1] >> 4) : (b->scales_l[j][g >> 1] & 0xF);
+                    const int ls = lo | (((b->scales_h[j] >> (2 * g)) & 0x3) << 4);
+                    dl[j] = GGML_CPU_FP16_TO_FP32(b->d[j]) * (ls - 32);
+                }
+
+                for (int m = 0; m < 4; m++) {
+                    for (int j = 0; j < ncols_interleaved; j++) {
+                        sumi = 0;
+                        for (int h2 = 0; h2 < 2; h2++) {
+                            const uint8_t * qs = b->qs + (((g * 2 + h2) * ncols_interleaved + j) * 8);
+                            for (int i = 0; i < 8; ++i) {
+                                const int v0 = kvalues_iq4nl[qs[i] & 0x0F];
+                                const int v1 = kvalues_iq4nl[qs[i] >> 4];
+                                sumi += (v0 * a_ptr[l].qs[h2 * 32 + m * 8 + i]) +
+                                        (v1 * a_ptr[l].qs[h2 * 32 + m * 8 + i + qk / 2 * 4]);
+                            }
+                        }
+                        sumf[m][j] += sumi * dl[j] * GGML_CPU_FP16_TO_FP32(a_ptr[l].d[m]);
+                    }
+                }
+            }
+            for (int m = 0; m < 4; m++) {
+                for (int j = 0; j < ncols_interleaved; j++)
+                    s[(y * 4 + m) * bs + x * ncols_interleaved + j] = sumf[m][j];
+            }
+        }
+    }
+}
+
 void ggml_gemm_iq4_nl_8x8_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
     const int qk = QK8_0;
     const int nb = n / qk;
@@ -3527,7 +3635,7 @@ static block_q8_0x4 make_block_q8_0x4(block_q8_0 * in, unsigned int blck_size_in
     return out;
 }
 
-static block_q4_0x4 make_block_q4_0x4(block_q4_0 * in, unsigned int blck_size_interleave) {
+static block_q4_0x4 make_block_q4_0x4(block_q4_0 * in, int blck_size_interleave) {
     block_q4_0x4 out;
 
     for (int i = 0; i < 4; i++) {
@@ -5081,6 +5189,65 @@ static int repack_mxfp4_to_mxfp4_8_bl(struct ggml_tensor * t, int interleave_blo
     GGML_UNUSED(data_size);
 }
 
+static block_iq4_xsx8 make_block_iq4_xsx8(block_iq4_xs * in, unsigned int blck_size_interleave) {
+    block_iq4_xsx8 out;
+    // super-block deltas and sub-block scale words copied per row
+    for (int i = 0; i < 8; i++) {
+        out.d[i]        = in[i].d;
+        out.scales_h[i] = in[i].scales_h;
+        for (int g = 0; g < QK_K / 64; g++) {
+            out.scales_l[i][g] = in[i].scales_l[g];
+        }
+    }
+
+    // Interleave the nibble bytes (128 bytes per block) by taking
+    // blck_size_interleave bytes at a time; chunk g*8+j then holds block j's
+    // bytes g*8..g*8+7, i.e. values g*16..g*16+15 of sub-block g/2
+    const int end = 8 * (QK_K / 2) / blck_size_interleave;
+    for (int i = 0; i < end; ++i) {
+        int src_id     = i % 8;
+        int src_offset = (i / 8) * blck_size_interleave;
+        int dst_offset = i * blck_size_interleave;
+
+        memcpy(out.qs + dst_offset, in[src_id].qs + src_offset, blck_size_interleave);
+    }
+
+    return out;
+}
+
+static int repack_iq4_xs_to_iq4_xs_8_bl(struct ggml_tensor * t, int interleave_block, const void * GGML_RESTRICT data, size_t data_size) {
+    GGML_ASSERT(t->type == GGML_TYPE_IQ4_XS);
+    GGML_ASSERT(interleave_block == 8);
+
+    const block_iq4_xs * src = (const block_iq4_xs *) data;
+          block_iq4_xsx8 * dst = (block_iq4_xsx8 *) t->data;
+
+    block_iq4_xs dst_tmp[8];
+
+    int nrow = ggml_nrows(t);
+    int nrows_interleaved = 8;
+    int nblocks = t->ne[0] / QK_K;
+
+    GGML_ASSERT(data_size == nrow * nblocks * sizeof(block_iq4_xs));
+
+    if (t->ne[1] % nrows_interleaved != 0 || t->ne[0] % 8 != 0) {
+        return -1;
+    }
+
+    for (int b = 0; b < nrow; b += nrows_interleaved) {
+        for (int64_t x = 0; x < nblocks; x++) {
+            for (int i = 0; i < nrows_interleaved; i++) {
+                dst_tmp[i] = src[x + i * nblocks];
+            }
+            *dst++ = make_block_iq4_xsx8(dst_tmp, interleave_block);
+        }
+        src += nrows_interleaved * nblocks;
+    }
+    return 0;
+
+    GGML_UNUSED(data_size);
+}
+
 namespace ggml::cpu::repack {
 // repack
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS>
@@ -5162,6 +5329,10 @@ template <> int repack<block_iq2_xs, 8, 8>(struct ggml_tensor * t, const void * 
 
 template <> int repack<block_iq3_xxs, 8, 8>(struct ggml_tensor * t, const void * data, size_t data_size) {
     return repack_iq3_xxs_to_iq3_xxs_8_bl(t, 8, data, data_size);
+}
+
+template <> int repack<block_iq4_xs, 8, 8>(struct ggml_tensor * t, const void * data, size_t data_size) {
+    return repack_iq4_xs_to_iq4_xs_8_bl(t, 8, data, data_size);
 }
 
 template <> int repack<block_mxfp4, 4, 4>(struct ggml_tensor * t, const void * data, size_t data_size) {
@@ -5271,6 +5442,10 @@ template <> void gemv<block_iq4_nl, 4, 4, GGML_TYPE_Q8_0>(int n, float * s, size
 
 template <> void gemv<block_iq4_nl, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
     ggml_gemv_iq4_nl_8x8_q8_0(n, s, bs, vx, vy, nr, nc);
+}
+
+template <> void gemv<block_iq4_xs, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemv_iq4_xs_8x8_q8_0(n, s, bs, vx, vy, nr, nc);
 }
 
 template <> void gemv<block_iq1_s, 8, 8, GGML_TYPE_Q8_K>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
@@ -5398,6 +5573,10 @@ template <> void gemm<block_iq4_nl, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size
     ggml_gemm_iq4_nl_8x8_q8_0(n, s, bs, vx, vy, nr, nc);
 }
 
+template <> void gemm<block_iq4_xs, 8, 8, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemm_iq4_xs_8x8_q8_0(n, s, bs, vx, vy, nr, nc);
+}
+
 template <> void gemm<block_iq1_s, 8, 8, GGML_TYPE_Q8_K>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
     ggml_gemm_iq1_s_8x8_q8_K(n, s, bs, vx, vy, nr, nc);
 }
@@ -5472,9 +5651,28 @@ template <> struct gemm_min_nrows<block_iq1_m, 8, 8, GGML_TYPE_Q8_K> { static co
 template <> struct gemm_min_nrows<block_iq2_xxs, 8, 8, GGML_TYPE_Q8_K> { static constexpr int64_t value = 4; };
 template <> struct gemm_min_nrows<block_iq2_xs, 8, 8, GGML_TYPE_Q8_K> { static constexpr int64_t value = 4; };
 template <> struct gemm_min_nrows<block_iq3_xxs, 8, 8, GGML_TYPE_Q8_K> { static constexpr int64_t value = 4; };
+template <> struct gemm_min_nrows<block_iq4_xs, 8, 8, GGML_TYPE_Q8_0> { static constexpr int64_t value = 4; };
 
-// Tile of src1 rows gathered per gemm call in forward_mul_mat_id (multiple of 4).
-static constexpr int64_t MMID_GEMM_TILE = 32;
+template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PARAM_TYPE>
+struct gemv_small_nrows { static constexpr bool value = false; };
+
+template <> struct gemv_small_nrows<block_mxfp4, 8, 8, GGML_TYPE_Q8_0> { static constexpr bool value = true; };
+
+// Maximum src1 rows staged per GEMM call in forward_mul_mat_id. The runtime
+// tile can be swept without changing the workspace ABI.
+static constexpr int64_t MMID_GEMM_TILE_MAX = 32;
+
+static int64_t mmid_gemm_tile() {
+    static const int64_t tile = []() {
+        const char * value = getenv("GGML_REPACK_MMID_GEMM_TILE");
+        if (!value || value[0] == '\0') {
+            return (int64_t) 32;
+        }
+        const int parsed = atoi(value);
+        return (int64_t) (parsed == 4 || parsed == 8 || parsed == 16 || parsed == 32 ? parsed : 32);
+    }();
+    return tile;
+}
 // Largest NUMA EP row-claim block accepted by GGML_NUMA_EP_CHUNK. The per-thread
 // dense output tile must cover this width even when ne01/n_threads is smaller.
 static constexpr int64_t MMID_EP_CHUNK_MAX = 128;
@@ -5482,9 +5680,14 @@ static constexpr int64_t MMID_EP_CHUNK_MAX = 128;
 class tensor_traits_base : public ggml::cpu::tensor_traits {
   public:
     virtual int repack(struct ggml_tensor * t, const void * data, size_t data_size) = 0;
+    virtual ggml_type activation_type() const = 0;
 };
 
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PARAM_TYPE> class tensor_traits : public tensor_traits_base {
+
+    ggml_type activation_type() const override {
+        return PARAM_TYPE;
+    }
 
     bool work_size(int n_threads, const struct ggml_tensor * op, size_t & size) override {
         // not realy a GGML_TYPE_Q8_0 but same size.
@@ -5531,7 +5734,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                     // maximum NUMA EP claim quantum.
                     const int64_t ne01 = op->src[0]->ne[1];
                     const int64_t cols = MAX(MMID_EP_CHUNK_MAX, (ne01 + n_threads - 1)/n_threads + NB_COLS);
-                    size += n_threads*(MMID_GEMM_TILE*nbw1 + MMID_GEMM_TILE*cols*sizeof(float) +
+                    size += n_threads*(MMID_GEMM_TILE_MAX*nbw1 + MMID_GEMM_TILE_MAX*cols*sizeof(float) +
                                      4*op->src[1]->ne[0]*sizeof(float));
 
                     return true;
@@ -5912,7 +6115,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         // Column ranges are bounded by the regular thread split and the maximum NUMA
         // EP claim quantum.
         const int64_t mmid_max_cols = MAX(MMID_EP_CHUNK_MAX, (ne01 + nth - 1)/nth + NB_COLS);
-        const size_t  mmid_scratch_stride = MMID_GEMM_TILE*nbw1 + MMID_GEMM_TILE*mmid_max_cols*sizeof(float) +
+        const size_t  mmid_scratch_stride = MMID_GEMM_TILE_MAX*nbw1 + MMID_GEMM_TILE_MAX*mmid_max_cols*sizeof(float) +
                                             4*ne00*sizeof(float);
 
         const size_t mapping_size = (3*(size_t) n_as + 1 + (size_t) n_selected)*sizeof(mmid_row_mapping);
@@ -5946,12 +6149,19 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         // prequantized source can arrive from a GPU/CPU boundary and is reused
         // directly by gate and up projections.
         if (!src1_prequantized) {
-            for (int64_t i12 = 0; i12 < ne12; ++i12) {
-                for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
-                    from_float((float *)((char *) src1->data + i12 * nb12 + i11 * nb11),
-                               (void *)               (wdata + i12 * nbw2 + i11 * nbw1),
-                               ne10);
-                }
+            // Distribute the complete (token, selected-expert) row space. The
+            // compact remote-EP graph deliberately uses n_ids=1 and places
+            // assignments in ne12; partitioning only ne11 left every F32->Q8
+            // row on thread 0 while the rest of the team waited at the barrier.
+            // Rows are independent quantization units, so flattening the two
+            // dimensions does not alter arithmetic within any row.
+            const int64_t src1_rows = ne11 * ne12;
+            for (int64_t row = ith; row < src1_rows; row += nth) {
+                const int64_t i12 = row / ne11;
+                const int64_t i11 = row % ne11;
+                from_float((float *)((char *) src1->data + i12 * nb12 + i11 * nb11),
+                           (void *)               (wdata + i12 * nbw2 + i11 * nbw1),
+                           ne10);
             }
         }
         const char * src1_qdata = src1_prequantized ? (const char *) src1->data : wdata;
@@ -5987,6 +6197,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                     MMID_MATRIX_ROW(i02, matrix_row_cursors[i02]++) = { id, iid1 };
                 }
             }
+
         }
 
         // NUMA expert parallelism (GGML_NUMA_EP): every expert's rows are split into
@@ -6042,8 +6253,9 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         }();
         const int64_t ep_chunk = ep_chunk_override != 0 ? ep_chunk_override : (ne12 > 8 ? 64 : 16);
         static constexpr int64_t ep_window_align = MMID_EP_CHUNK_MAX;
-        const int64_t ep_win = ep ? (((ne01 + ep_nodes - 1) / ep_nodes + ep_window_align - 1) /
-                                      ep_window_align) * ep_window_align : 0;
+        ggml_shard_window ep_window;
+        GGML_ASSERT(!ep || ggml_shard_window_equal(ne01, ep_nodes, 0, ep_window_align, ep_window));
+        const int64_t ep_win = ep ? ep_window.stride : 0;
 
         if (ep) {
             for (int cur_a = ith; cur_a < n_as; cur_a += nth) {
@@ -6059,22 +6271,26 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         // Tiles are interleaved from the already-quantized source rows, multiplied,
         // and scattered back to their original (slot, token) positions. Tail rows go
         // through per-row GEMV.
-        auto mmid_rows_range = [&](int64_t cur_a, const char * src0_cur, int64_t ws, int64_t we) {
+        auto mmid_rows_range = [&](int64_t cur_a, const char * src0_cur, int64_t ws, int64_t we,
+                                   bool force_shared_small) {
             const int64_t cne1  = matrix_row_counts[cur_a];
             const int64_t ncols = we - ws;
             GGML_ASSERT(ncols <= mmid_max_cols);
 
             int64_t nrows_gemm = 0;
-            if (cne1 >= gemm_min_nrows<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>::value && ncols % NB_COLS == 0) {
+            if (!force_shared_small &&
+                    cne1 >= gemm_min_nrows<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>::value &&
+                    ncols % NB_COLS == 0) {
                 nrows_gemm = cne1 - (cne1 % 4);
             }
 
             char * vy_scratch = mmid_scratch + ith*mmid_scratch_stride;
-            auto * dst_tile = (float *) (vy_scratch + MMID_GEMM_TILE*nbw1);
-            auto * x4       = dst_tile + MMID_GEMM_TILE*mmid_max_cols; // 4*ne00 floats
+            auto * dst_tile = (float *) (vy_scratch + MMID_GEMM_TILE_MAX*nbw1);
+            auto * x4       = dst_tile + MMID_GEMM_TILE_MAX*mmid_max_cols; // 4*ne00 floats
+            const int64_t gemm_tile = mmid_gemm_tile();
 
-            for (int64_t base = 0; base < nrows_gemm; base += MMID_GEMM_TILE) {
-                const int64_t tr = MIN(MMID_GEMM_TILE, nrows_gemm - base);
+            for (int64_t base = 0; base < nrows_gemm; base += gemm_tile) {
+                const int64_t tr = MIN(gemm_tile, nrows_gemm - base);
                 for (int64_t k = 0; k < tr; k += 4) {
                     if constexpr (INTER_SIZE == 8 &&
                                   (PARAM_TYPE == GGML_TYPE_Q8_0 || PARAM_TYPE == GGML_TYPE_Q8_K)) {
@@ -6103,7 +6319,33 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                 }
             }
 
-            for (int64_t ir1 = nrows_gemm; ir1 < cne1; ir1++) {
+            int64_t nrows_small = 0;
+            if constexpr (gemv_small_nrows<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>::value) {
+                const bool use_small_rows = (force_shared_small || nrows_gemm == 0) && cne1 >= 2 &&
+                    ggml_cpu_has_avx512() && ggml_cpu_has_avx512_vnni();
+                while (use_small_rows && cne1 - nrows_small >= 2) {
+                    // The Ice Lake AVX512 kernel keeps up to eight activation
+                    // accumulators while decoding each MXFP4 weight block once.
+                    // Remote EP prefill commonly leaves 5-8 rows per expert on
+                    // one worker; a four-row cap streamed the same expert twice.
+                    const int64_t tr = MIN((int64_t) 8, cne1 - nrows_small);
+                    for (int64_t k = 0; k < tr; ++k) {
+                        const struct mmid_row_mapping rm = MMID_MATRIX_ROW(cur_a, nrows_small + k);
+                        const char * qrow = src1_qdata + (rm.i1 % ne11)*nbw1 + rm.i2*nbw2;
+                        memcpy(vy_scratch + k*nbw1, qrow, nbw1);
+                    }
+                    gemv<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(
+                        ne00, dst_tile, ncols, src0_cur + ws*nb01, vy_scratch, tr, ncols);
+                    for (int64_t k = 0; k < tr; ++k) {
+                        const struct mmid_row_mapping rm = MMID_MATRIX_ROW(cur_a, nrows_small + k);
+                        memcpy((char *) dst->data + rm.i1*nb1 + rm.i2*nb2 + ws*sizeof(float),
+                               dst_tile + k*ncols, ncols*sizeof(float));
+                    }
+                    nrows_small += tr;
+                }
+            }
+
+            for (int64_t ir1 = MAX(nrows_gemm, nrows_small); ir1 < cne1; ir1++) {
                 struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, ir1);
 
                 const int id = row_mapping.i1;  // selected expert index
@@ -6264,7 +6506,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                                 }
                             }
 
-                            mmid_rows_range(cur_a, src0_cur, r0, r1);
+                            mmid_rows_range(cur_a, src0_cur, r0, r1, false);
                         }
                     }
                 }
@@ -6290,12 +6532,13 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
             if (n_sel > 0) {
                 const int64_t n_groups   = MIN(n_sel, (int64_t) nth);
-                const int64_t group_base = nth / n_groups; // min threads per group
-                const int64_t group_rem  = nth % n_groups; // first group_rem groups get one extra thread
+                const int64_t group_base = nth / n_groups;
+                const int64_t group_rem  = nth % n_groups;
 
-                // locate this thread's group and its rank within the group
                 const int64_t big_threads = group_rem * (group_base + 1);
-                int64_t group, rank, group_size;
+                int64_t group;
+                int64_t rank;
+                int64_t group_size;
                 if (ith < big_threads) {
                     group      = ith / (group_base + 1);
                     rank       = ith % (group_base + 1);
@@ -6306,7 +6549,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                     group_size = group_base;
                 }
 
-                // compacted index range of the selected experts handled by this group
+                // A group may cover multiple experts when selected experts
+                // outnumber worker threads.
                 const int64_t sel_begin = (group * n_sel) / n_groups;
                 const int64_t sel_end   = ((group + 1) * n_sel) / n_groups;
 
@@ -6340,6 +6584,22 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                     }
 
                     if (src0_cur_start >= src0_cur_end) {
+                        continue;
+                    }
+
+                    bool use_shared_small = false;
+                    if constexpr (gemv_small_nrows<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>::value) {
+                        use_shared_small = nr1 >= 2 && nr1 <= 4 &&
+                            ggml_cpu_has_avx512() && ggml_cpu_has_avx512_vnni();
+                    }
+                    if (use_shared_small) {
+                        // A speculative TG batch can route the same expert once
+                        // per token. Decode its weight stream once for those 2-4
+                        // activation rows while preserving the per-row dot order.
+                        for (int64_t ws = src0_cur_start; ws < src0_cur_end; ws += mmid_max_cols) {
+                            const int64_t we = MIN(ws + mmid_max_cols, src0_cur_end);
+                            mmid_rows_range(cur_a, src0_cur, ws, we, true);
+                        }
                         continue;
                     }
 
@@ -6387,7 +6647,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                     continue;
                 }
 
-                mmid_rows_range(cur_a, src0_cur, src0_cur_start, src0_cur_end);
+                mmid_rows_range(cur_a, src0_cur, src0_cur_start, src0_cur_end, false);
             }
         }
 #undef MMID_MATRIX_ROW
@@ -6434,6 +6694,7 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
     // instance for IQ4
     static const ggml::cpu::repack::tensor_traits<block_iq4_nl, 4, 4, GGML_TYPE_Q8_0> iq4_nl_4x4_q8_0;
     static const ggml::cpu::repack::tensor_traits<block_iq4_nl, 8, 8, GGML_TYPE_Q8_0> iq4_nl_8x8_q8_0;
+    static const ggml::cpu::repack::tensor_traits<block_iq4_xs, 8, 8, GGML_TYPE_Q8_0> iq4_xs_8x8_q8_0;
 
     // instances for IQ1
     static const ggml::cpu::repack::tensor_traits<block_iq1_s, 8, 8, GGML_TYPE_Q8_K> iq1_s_8x8_q8_K;
@@ -6518,9 +6779,16 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
             #endif
         }
     } else if (cur->type == GGML_TYPE_Q2_K) {
-        // The x86 kernel has a fully vectorized AVX2 implementation. Requiring
-        // AVX512 here left that path unreachable on AVX2-only hosts.
-        if (ggml_cpu_has_avx2()) {
+        // On AVX512-VNNI, the mature row-major vec-dot path is faster than the
+        // x8 repack path for both routed TG and PP. Keep repack enabled on the
+        // other architectures, and retain an explicit A/B override for future
+        // kernel work. This is intentionally type-specific: MXFP4 and the other
+        // profitable formats continue to use CPU_REPACK.
+        static const bool q2_k_repack_enabled = []() {
+            const char * e = getenv("GGML_REPACK_Q2_K");
+            return e ? atoi(e) != 0 : !ggml_cpu_has_avx512_vnni();
+        }();
+        if (q2_k_repack_enabled && ggml_cpu_has_avx2()) {
             if (cur->ne[1] % 8 == 0) {
                 return &q2_K_8x8_q8_K;
             }
@@ -6617,6 +6885,18 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
             if (cur->ne[1] % 8 == 0) {
                 return &iq3_xxs_8x8_q8_K;
             }
+        }
+    } else if (cur->type == GGML_TYPE_IQ4_XS) {
+        // There is no native IQ4_XS x8 kernel yet: the arch-neutral LUT path
+        // is much slower than the mature row-major vec_dot implementation on
+        // x86 (for both TG and PP). Keep the layout available behind an A/B
+        // knob for native-kernel development, but never select it by default.
+        static const bool iq4_xs_repack_enabled = []() {
+            const char * e = getenv("GGML_REPACK_IQ4_XS");
+            return e && atoi(e) != 0;
+        }();
+        if (iq4_xs_repack_enabled && cur->ne[1] % 8 == 0) {
+            return &iq4_xs_8x8_q8_0;
         }
     } else if (cur->type == GGML_TYPE_IQ4_NL) {
         if (ggml_cpu_has_avx2()) {
@@ -6766,13 +7046,11 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
             if (op->src[1]->buffer && !ggml_backend_buft_is_host(op->src[1]->buffer->buft)) {
                 return false;
             }
+            const auto * traits = static_cast<const tensor_traits_base *>(op->src[0]->extra);
             if (op->src[1]->type == GGML_TYPE_F32 ||
-                    (op->src[0]->type == GGML_TYPE_MXFP4 && op->src[1]->type == GGML_TYPE_Q8_0)) {
+                    (traits != nullptr && op->src[1]->type == traits->activation_type())) {
                 return true;
             }
-            //if (op->src[1]->type == GGML_TYPE_Q8_0) {
-            //    return true;
-            //}
         }
         return false;
     }
@@ -6927,8 +7205,10 @@ struct ggml_repack_unrepack_job * ggml_repack_unrepack_job_new(
         // window ownership only exists when the expert pages were actually
         // placed per node (GGML_NUMA_EP + NUMA init)
         const int n_nodes = std::min(ggml_numa_node_count(), (int) GGML_NUMA_MAX_NODES);
+        ggml_shard_window window;
+        GGML_ASSERT(ggml_shard_window_equal(rows_per_expert, n_nodes, 0, 128, window));
         job->n_nodes = n_nodes;
-        job->ep_win  = ((rows_per_expert + n_nodes - 1)/n_nodes + 127)/128*128;
+        job->ep_win  = window.stride;
     }
     return job;
 }

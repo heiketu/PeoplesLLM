@@ -1362,6 +1362,13 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
 
+    // CPU fused min(a, limit) / clamp(b, -limit, limit) + SWIGLU.
+    GGML_API struct ggml_tensor * ggml_swiglu_split_clamped(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            float                 limit);
+
     GGML_API struct ggml_tensor * ggml_geglu_erf_split(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
@@ -2927,6 +2934,12 @@ extern "C" {
             int                   idx);
 
     GGML_API void ggml_build_forward_expand(
+            struct ggml_cgraph * cgraph,
+            struct ggml_tensor * tensor);
+
+    // add the tensor and its parents to the graph without marking them for compute
+    // the flag is set later, when the tensor is reached from a node that computes
+    GGML_API void ggml_build_forward_order(
             struct ggml_cgraph * cgraph,
             struct ggml_tensor * tensor);
 

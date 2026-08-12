@@ -3076,6 +3076,17 @@ struct ggml_tensor * ggml_swiglu_split(
     return ggml_glu_impl(ctx, a, b, GGML_GLU_OP_SWIGLU, false);
 }
 
+struct ggml_tensor * ggml_swiglu_split_clamped(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        float                 limit) {
+    GGML_ASSERT(limit > 0.0f);
+    struct ggml_tensor * result = ggml_glu_impl(ctx, a, b, GGML_GLU_OP_SWIGLU, false);
+    ggml_set_op_params_f32(result, 2, limit);
+    return result;
+}
+
 // ggml_geglu_erf
 
 struct ggml_tensor * ggml_geglu_erf(
@@ -7552,6 +7563,10 @@ void ggml_build_forward_expand(struct ggml_cgraph * cgraph, struct ggml_tensor *
     ggml_build_forward_impl(cgraph, tensor, true, true);
 }
 
+void ggml_build_forward_order(struct ggml_cgraph * cgraph, struct ggml_tensor * tensor) {
+    ggml_build_forward_impl(cgraph, tensor, true, false);
+}
+
 void ggml_build_backward_expand(
         struct ggml_context *  ctx,
         struct ggml_cgraph  *  cgraph,
@@ -8212,7 +8227,9 @@ void ggml_set_input(struct ggml_tensor * tensor) {
 }
 
 void ggml_set_output(struct ggml_tensor * tensor) {
-    tensor->flags |= GGML_TENSOR_FLAG_OUTPUT;
+    for (struct ggml_tensor * cur = tensor; cur != NULL; cur = cur->view_src) {
+        cur->flags |= GGML_TENSOR_FLAG_OUTPUT;
+    }
 }
 
 void ggml_set_param(struct ggml_tensor * tensor) {

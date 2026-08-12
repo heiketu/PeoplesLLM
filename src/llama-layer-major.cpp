@@ -7,6 +7,7 @@
 #include "llama-kv-cache-dsv4.h"
 #include "llama-memory.h"
 #include "llama-model.h"
+#include "ggml-shard-plan.h"
 
 #include <algorithm>
 #include <cmath>
@@ -19,6 +20,48 @@
 #include <new>
 #include <unistd.h>
 #include <vector>
+
+llama_moe_pp_ep_plan llama_moe_pp_ep_plan_make(int64_t n_expert) {
+    llama_moe_pp_ep_plan plan;
+    if (n_expert < 2) {
+        plan.expert_count[0] = n_expert;
+        return plan;
+    }
+
+    int64_t owner_count = n_expert/2;
+    if (const char * value = getenv("GGML_CUDA_MOE_PP_EP_OWNER_EXPERTS")) {
+        char * end = nullptr;
+        const long long parsed = strtoll(value, &end, 10);
+        if (end != value && *end == '\0' && parsed > 0 && parsed < n_expert) {
+            owner_count = parsed;
+        }
+    }
+
+    ggml_shard_plan_input input;
+    input.placement = ggml_shard_placement::SPLIT;
+    input.axis = 2;
+    input.domains = {
+        {0, ggml_shard_domain_kind::GPU, static_cast<float>(owner_count)},
+        {1, ggml_shard_domain_kind::GPU, static_cast<float>(n_expert - owner_count)},
+    };
+    input.segments = {{n_expert, 1, 1}};
+
+    ggml_shard_plan shard_plan;
+    GGML_ASSERT(ggml_shard_plan_build(input, shard_plan));
+    for (size_t i = 0; i < 2; ++i) {
+        plan.expert_begin[i] = shard_plan.offsets[i];
+        plan.expert_count[i] = shard_plan.extents[i];
+    }
+    plan.asymmetric = owner_count != n_expert/2;
+    return plan;
+}
+
+int llama_moe_pp_ep_device_rank(const llama_moe_pp_ep_plan & plan, int logical_rank, int owner_rank) {
+    if (!plan.asymmetric || logical_rank < 0 || logical_rank > 1 || owner_rank < 0 || owner_rank > 1) {
+        return logical_rank;
+    }
+    return logical_rank == 0 ? owner_rank : 1 - owner_rank;
+}
 
 namespace {
 
@@ -231,12 +274,12 @@ public:
     }
 
     // Mirror of the scheduler's staged size for the EP rank views of w.
-    static size_t rank_view_nbytes(const ggml_tensor * w, int64_t half) {
+    static size_t rank_view_nbytes(const ggml_tensor * w, int64_t n_experts) {
         const size_t blck_size = ggml_blck_size(w->type);
         size_t nbytes = blck_size == 1 ?
             (size_t) ggml_type_size(w->type) + (w->ne[0] - 1)*w->nb[0] :
             (size_t) w->ne[0]*w->nb[0]/blck_size;
-        nbytes += (w->ne[1] - 1)*w->nb[1] + (half - 1)*w->nb[2];
+        nbytes += (w->ne[1] - 1)*w->nb[1] + (n_experts - 1)*w->nb[2];
         return nbytes;
     }
 
@@ -251,6 +294,15 @@ public:
             layer.ffn_gate_exps->type == GGML_TYPE_MXFP4 &&
             layer.ffn_up_exps->type   == GGML_TYPE_MXFP4 &&
             layer.ffn_down_exps->type == GGML_TYPE_MXFP4;
+        int owner_rank = -1;
+        if (ep) {
+            const ggml_backend_dev_t owner_dev = model.dev_layer(il);
+            for (size_t rank = 0; rank < 2; ++rank) {
+                if (ggml_backend_get_device(backends_[rank]) == owner_dev) {
+                    owner_rank = (int) rank;
+                }
+            }
+        }
         const ggml_tensor * weights[] = { layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps };
         for (const ggml_tensor * w : weights) {
             if (w == nullptr || w->data == nullptr) {
@@ -269,14 +321,15 @@ public:
                 continue;
             }
             if (ep && w->ne[2] % 2 == 0) {
-                const int64_t half = w->ne[2]/2;
-                for (int rank = 0; rank < 2; ++rank) {
-                    const char * data = (const char *) w->data + rank*half*w->nb[2];
-                    const size_t size = rank_view_nbytes(w, half);
-                    if (fns_src_[rank] != nullptr) {
-                        fns_src_[rank](backends_[rank], w, data, size);
+                const llama_moe_pp_ep_plan plan = llama_moe_pp_ep_plan_make(w->ne[2]);
+                for (int logical_rank = 0; logical_rank < 2; ++logical_rank) {
+                    const int device_rank = llama_moe_pp_ep_device_rank(plan, logical_rank, owner_rank);
+                    const char * data = (const char *) w->data + plan.expert_begin[logical_rank]*w->nb[2];
+                    const size_t size = rank_view_nbytes(w, plan.expert_count[logical_rank]);
+                    if (fns_src_[device_rank] != nullptr) {
+                        fns_src_[device_rank](backends_[device_rank], w, data, size);
                     } else if (!repack) {
-                        fns_[rank](backends_[rank], data, size);
+                        fns_[device_rank](backends_[device_rank], data, size);
                     }
                 }
             } else {
@@ -335,7 +388,7 @@ bool llama_layer_major_vram_budget_ok(
         return true; // the scheduler will not stage any MoE weight
     }
 
-    size_t max_bytes = 0;
+    size_t max_staged = 0;
     for (const auto & layer : model.layers) {
         const ggml_tensor * weights[] = {
             layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps, layer.ffn_gate_up_exps,
@@ -349,19 +402,23 @@ bool llama_layer_major_vram_budget_ok(
                     ggml_backend_buffer_get_usage(buf) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
                 continue;
             }
-            max_bytes = std::max(max_bytes, ggml_nbytes(w));
+            size_t staged = ggml_nbytes(w);
+            if (ep_env && backends.size() >= 2 && w->ne[2] >= 2) {
+                const llama_moe_pp_ep_plan plan = llama_moe_pp_ep_plan_make(w->ne[2]);
+                staged = std::max(
+                    moe_pipe_hint::rank_view_nbytes(w, plan.expert_count[0]),
+                    moe_pipe_hint::rank_view_nbytes(w, plan.expert_count[1]));
+            }
+            max_staged = std::max(max_staged, staged);
         }
     }
-    if (max_bytes == 0) {
+    if (max_staged == 0) {
         return true; // no host MoE weight, nothing is staged
     }
 
-    // EP mode stages per-rank halves of each expert tensor on every GPU
-    const size_t staged = ep_env && backends.size() >= 2 ? max_bytes/2 : max_bytes;
-
     constexpr int n_slots = 4; // GGML_CUDA_MOE_PP_MAX_PREFETCH
     const size_t margin   = (size_t) 1*1024*1024*1024;
-    const size_t required = (size_t) n_slots*staged + margin;
+    const size_t required = (size_t) n_slots*max_staged + margin;
 
     typedef bool (*mem_get_info_t)(ggml_backend_t, size_t *, size_t *);
     for (ggml_backend_t backend : backends) {
@@ -384,7 +441,7 @@ bool llama_layer_major_vram_budget_ok(
                     "(%d prefetch slots x %.2f GiB staged + %.2f GiB margin)\n",
                     __func__, ggml_backend_name(backend),
                     free_mem/1073741824.0, total_mem/1073741824.0, required/1073741824.0,
-                    n_slots, staged/1073741824.0, margin/1073741824.0);
+                    n_slots, max_staged/1073741824.0, margin/1073741824.0);
             return false;
         }
     }
@@ -601,6 +658,17 @@ bool llama_layer_major_hc_state::store_tile(
 }
 
 int llama_context::decode_layer_major(const llama_batch & batch_inp, uint32_t n_ubatch) {
+    static const uint32_t configured_max_ubatch = []() {
+        const char * value = getenv("LLAMA_LAYER_MAJOR_UBATCH");
+        if (!value) {
+            return 0u;
+        }
+        char * end = nullptr;
+        const unsigned long parsed = strtoul(value, &end, 10);
+        return end != value && *end == '\0' && parsed <= 16384 ? (uint32_t) parsed : 0u;
+    }();
+    const uint32_t max_ubatch = std::max(cparams.n_ubatch, configured_max_ubatch);
+
     // Keep the initial implementation narrow so unsupported requests retain
     // the regular llama_decode() path and its full compatibility surface.
     if (model.arch != LLM_ARCH_DEEPSEEK4 ||
@@ -610,13 +678,13 @@ int llama_context::decode_layer_major(const llama_batch & batch_inp, uint32_t n_
             cparams.pooling_type != LLAMA_POOLING_TYPE_NONE ||
             !sampling.samplers.empty() || !loras->empty() ||
             batch_inp.n_tokens <= 0 || !batch_inp.token || batch_inp.embd ||
-            n_ubatch == 0 || n_ubatch > cparams.n_ubatch) {
+            n_ubatch == 0 || n_ubatch > max_ubatch) {
         LLAMA_LOG_INFO("%s: ineligible: arch=%d ctx_type=%d causal=%d embd=%d nextn=%d prenorm=%d pooling=%d samplers=%zu loras=%zu n_tokens=%d token=%p embd=%p n_ubatch=%u cparams_ubatch=%u\n",
                 __func__, (int) model.arch, (int) cparams.ctx_type, (int) cparams.causal_attn,
                 (int) cparams.embeddings, (int) cparams.embeddings_nextn, (int) cparams.embeddings_pre_norm,
                 (int) cparams.pooling_type, sampling.samplers.size(), loras->size(),
                 batch_inp.n_tokens, (void *) batch_inp.token, (void *) batch_inp.embd,
-                n_ubatch, cparams.n_ubatch);
+                n_ubatch, max_ubatch);
         return -1;
     }
 
@@ -695,12 +763,14 @@ int llama_context::decode_layer_major(const llama_batch & batch_inp, uint32_t n_
     // preflight the prefetch-slot VRAM budget before anything allocates;
     // a shortfall here still has the untouched chunked path as fallback
     if (!llama_layer_major_vram_budget_ok(model, backend_ptrs, n_tokens_all)) {
+        if (getenv("GGML_OFFLOAD_TRACE")) fprintf(stderr, "[lm-trace] decline: vram budget (n_tokens=%u)\n", n_tokens_all);
         return 1;
     }
 
     const size_t hc_dim = hparams.n_embd_h();
     if (hc_dim == 0 || n_tokens_all > SIZE_MAX/hc_dim ||
             (size_t) n_tokens_all*hc_dim > SIZE_MAX/sizeof(float)) {
+        if (getenv("GGML_OFFLOAD_TRACE")) fprintf(stderr, "[lm-trace] decline: hc_dim overflow\n");
         return -2;
     }
 
@@ -717,6 +787,7 @@ int llama_context::decode_layer_major(const llama_batch & batch_inp, uint32_t n_
     // failure remains safe for caller fallback.
     llama_layer_major_hc_state hc_state;
     if (!hc_state.init(n_tokens_all, hc_dim, n_ubatch, sched.get(), backend_ptrs)) {
+        if (getenv("GGML_OFFLOAD_TRACE")) fprintf(stderr, "[lm-trace] decline: hc_state init\n");
         return -2;
     }
 
@@ -724,22 +795,48 @@ int llama_context::decode_layer_major(const llama_batch & batch_inp, uint32_t n_
 
     auto mctx_base = memory->init_batch(*balloc, n_ubatch, false);
     if (!mctx_base) {
+        if (getenv("GGML_OFFLOAD_TRACE")) fprintf(stderr, "[lm-trace] decline: init_batch null\n");
         return -2;
     }
     switch (mctx_base->get_status()) {
         case LLAMA_MEMORY_STATUS_SUCCESS: break;
-        case LLAMA_MEMORY_STATUS_FAILED_PREPARE: return 1;
+        case LLAMA_MEMORY_STATUS_FAILED_PREPARE:
+            if (getenv("GGML_OFFLOAD_TRACE")) fprintf(stderr, "[lm-trace] decline: FAILED_PREPARE\n");
+            return 1;
         case LLAMA_MEMORY_STATUS_NO_UPDATE:
-        case LLAMA_MEMORY_STATUS_FAILED_COMPUTE: return -2;
+        case LLAMA_MEMORY_STATUS_FAILED_COMPUTE:
+            if (getenv("GGML_OFFLOAD_TRACE")) fprintf(stderr, "[lm-trace] decline: memory status %d\n", (int) mctx_base->get_status());
+            return -2;
     }
 
     auto * mctx = dynamic_cast<llama_kv_cache_dsv4_context *>(mctx_base.get());
     if (!mctx) {
+        if (getenv("GGML_OFFLOAD_TRACE")) fprintf(stderr, "[lm-trace] decline: not dsv4 kv context\n");
         return -1;
     }
     mctx->enable_input_replay_cache();
+    if (getenv("GGML_OFFLOAD_TRACE")) fprintf(stderr, "[lm-trace] engaged: n_tokens=%u ubatch=%u\n", n_tokens_all, n_ubatch);
 
     if (output_reserve(1) < 1) {
+        if (getenv("GGML_OFFLOAD_TRACE")) fprintf(stderr, "[lm-trace] decline: output_reserve\n");
+        return -2;
+    }
+
+    // DFlash/DSpARK consume selected target-layer inputs after target
+    // prefill. The regular output buffer is sized to cparams.n_batch, while a
+    // layer-major request intentionally spans many such tiles. Allocate only
+    // the enabled layers, but retain a contiguous full-prompt view for the
+    // speculative encoder API.
+    embd_layer_inp_layer_major.clear();
+    embd_layer_inp_layer_major.resize(cparams.embeddings_layer_inp.size());
+    try {
+        for (size_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
+            if (cparams.embeddings_layer_inp[il]) {
+                embd_layer_inp_layer_major[il].resize((size_t) n_tokens_all*hparams.n_embd);
+            }
+        }
+    } catch (const std::bad_alloc &) {
+        embd_layer_inp_layer_major.clear();
         return -2;
     }
     if (output_ids.size() < n_tokens_all) {
@@ -762,11 +859,39 @@ int llama_context::decode_layer_major(const llama_batch & batch_inp, uint32_t n_
     const int64_t total_start_us = profile_enabled ? ggml_time_us() : 0;
 
     auto rollback = [&](int rc) {
+        if (getenv("GGML_OFFLOAD_TRACE")) fprintf(stderr, "[lm-trace] rollback rc=%d cache_touched=%d\n", rc, (int) cache_touched);
         ggml_backend_sched_synchronize(sched.get());
         if (cache_touched) {
             memory->seq_rm(seq_id, 0, -1);
         }
+        embd_layer_inp_layer_major.clear();
         return rc;
+    };
+
+    auto extract_layer_input = [&](const llm_graph_result * res, int32_t layer, size_t token_offset, size_t n_tokens) {
+        if (layer < 0 || (size_t) layer >= cparams.embeddings_layer_inp.size() ||
+                !cparams.embeddings_layer_inp[layer]) {
+            return true;
+        }
+        ggml_tensor * tensor = res->get_layer_inp(layer);
+        auto & dst = embd_layer_inp_layer_major[layer];
+        const size_t n_floats = tensor ? ggml_nelements(tensor) : 0;
+        if (!tensor || tensor->type != GGML_TYPE_F32 ||
+                n_floats != n_tokens*(size_t) hparams.n_embd ||
+                token_offset > n_tokens_all || n_tokens > n_tokens_all - token_offset ||
+                dst.size() != (size_t) n_tokens_all*hparams.n_embd) {
+            LLAMA_LOG_ERROR("%s: invalid extracted layer input %d at token offset %zu\n",
+                    __func__, layer, token_offset);
+            return false;
+        }
+        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), tensor);
+        if (!backend) {
+            return false;
+        }
+        ggml_backend_tensor_get_async(
+                backend, tensor, dst.data() + token_offset*hparams.n_embd, 0,
+                n_floats*sizeof(float));
+        return true;
     };
 
     moe_pipe_hint pipe_hint;
@@ -783,6 +908,7 @@ int llama_context::decode_layer_major(const llama_batch & batch_inp, uint32_t n_
     }();
 
     for (int32_t il = 0; il < n_layer; ++il) {
+        if (getenv("GGML_OFFLOAD_TRACE") && il < 2) fprintf(stderr, "[lm-trace] layer %d begin\n", il);
         ggml_backend_t layer_backend = backend_for_device(backend_ptrs, model.dev_layer(il));
         if (hc_state.is_device_resident() && layer_backend &&
                 ggml_backend_dev_type(ggml_backend_get_device(layer_backend)) == GGML_BACKEND_DEVICE_TYPE_GPU &&
@@ -838,6 +964,14 @@ int llama_context::decode_layer_major(const llama_batch & batch_inp, uint32_t n_
                     case GGML_STATUS_FAILED:       return rollback(-3);
                     case GGML_STATUS_SUCCESS:      GGML_ABORT("should not happen");
                 }
+            }
+
+            // A sliced DSV4 graph exposes the current layer's input. The last
+            // slice can additionally expose the post-stack layer n_layer.
+            if (!extract_layer_input(res, il, token_offset, ubatch.n_tokens) ||
+                    (il + 1 == n_layer &&
+                     !extract_layer_input(res, n_layer, token_offset, ubatch.n_tokens))) {
+                return rollback(-3);
             }
 
             if (il == 1 && hc_state.is_device_resident() &&
@@ -961,14 +1095,20 @@ int llama_context::decode_layer_major(const llama_batch & batch_inp, uint32_t n_
         }
     }
 
+    if (getenv("GGML_OFFLOAD_TRACE")) fprintf(stderr, "[lm-trace] loop done, tiles=%zu\n", tile_count);
     if (profile_enabled) {
         const int64_t total_us = ggml_time_us() - total_start_us;
         LLAMA_LOG_INFO(
-                "%s: total %.3f ms, tiles %zu, apply %.3f ms, graph %.3f ms, "
-                "inputs %.3f ms, submit %.3f ms, store %.3f ms, sync %.3f ms, rewind %.3f ms\n",
+                "%s: total %.3f ms, tiles %zu, apply %.3f ms, graph %.3f ms "
+                "(build %.3f ms/%lld, alloc %.3f ms, reuse %lld), inputs %.3f ms, "
+                "submit %.3f ms, store %.3f ms, sync %.3f ms, rewind %.3f ms\n",
                 __func__, total_us/1000.0, tile_count,
                 ubatch_profile.memory_apply_us/1000.0,
                 ubatch_profile.graph_prepare_us/1000.0,
+                ubatch_profile.graph_build_us/1000.0,
+                (long long) ubatch_profile.graph_builds,
+                ubatch_profile.graph_alloc_us/1000.0,
+                (long long) ubatch_profile.graph_reuses,
                 ubatch_profile.set_inputs_us/1000.0,
                 ubatch_profile.submit_us/1000.0,
                 store_us/1000.0, sync_us/1000.0, rewind_us/1000.0);

@@ -20,9 +20,14 @@
 //                   worker->master reply:
 //                   { u32 proto_ver, u32 caps, i32 layer_first, i32 layer_last,
 //                     i32 expert_first, i32 expert_last, u32 kernel_id }
+//                   + optional u8 expert_bitmap[ceil((expert_last-expert_first)/8)]
+//                   when LLAMA_EP_CAP_EXPERT_BITMAP is set. Bitmap bit e-first
+//                   reports arbitrary sparse ownership; the fixed prefix stays
+//                   wire-compatible with range-only protocol-v2 workers.
 //                   (kernel_id: ggml build + ISA fingerprint, for the §7.3
 //                   homogeneity check). an old LEP1-only worker answers ERR to
-//                   CAP — the master then falls back to the classic/mirror path.
+//                   CAP. The caller may use a retained local path; a pure sharded
+//                   master must fail because it has no expert weights to use.
 //   REQ2  (type 5): { i32 layer, i32 n_tokens, i32 n_sel, i32 n_embd }
 //                   + i32 token_idx[n_sel]   (which token this assignment belongs to)
 //                   + i32 slot_idx[n_sel]    (global slot index; master merges by it)
@@ -33,16 +38,46 @@
 //                   + fp32 out[n_sel*n_embd] (one vector per assignment, already
 //                   multiplied by the router weight, NOT summed; same order as REQ2)
 //
+// protocol v3 (async pipelined dispatch, cross-slot pipeline scheduler):
+//   REQ3  (type 7): { i32 layer, i32 n_tokens, i32 n_sel, i32 n_embd, u64 req_id }
+//                   + same ragged arrays + hidden as REQ2. the worker answers
+//                   with RESP3 carrying the same req_id; several REQ3s may be in
+//                   flight on one connection and responses may be consumed in any
+//                   order by the master (the worker itself still computes FIFO).
+//   RESP3 (type 8): { u64 req_id, i32 n_sel, i32 n_embd }
+//                   + fp32 out[n_sel*n_embd] (same semantics as RESP2)
+//
+// protocol v2 optional master-weighted sync dispatch:
+//   REQ4  (type 9): payload is byte-identical to REQ2.
+//   RESP4 (type 10): header/shape are byte-identical to RESP2, but each expert
+//                    vector is unweighted. The master applies the router weight
+//                    in its existing global slot-order merge. This removes one
+//                    worker graph op/barrier without changing model math.
+//
 // The transport itself is message-agnostic: a function table (send_all/recv_all/close)
 // isolates the framing from the byte mover, so the TCP backend below can be swapped
 // for an RDMA verbs backend without touching protocol code.
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 
+// Payload arrays are sent without byte swapping. Make the wire contract honest:
+// unsupported hosts fail at build time instead of silently corrupting a mixed-
+// endian cluster.
+#if defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__)
+static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__,
+        "llama EP protocol currently requires a little-endian host");
+#endif
+static_assert(sizeof(float) == 4 && std::numeric_limits<float>::is_iec559,
+        "llama EP protocol requires IEEE-754 binary32 floats");
+
 #define LLAMA_EP_MAGIC 0x4C455031u // "LEP1"
+
+// Keep allocations and gathered sends bounded on both sides of the wire.
+constexpr uint64_t LLAMA_EP_MAX_FRAME_BYTES = (uint64_t) 1 << 30;
 
 // protocol version offered in the CAP handshake; LEP1 peers never send CAP
 #define LLAMA_EP_PROTO_VER 2u
@@ -54,11 +89,18 @@ enum llama_ep_msg_type : uint32_t {
     LLAMA_EP_MSG_CAP  = 4,
     LLAMA_EP_MSG_REQ2 = 5,
     LLAMA_EP_MSG_RESP2 = 6,
+    LLAMA_EP_MSG_REQ3 = 7,
+    LLAMA_EP_MSG_RESP3 = 8,
+    LLAMA_EP_MSG_REQ4 = 9,
+    LLAMA_EP_MSG_RESP4 = 10,
 };
 
 // worker CAP caps bits
 enum llama_ep_cap_bits : uint32_t {
     LLAMA_EP_CAP_REQ2 = 1u << 0, // ragged per-slot dispatch (REQ2/RESP2)
+    LLAMA_EP_CAP_REQ3 = 1u << 1, // async req_id dispatch (REQ3/RESP3)
+    LLAMA_EP_CAP_EXPERT_BITMAP = 1u << 2, // CAP appends sparse ownership bitmap
+    LLAMA_EP_CAP_REQ4 = 1u << 3, // sync ragged dispatch, master applies weights
 };
 
 enum llama_ep_err_code : int32_t {
@@ -115,6 +157,20 @@ struct llama_ep_resp2_header {
     int32_t n_sel;
     int32_t n_embd;
 };
+
+struct llama_ep_req3_header {
+    int32_t layer;
+    int32_t n_tokens;
+    int32_t n_sel;
+    int32_t n_embd;
+    uint64_t req_id;
+};
+
+struct llama_ep_resp3_header {
+    uint64_t req_id;
+    int32_t n_sel;
+    int32_t n_embd;
+};
 #pragma pack(pop)
 
 // ggml build + ISA fingerprint (fnv1a over compile-time feature macros); two
@@ -127,7 +183,12 @@ uint32_t llama_ep_kernel_id();
 struct llama_ep_transport_ops {
     bool (*send_all)(void * ctx, const void * data, size_t len); // false on error/EOF
     bool (*recv_all)(void * ctx, void * data, size_t len);       // false on error/EOF
+    void (*shutdown)(void * ctx); // wake blocked I/O without freeing ctx
     void (*close)(void * ctx);
+    // Optional gathered byte-stream send. The framing layer uses this to keep
+    // one logical frame in the minimum number of backend messages without
+    // first concatenating it in an unregistered temporary buffer.
+    bool (*sendv_all)(void * ctx, const void * const * parts, const size_t * part_lens, size_t n_parts);
 };
 
 struct llama_ep_transport {

@@ -15,6 +15,7 @@
 
 #include "llama-ep-transport.h"
 
+#include <atomic>
 #include <cerrno>
 #include <cstring>
 #include <cstdlib>
@@ -33,7 +34,10 @@ namespace {
 const size_t SLOT_PAYLOAD = 256 * 1024;        // max payload bytes per RDMA Send
 const size_t SLOT_BYTES   = 4 + SLOT_PAYLOAD;  // u32 len + payload
 const int    N_SEND = 4;                       // outstanding sends before ring reuse
-const int    N_RECV = 8;                       // pre-posted receive slots
+// A 16 MiB receive ring keeps a full GLM-5.2 top-8 ubatch=64 RESP2 in flight.
+// This matters when another endpoint finishes while the master is draining the
+// first one; a smaller ring RNR-stalls the worker and rejects practical PP.
+const int    N_RECV = 64;                      // 64 x 256 KiB = 16 MiB payload
 
 void set_err(std::string * err, const char * what) {
     if (err) {
@@ -48,12 +52,21 @@ void set_err_msg(std::string * err, const std::string & msg) {
 }
 
 struct rdma_conn {
-    rdma_event_channel * ec      = nullptr; // borrowed (listener conns share the listener's channel)
+    // Each established connection owns a CM event channel.  Keeping accepted
+    // connections on the listener channel lets the accept loop consume their
+    // DISCONNECTED events, leaving the connection thread blocked on its CQ.
+    rdma_event_channel * ec      = nullptr;
     bool                 owns_ec = false;
     rdma_cm_id         * id      = nullptr;
     ibv_pd             * pd      = nullptr;
-    ibv_comp_channel   * ch      = nullptr;
-    ibv_cq             * cq      = nullptr;
+    // split completion paths: the send side (rdma_send_all) and the recv
+    // side (rdma_recv_all) may run on different threads (async pipelined EP
+    // keeps a background receiver draining RESP frames while the compute
+    // thread fires REQs), so each owns its own CQ + channel + ring state
+    ibv_comp_channel   * ch_s    = nullptr;
+    ibv_cq             * cq_s    = nullptr;
+    ibv_comp_channel   * ch_r    = nullptr;
+    ibv_cq             * cq_r    = nullptr;
 
     uint8_t * sbuf = nullptr;  // N_SEND slots
     ibv_mr  * smr  = nullptr;
@@ -70,7 +83,7 @@ struct rdma_conn {
     size_t   cur_off    = 0;      // absolute offset of cursor into rbuf
     bool     cur_active = false;
 
-    bool broken = false;
+    std::atomic<bool> broken {false};
 };
 
 bool post_recv(rdma_conn * c, int slot) {
@@ -114,11 +127,14 @@ bool spin_mode() {
     return v;
 }
 
-// drain the CQ; if block, sleep on the completion channel until at least one CQE
-bool pump(rdma_conn * c, bool block) {
+// Drain one CQ.  A blocking wait watches both the completion channel and the
+// connection's CM channel: a peer which exits without a protocol shutdown is
+// not guaranteed to generate a CQE for an already-posted receive, but it does
+// generate RDMA_CM_EVENT_DISCONNECTED.
+bool pump(rdma_conn * c, ibv_cq * cq, ibv_comp_channel * ch, bool block) {
     ibv_wc wcs[16];
     for (;;) {
-        int n = ibv_poll_cq(c->cq, 16, wcs);
+        int n = ibv_poll_cq(cq, 16, wcs);
         if (n < 0) {
             c->broken = true;
             return false;
@@ -136,12 +152,12 @@ bool pump(rdma_conn * c, bool block) {
             sched_yield();
             continue;
         }
-        if (ibv_req_notify_cq(c->cq, 0) != 0) {
+        if (ibv_req_notify_cq(cq, 0) != 0) {
             c->broken = true;
             return false;
         }
         // re-poll after arming to close the missed-event race
-        n = ibv_poll_cq(c->cq, 16, wcs);
+        n = ibv_poll_cq(cq, 16, wcs);
         if (n < 0) {
             c->broken = true;
             return false;
@@ -152,39 +168,89 @@ bool pump(rdma_conn * c, bool block) {
             }
             return true;
         }
-        pollfd pfd = {c->ch->fd, POLLIN, 0};
-        if (poll(&pfd, 1, -1) < 0 && errno != EINTR) {
+        pollfd pfds[2] = {
+            {ch->fd,    POLLIN, 0},
+            {c->ec->fd, POLLIN, 0},
+        };
+        const int pr = poll(pfds, 2, -1);
+        if (pr < 0 && errno != EINTR) {
             c->broken = true;
             return false;
         }
-        if (pfd.revents & POLLIN) {
+        if (pr < 0) {
+            continue;
+        }
+
+        // CM events after ESTABLISHED are terminal for this byte stream.  The
+        // channel is non-blocking because the send and receive pumps can wake
+        // on the same event concurrently; only one of them should consume it.
+        if (pfds[1].revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL)) {
+            rdma_cm_event * ev = nullptr;
+            if (rdma_get_cm_event(c->ec, &ev) == 0) {
+                rdma_ack_cm_event(ev);
+                c->broken = true;
+                return false;
+            }
+            if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                c->broken = true;
+                return false;
+            }
+            if (c->broken) {
+                return false;
+            }
+        }
+        if (pfds[0].revents & POLLIN) {
             ibv_cq * ev_cq = nullptr;
             void   * ev_ctx = nullptr;
-            if (ibv_get_cq_event(c->ch, &ev_cq, &ev_ctx) == 0) {
-                ibv_ack_cq_events(c->cq, 1);
+            if (ibv_get_cq_event(ch, &ev_cq, &ev_ctx) == 0) {
+                ibv_ack_cq_events(cq, 1);
             }
+        } else if (pfds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            c->broken = true;
+            return false;
         }
         // loop back and poll
     }
 }
 
-bool rdma_send_all(void * vctx, const void * data, size_t len) {
+bool rdma_sendv_all(void * vctx, const void * const * parts, const size_t * part_lens, size_t n_parts) {
     rdma_conn * c = static_cast<rdma_conn *>(vctx);
-    const uint8_t * p = static_cast<const uint8_t *>(data);
-    while (len > 0) {
-        const size_t n = len < SLOT_PAYLOAD ? len : SLOT_PAYLOAD;
+    size_t part = 0;
+    size_t part_off = 0;
+    while (part < n_parts) {
+        while (part < n_parts && part_off == part_lens[part]) {
+            part++;
+            part_off = 0;
+        }
+        if (part == n_parts) {
+            break;
+        }
         const int slot = c->sends_posted % N_SEND;
         while (!c->sslot_free[slot]) {
-            if (!pump(c, true)) {
+            if (!pump(c, c->cq_s, c->ch_s, true)) {
                 return false;
             }
         }
         uint8_t * b = c->sbuf + (size_t) slot * SLOT_BYTES;
-        const uint32_t hdr = (uint32_t) n;
-        memcpy(b, &hdr, 4);
-        memcpy(b + 4, p, n);
+        size_t used = 0;
+        while (part < n_parts && used < SLOT_PAYLOAD) {
+            const size_t left = part_lens[part] - part_off;
+            const size_t n = left < SLOT_PAYLOAD - used ? left : SLOT_PAYLOAD - used;
+            if (n > 0) {
+                memcpy(b + 4 + used, static_cast<const uint8_t *>(parts[part]) + part_off, n);
+                used += n;
+                part_off += n;
+            }
+            if (part_off == part_lens[part]) {
+                part++;
+                part_off = 0;
+            }
+        }
 
-        ibv_sge sge = {(uintptr_t) b, (uint32_t) (4 + n), c->smr->lkey};
+        const uint32_t hdr = (uint32_t) used;
+        memcpy(b, &hdr, 4);
+
+        ibv_sge sge = {(uintptr_t) b, (uint32_t) (4 + used), c->smr->lkey};
         ibv_send_wr wr = {};
         wr.wr_id      = (uint64_t) (64 + slot);
         wr.sg_list    = &sge;
@@ -198,10 +264,14 @@ bool rdma_send_all(void * vctx, const void * data, size_t len) {
         }
         c->sslot_free[slot] = false;
         c->sends_posted++;
-        p   += n;
-        len -= n;
     }
     return true;
+}
+
+bool rdma_send_all(void * vctx, const void * data, size_t len) {
+    const void * parts[1] = {data};
+    const size_t part_lens[1] = {len};
+    return rdma_sendv_all(vctx, parts, part_lens, len > 0 ? 1 : 0);
 }
 
 bool rdma_recv_all(void * vctx, void * data, size_t len) {
@@ -211,7 +281,7 @@ bool rdma_recv_all(void * vctx, void * data, size_t len) {
         if (!c->cur_active) {
             const int slot = c->rhead % N_RECV;
             while (!c->rslot_ready[slot]) {
-                if (!pump(c, true)) {
+                if (!pump(c, c->cq_r, c->ch_r, true)) {
                     return false;
                 }
             }
@@ -245,6 +315,15 @@ bool rdma_recv_all(void * vctx, void * data, size_t len) {
     return true;
 }
 
+void rdma_conn_shutdown(void * vctx) {
+    rdma_conn * c = static_cast<rdma_conn *>(vctx);
+    c->broken = true;
+    if (c->id) {
+        // The per-connection CM channel wakes a recv pump blocked in poll().
+        rdma_disconnect(c->id);
+    }
+}
+
 void rdma_conn_close(void * vctx) {
     rdma_conn * c = static_cast<rdma_conn *>(vctx);
     if (c->id) {
@@ -261,11 +340,17 @@ void rdma_conn_close(void * vctx) {
     if (c->id) {
         rdma_destroy_ep(c->id); // destroys the QP too (created via rdma_create_qp)
     }
-    if (c->cq) {
-        ibv_destroy_cq(c->cq);
+    if (c->cq_s) {
+        ibv_destroy_cq(c->cq_s);
     }
-    if (c->ch) {
-        ibv_destroy_comp_channel(c->ch);
+    if (c->ch_s) {
+        ibv_destroy_comp_channel(c->ch_s);
+    }
+    if (c->cq_r) {
+        ibv_destroy_cq(c->cq_r);
+    }
+    if (c->ch_r) {
+        ibv_destroy_comp_channel(c->ch_r);
     }
     if (c->pd) {
         ibv_dealloc_pd(c->pd);
@@ -331,6 +416,15 @@ bool cm_wait(rdma_event_channel * ec, rdma_cm_event_type want, rdma_cm_id ** id_
     }
 }
 
+bool make_cm_channel_nonblocking(rdma_event_channel * ec, std::string * err) {
+    const int flags = fcntl(ec->fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(ec->fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+        set_err(err, "fcntl(rdma_cm channel, O_NONBLOCK)");
+        return false;
+    }
+    return true;
+}
+
 // Tighten the RNR retry timer on an established RC QP.  The rdma_cm default
 // min_rnr_timer is huge (~80 ms scale): a single RNR NAK — inevitable once a
 // bulk frame overruns the 8-slot receive ring — stalled the stream by ~80 ms
@@ -356,20 +450,22 @@ bool setup_conn(rdma_conn * c, std::string * err) {
         set_err(err, "ibv_alloc_pd");
         return false;
     }
-    c->ch = ibv_create_comp_channel(c->id->verbs);
-    if (!c->ch) {
+    c->ch_s = ibv_create_comp_channel(c->id->verbs);
+    c->ch_r = ibv_create_comp_channel(c->id->verbs);
+    if (!c->ch_s || !c->ch_r) {
         set_err(err, "ibv_create_comp_channel");
         return false;
     }
-    c->cq = ibv_create_cq(c->id->verbs, N_SEND + N_RECV + 16, nullptr, c->ch, 0);
-    if (!c->cq) {
+    c->cq_s = ibv_create_cq(c->id->verbs, N_SEND + 16, nullptr, c->ch_s, 0);
+    c->cq_r = ibv_create_cq(c->id->verbs, N_RECV + 16, nullptr, c->ch_r, 0);
+    if (!c->cq_s || !c->cq_r) {
         set_err(err, "ibv_create_cq");
         return false;
     }
 
     ibv_qp_init_attr qia = {};
-    qia.send_cq = c->cq;
-    qia.recv_cq = c->cq;
+    qia.send_cq = c->cq_s;
+    qia.recv_cq = c->cq_r;
     qia.qp_type = IBV_QPT_RC;
     qia.cap.max_send_wr  = N_SEND + 8;
     qia.cap.max_recv_wr  = N_RECV + 8;
@@ -431,6 +527,12 @@ llama_ep_transport * llama_ep_rdma_connect(const char * host, int port, std::str
         delete c;
         return nullptr;
     }
+    if (!make_cm_channel_nonblocking(c->ec, err)) {
+        freeaddrinfo(res);
+        rdma_destroy_event_channel(c->ec);
+        delete c;
+        return nullptr;
+    }
     if (rdma_create_id(c->ec, &c->id, nullptr, RDMA_PS_TCP) != 0) {
         set_err(err, "rdma_create_id (no RDMA device?)");
         freeaddrinfo(res);
@@ -475,7 +577,7 @@ llama_ep_transport * llama_ep_rdma_connect(const char * host, int port, std::str
 
     auto * t = new llama_ep_transport;
     t->ctx = c;
-    t->ops = {rdma_send_all, rdma_recv_all, rdma_conn_close};
+    t->ops = {rdma_send_all, rdma_recv_all, rdma_conn_shutdown, rdma_conn_close, rdma_sendv_all};
     return t;
 }
 
@@ -497,8 +599,13 @@ bool rdma_listener_accept(void * vctx, llama_ep_transport * out) {
     }
 
     auto * c = new rdma_conn;
-    c->ec = l->ec; // borrowed; listener owns the channel
     c->id = conn_id;
+    c->owns_ec = true;
+    c->ec = rdma_create_event_channel();
+    if (!c->ec || !make_cm_channel_nonblocking(c->ec, &err) || rdma_migrate_id(conn_id, c->ec) != 0) {
+        rdma_conn_close(c);
+        return false;
+    }
     if (!setup_conn(c, &err)) {
         rdma_conn_close(c);
         return false;
@@ -513,14 +620,14 @@ bool rdma_listener_accept(void * vctx, llama_ep_transport * out) {
         rdma_conn_close(c);
         return false;
     }
-    if (!cm_wait(l->ec, RDMA_CM_EVENT_ESTABLISHED, nullptr, &err, -1)) {
+    if (!cm_wait(c->ec, RDMA_CM_EVENT_ESTABLISHED, nullptr, &err, -1)) {
         rdma_conn_close(c);
         return false;
     }
     tune_qp(conn_id->qp);
 
     out->ctx = c;
-    out->ops = {rdma_send_all, rdma_recv_all, rdma_conn_close};
+    out->ops = {rdma_send_all, rdma_recv_all, rdma_conn_shutdown, rdma_conn_close, rdma_sendv_all};
     return true;
 }
 

@@ -10,9 +10,22 @@
 struct llama_layer_major_ubatch_profile {
     int64_t memory_apply_us = 0;
     int64_t graph_prepare_us = 0;
+    int64_t graph_build_us = 0;
+    int64_t graph_alloc_us = 0;
     int64_t set_inputs_us = 0;
     int64_t submit_us = 0;
+    int64_t graph_builds = 0;
+    int64_t graph_reuses = 0;
 };
+
+struct llama_moe_pp_ep_plan {
+    int64_t expert_begin[2] = { 0, 0 };
+    int64_t expert_count[2] = { 0, 0 };
+    bool asymmetric = false;
+};
+
+llama_moe_pp_ep_plan llama_moe_pp_ep_plan_make(int64_t n_expert);
+int llama_moe_pp_ep_device_rank(const llama_moe_pp_ep_plan & plan, int logical_rank, int owner_rank);
 
 struct llama_layer_major_graph_input {
     ggml_backend_t hc_backend = nullptr;

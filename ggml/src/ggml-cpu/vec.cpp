@@ -452,6 +452,45 @@ void ggml_vec_swiglu_f32(const int n, float * y, const float * x, const float * 
     }
 }
 
+// DeepSeek-V4 applies gate=min(gate, limit), up=clamp(up, -limit, limit)
+// immediately before SWIGLU. Doing all three elementwise operations in one
+// pass preserves the formula while avoiding two graph barriers and two extra
+// activation-buffer walks at small EP decode shapes.
+void ggml_vec_swiglu_clamped_f32(
+        const int n, float * y, const float * x, const float * g, float limit) {
+    int i = 0;
+#if defined(__AVX512F__) && defined(__AVX512DQ__)
+    const __m512 hi = _mm512_set1_ps(limit);
+    const __m512 lo = _mm512_set1_ps(-limit);
+    for (; i + 15 < n; i += 16) {
+        const __m512 vx = _mm512_min_ps(_mm512_loadu_ps(x + i), hi);
+        const __m512 vg = _mm512_min_ps(_mm512_max_ps(_mm512_loadu_ps(g + i), lo), hi);
+        _mm512_storeu_ps(y + i, _mm512_mul_ps(ggml_v_silu(vx), vg));
+    }
+#elif defined(__AVX2__) && defined(__FMA__)
+    const __m256 hi = _mm256_set1_ps(limit);
+    const __m256 lo = _mm256_set1_ps(-limit);
+    for (; i + 7 < n; i += 8) {
+        const __m256 vx = _mm256_min_ps(_mm256_loadu_ps(x + i), hi);
+        const __m256 vg = _mm256_min_ps(_mm256_max_ps(_mm256_loadu_ps(g + i), lo), hi);
+        _mm256_storeu_ps(y + i, _mm256_mul_ps(ggml_v_silu(vx), vg));
+    }
+#elif defined(__SSE2__)
+    const __m128 hi = _mm_set1_ps(limit);
+    const __m128 lo = _mm_set1_ps(-limit);
+    for (; i + 3 < n; i += 4) {
+        const __m128 vx = _mm_min_ps(_mm_loadu_ps(x + i), hi);
+        const __m128 vg = _mm_min_ps(_mm_max_ps(_mm_loadu_ps(g + i), lo), hi);
+        _mm_storeu_ps(y + i, _mm_mul_ps(ggml_v_silu(vx), vg));
+    }
+#endif
+    for (; i < n; ++i) {
+        const float gate = std::min(x[i], limit);
+        const float up   = std::min(std::max(g[i], -limit), limit);
+        y[i] = ggml_silu_f32(gate) * up;
+    }
+}
+
 ggml_float ggml_vec_cvar_f32(const int n, float * y, const float * x, const float mean) {
     int i = 0;
     ggml_float sum = 0;

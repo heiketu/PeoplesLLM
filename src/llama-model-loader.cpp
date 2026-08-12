@@ -4,6 +4,7 @@
 #include "ggml.h"
 #include "gguf.h"
 #include "llama-hparams.h"
+#include "llama.h"
 
 #include <algorithm>
 #include <array>
@@ -522,10 +523,10 @@ llama_model_loader::llama_model_loader(
         const std::string & fname,
         std::vector<std::string> & splits,
         FILE * file,
-        bool use_mmap,
-        bool use_direct_io,
+        llama_load_mode load_mode,
         bool check_tensors,
         bool no_alloc,
+        bool load_mtp,
         const llama_model_kv_override * param_overrides_p,
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p)
         : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud) {
@@ -541,6 +542,9 @@ llama_model_loader::llama_model_loader(
     }
 
     tensor_buft_overrides = param_tensor_buft_overrides_p;
+
+    this->use_mmap      = load_mode == LLAMA_LOAD_MODE_MMAP || load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
+    this->use_direct_io = load_mode == LLAMA_LOAD_MODE_DIRECT_IO;
 
     if (!fname.empty()) {
         // Load the main GGUF
@@ -561,20 +565,6 @@ llama_model_loader::llama_model_loader(
 
         files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
         contexts.emplace_back(ctx);
-
-        if (use_mmap && use_direct_io) {
-            if (files.back()->has_direct_io()) {
-                LLAMA_LOG_WARN("%s: direct I/O is enabled, disabling mmap\n", __func__);
-                use_mmap = false;
-            } else {
-                LLAMA_LOG_WARN("%s: direct I/O is not available, using mmap\n", __func__);
-                use_direct_io = false;
-
-                // reopen file using std::fopen for mmap
-                files.pop_back();
-                files.emplace_back(new llama_file(fname.c_str(), "rb", false));
-            }
-        }
 
         // Save tensors data offset of the main file.
         // For subsidiary files, `meta` tensor data offset must not be used,
@@ -816,15 +806,14 @@ llama_model_loader::llama_model_loader(
         }
     }
 
-    if (!llama_mmap::SUPPORTED) {
+    if (this->use_mmap && !llama_mmap::SUPPORTED) {
         LLAMA_LOG_WARN("%s: mmap is not supported on this platform\n", __func__);
-        use_mmap = false;
+        this->use_mmap = false;
     }
 
-    this->use_mmap = use_mmap;
-    this->use_direct_io = use_direct_io;
     this->check_tensors = check_tensors;
     this->no_alloc = no_alloc;
+    this->load_mtp = load_mtp;
 }
 
 std::string llama_model_loader::get_arch_name() const {
@@ -868,7 +857,11 @@ struct ggml_tensor * llama_model_loader::require_tensor_meta(const std::string &
     return tensor;
 }
 
-const struct ggml_tensor * llama_model_loader::check_tensor_dims(const std::string & name, const std::vector<int64_t> & ne, bool required) const {
+const struct ggml_tensor * llama_model_loader::check_tensor_dims(
+        const std::string & name,
+        const std::vector<int64_t> & ne,
+        bool required,
+        bool allow_reshape) const {
     const struct ggml_tensor * cur = get_tensor_meta(name.c_str());
 
     if (cur == NULL) {
@@ -878,21 +871,33 @@ const struct ggml_tensor * llama_model_loader::check_tensor_dims(const std::stri
         throw std::runtime_error(format("%s: tensor '%s' not found", __func__, name.c_str()));
     }
 
-    {
-        bool is_ok = true;
+    bool is_ok = true;
+
+    if (allow_reshape) {
+        // check total number of elements only
+        const int64_t ncur = ggml_nelements(cur);
+        int64_t nexp = 1;
+        for (size_t i = 0; i < ne.size(); ++i) {
+            nexp *= ne[i];
+        }
+        if (ncur != nexp) {
+            is_ok = false;
+        }
+    } else {
         for (size_t i = 0; i < GGML_MAX_DIMS; ++i) {
             if ((i < ne.size() && ne[i] != cur->ne[i]) || (i >= ne.size() && cur->ne[i] != 1)) {
                 is_ok = false;
                 break;
             }
         }
-        if (!is_ok) {
-            throw std::runtime_error(
-                    format("%s: tensor '%s' has wrong shape; expected %s, got %s",
-                        __func__, name.c_str(),
-                        llama_format_tensor_shape(ne).c_str(),
-                        llama_format_tensor_shape(cur).c_str()));
-        }
+    }
+
+    if (!is_ok) {
+        throw std::runtime_error(
+                format("%s: tensor '%s' has wrong shape; expected %s, got %s",
+                    __func__, name.c_str(),
+                    llama_format_tensor_shape(ne).c_str(),
+                    llama_format_tensor_shape(cur).c_str()));
     }
 
     return cur;
@@ -932,10 +937,11 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
             } break;
         case GGML_OP_MUL_MAT_ID:
             {
-                const int n_expert_used = hparams.n_expert_used;
-                GGML_ASSERT(n_expert_used > 0);
-                ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, w->ne[0], n_expert_used, 512);
-                ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_expert_used, 512);
+                // Used for either MoE expert routing or embedded adapter routing
+                const int n_ids_used = hparams.router_layer >= 0 ? 1 : hparams.n_expert_used;
+                GGML_ASSERT(n_ids_used > 0);
+                ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, w->ne[0], n_ids_used, 512);
+                ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_ids_used, 512);
                 op_tensor = ggml_mul_mat_id(ctx, w, b, ids);
             } break;
         case GGML_OP_ADD:
@@ -1118,15 +1124,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             return nullptr;
         }
 
-        // tensors with "bias" suffix are always used with GGML_OP_ADD or GGML_OP_ADD_ID
+        // tensors with "bias" suffix are always used with GGML_OP_ADD or GGML_OP_ADD_ID;
+        // embedded-adapter ".lora_a"/".lora_b" tensors are always used with GGML_OP_MUL_MAT_ID
         ggml_op op;
-        bool bias = tn.suffix != nullptr && strcmp(tn.suffix, "bias") == 0;
-        if (bias) {
-            if (info.op == GGML_OP_MUL_MAT_ID) {
-                op = GGML_OP_ADD_ID;
-            } else {
-                op = GGML_OP_ADD;
-            }
+        if (tn.suffix != nullptr && strcmp(tn.suffix, "bias") == 0) {
+            op = info.op == GGML_OP_MUL_MAT_ID ? GGML_OP_ADD_ID : GGML_OP_ADD;
+        } else if (hparams.router_layer >= 0 && tn.suffix != nullptr &&
+                (strcmp(tn.suffix, "lora_a") == 0 || strcmp(tn.suffix, "lora_b") == 0)) {
+            op = GGML_OP_MUL_MAT_ID;
         } else {
             op = info.op;
         }
@@ -1219,6 +1224,15 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             const char * value = getenv("GGML_CUDA_MOE_PP_MIN_TOKENS");
             return value ? (int64_t) atoll(value) : (int64_t) 0;
         }();
+        // instrumentation (GGML_OFFLOAD_TRACE=1): why an _exps tensor is/isn't upgraded
+        if (getenv("GGML_OFFLOAD_TRACE") != nullptr && strstr(t_meta->name, "_exps") != nullptr) {
+            auto * gpu_dev_t = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+            ggml_backend_buffer_type_t hb = gpu_dev_t ? ggml_backend_dev_host_buffer_type(gpu_dev_t) : nullptr;
+            fprintf(stderr, "[moe-pp-buft] %s ne2=%lld buft=%s from_override=%d is_host=%d env=%lld gpu=%p host_buft=%p(%s)\n",
+                    t_meta->name, (long long) t_meta->ne[2], ggml_backend_buft_name(buft),
+                    (int) buft_from_override, (int) ggml_backend_buft_is_host(buft), (long long) moe_pp_min_tokens,
+                    (void *) gpu_dev_t, (void *) hb, hb ? ggml_backend_buft_name(hb) : "null");
+        }
         if (moe_pp_min_tokens > 0 && !buft_from_override && ggml_backend_buft_is_host(buft) &&
                 t_meta->ne[2] > 1 && strstr(t_meta->name, "_exps") != nullptr) {
             auto * gpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
@@ -1231,6 +1245,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 });
                 buft = host_buft;
             }
+        }
+        if (getenv("GGML_OFFLOAD_TRACE") != nullptr && strstr(t_meta->name, "_exps") != nullptr) {
+            fprintf(stderr, "[moe-pp-buft] AFTER %s buft=%s\n", t_meta->name, ggml_backend_buft_name(buft));
         }
 
         if (buft != buft_list->front().second) {
@@ -1271,7 +1288,13 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         for (size_t dim = 0; dim < GGML_MAX_DIMS; dim++) {
             t_meta.ne[dim] = dim < ne.size() ? ne.begin()[dim] : 1;
             GGML_ASSERT(t_meta.ne[dim] >= 1);
-            t_meta.nb[dim] = dim == 0 ? ggml_type_size(type) : t_meta.ne[dim-1]*t_meta.nb[dim-1];
+            if (dim == 0) {
+                t_meta.nb[dim] = ggml_type_size(type);
+            } else if (dim == 1) {
+                t_meta.nb[dim] = ggml_row_size(type, t_meta.ne[dim-1]);
+            } else {
+                t_meta.nb[dim] = t_meta.nb[dim-1]*t_meta.ne[dim-1];
+            }
             GGML_ASSERT(t_meta.nb[dim] >= 1);
         }
         ggml_set_name(&t_meta, tn.str().c_str());
@@ -1284,11 +1307,33 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return ret;
     }
 
-    ggml_tensor * t_meta = get_tensor_meta(tn.str().c_str());
-    ggml_backend_buffer_type_t buft = buft_for_tensor(t_meta);
-    if (buft == nullptr) {
-        return nullptr; // return type is ggml_tensor *
+    LLAMA_LOG_DEBUG("%s: loading tensor %s\n", __func__, tn.str().c_str());
+    const struct ggml_tensor * cur = check_tensor_dims(tn.str(), ne, !(flags & TENSOR_NOT_REQUIRED), flags & TENSOR_ALLOW_RESHAPE);
+    if (cur == NULL) {
+        return NULL;
     }
+
+    ggml_tensor t_meta = *cur;
+    if (flags & TENSOR_ALLOW_RESHAPE) {
+        for (size_t dim = 0; dim < GGML_MAX_DIMS; dim++) {
+            t_meta.ne[dim] = dim < ne.size() ? ne.begin()[dim] : 1;
+            if (dim == 0) {
+                t_meta.nb[dim] = ggml_type_size(t_meta.type);
+            } else if (dim == 1) {
+                t_meta.nb[dim] = ggml_row_size(t_meta.type, t_meta.ne[dim-1]);
+            } else {
+                t_meta.nb[dim] = t_meta.ne[dim-1]*t_meta.nb[dim-1];
+            }
+        }
+    }
+
+    GGML_ASSERT(ggml_nbytes(&t_meta) == ggml_nbytes(cur));
+
+    ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
+    if (buft == nullptr) {
+        return nullptr;
+    }
+
     ggml_context * ctx = ctx_for_buft(buft);
 
     // if duplicated, check if the original tensor was allocated in the same buffer type context and avoid creating a new one
@@ -1299,51 +1344,16 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
     }
 
-    LLAMA_LOG_DEBUG("%s: loading tensor %s\n", __func__, tn.str().c_str());
-    const struct ggml_tensor * cur = check_tensor_dims(tn.str(), ne, !(flags & TENSOR_NOT_REQUIRED));
-
-    if (cur == NULL) {
-        return NULL;
-    }
-
     const bool duplicated = flags & TENSOR_DUPLICATED;
 
-    struct ggml_tensor * tensor = ggml_dup_tensor(ctx, cur);
-    ggml_set_name(tensor, ggml_get_name(cur));
+    struct ggml_tensor * tensor = ggml_dup_tensor(ctx, &t_meta);
+    ggml_set_name(tensor, ggml_get_name(&t_meta));
 
     if (duplicated) {
-        size_data += ggml_nbytes(cur);
+        size_data += ggml_nbytes(&t_meta);
     } else {
         n_created++;
     }
-
-    return tensor;
-}
-
-struct ggml_tensor * llama_model_loader::create_tensor_as_view(struct ggml_context * ctx, struct ggml_tensor * base, const std::string & name, const std::initializer_list<int64_t> & ne, size_t offset, bool required) {
-    const struct ggml_tensor * cur = check_tensor_dims(name, ne, required);
-
-    if (cur == NULL) {
-        return NULL;
-    }
-
-    if (cur->type != base->type) {
-        throw std::runtime_error(format("%s: tensor '%s' has wrong type; expected %s, got %s", __func__, name.c_str(), ggml_type_name(base->type), ggml_type_name(cur->type)));
-    }
-
-    std::array<int64_t, GGML_MAX_DIMS> dims;
-    for (size_t i = 0; i < GGML_MAX_DIMS; ++i) {
-        dims[i] = i < ne.size() ? ne.begin()[i] : 1;
-    }
-
-    struct ggml_tensor * tensor = ggml_view_4d(ctx, base,
-                                    dims[0], dims[1], dims[2], dims[3],
-                                    cur->nb[1], cur->nb[2], cur->nb[3],
-                                    offset);
-
-    ggml_set_name(tensor, name.c_str());
-
-    n_created++;
 
     return tensor;
 }

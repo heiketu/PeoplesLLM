@@ -87,7 +87,7 @@ function(llama_build_and_test source)
     set(multiValueArgs ARGS)
     cmake_parse_arguments(LLAMA_TEST "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
 
-    set(TEST_SOURCES ${source} ${LLAMA_TEST_UNPARSED_ARGUMENTS} get-model.cpp)
+    set(TEST_SOURCES ${source} ${LLAMA_TEST_UNPARSED_ARGUMENTS})
 
     if (NOT DEFINED LLAMA_TEST_LABEL)
         set(LLAMA_TEST_LABEL "main")
@@ -148,7 +148,7 @@ if (LLAMA_LLGUIDANCE)
     llama_build_and_test(test-grammar-llguidance.cpp ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-llama-bpe.gguf)
 endif ()
 
-llama_build(test-recurrent-state-rollback.cpp get-model.cpp)
+llama_build(test-recurrent-state-rollback.cpp)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
@@ -162,6 +162,11 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         llama_build_and_test(test-chat.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
         target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
         target_link_libraries(test-chat PRIVATE server-context)
+
+        llama_build(test-server-prefill-scheduler.cpp)
+        target_include_directories(test-server-prefill-scheduler PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+        target_link_libraries(test-server-prefill-scheduler PRIVATE server-context)
+        llama_test(test-server-prefill-scheduler)
     endif()
     # TODO: disabled on loongarch64 because the ggml-ci node lacks Python 3.8
     if (NOT ${CMAKE_SYSTEM_PROCESSOR} MATCHES "loongarch64")
@@ -260,6 +265,9 @@ llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 llama_build_and_test(test-arg-parser.cpp)
+llama_build_and_test(test-model-resolution.cpp)
+# the test serves its repos from an httplib server, and the library links it privately
+target_link_libraries(test-model-resolution PRIVATE cpp-httplib)
 
 if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   # TODO: repair known memory leaks
@@ -279,6 +287,10 @@ set_tests_properties(test-state-restore-fragmented PROPERTIES FIXTURES_REQUIRED 
 # Test state save/load functionality
 llama_build_and_test(test-save-load-state.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED test-download-model)
+
+if (APPLE)
+    llama_build(test-rset-release.cpp)
+endif()
 
 if (NOT GGML_BACKEND_DL)
     # these tests use the backends directly and cannot be built with dynamic loading
@@ -368,4 +380,9 @@ if (NOT LLAMA_USE_SYSTEM_GGML AND TARGET ggml-cpu)
         ${PROJECT_SOURCE_DIR}/ggml/src
         ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cpu)
     add_test(NAME test-repack-kernels COMMAND $<TARGET_FILE:test-repack-kernels>)
+    add_test(NAME test-repack-q2-policy COMMAND $<TARGET_FILE:test-repack-kernels> --q2-policy)
+    add_test(NAME test-repack-iq4-xs-policy COMMAND $<TARGET_FILE:test-repack-kernels> --iq4-xs-policy)
+    add_test(NAME test-repack-iq4-xs-policy-force
+        COMMAND ${CMAKE_COMMAND} -E env GGML_REPACK_IQ4_XS=1
+            $<TARGET_FILE:test-repack-kernels> --iq4-xs-policy)
 endif()

@@ -47,14 +47,18 @@ Test platform: dual Xeon 8360Y (Ice Lake, 152 threads, 251G RAM) + 2× RTX 3090 
 | **Cross-machine expert parallelism** (activation dispatch, KB-scale traffic — not weight transfer) | Model doesn't fit in one machine's RAM | DSV4 two-machine matches single-machine speed with **26% less** master RAM |
 | **RoCEv2 RDMA transport** (`GGML_REMOTE_EP_RDMA=1`, automatic TCP fallback) | IB/RoCE NICs; plain gigabit falls back seamlessly | RTT 42-74µs→**10-13µs**; after the large-frame fix, PP1020 33.4→**76.1 tok/s (2.3×)** |
 | **MAX-EFFORT layer mirroring** (`GGML_REMOTE_EP_MIRROR=1`) | Spare master RAM, decode-heavy workloads | Remote segment leaves the critical path, TG **+9~11%** |
+| **True four-NUMA, single-slot EP** (`SCHED_KLOCAL=0` + hot-expert replicas) | Two dual-socket machines compute one request together | GLM-5.2 PP512: 2 NUMA **24.13**→4 NUMA **40.59 tok/s (1.682×)**; byte-identical output across 75 layers |
 | **EP planner** (`tools/epd/ep-plan.py`) | Pre-deployment layer-split decisions | Recommends splits from measured bandwidth/latency, calibration error ≤1.5% |
 
 ### Model support
 
 DeepSeek-V4 / DSV4-Flash (incl. native MXFP4), GLM-5.2 (DSA), MiniMax-M3; plus a byte-level GGUF repair toolchain (quant-block corruption scan + patch — fixed 138 corrupted blocks in the official GLM-5.2 file that caused garbled output).
 
-## Latest progress (2026-08-06/07)
+## Latest progress (2026-08-06–11)
 
+- **Completed AVX512 EPD path:** fixed a zero-byte CPU_REPACK trait probe that silently left real-model tensors on raw kernels; compatible separate gate/up tensors now fuse at load time, raw mmap pages are reclaimed immediately after each tensor conversion, and thread autotuning measures each worker's actual compact assignment shape. In a controlled GLM-5.2 layer-3/64-expert A/B, warm REQ2 PP128 fell from 33.14–36.73 ms to 31.53–31.60 ms and TG from 0.505–0.595 ms to 0.460–0.477 ms, with identical output. These figures cover CPU MoE worker compute only, excluding GPU dense/attention.
+- **Dynamic feedback for heterogeneous workers:** the hot-replica dealer no longer assumes all four NUMA workers run at the same rate. It learns idle-queue TG and PP service times independently and schedules against in-flight virtual work. Pure policy, overflow, and dealer regressions pass; this change is not included in the 40.59 tok/s result below and awaits a quiet-window four-worker rerun.
+- **True four-NUMA, single-slot EP (GLM-5.2):** one worker per NUMA node on both master and slave; with `KLOCAL=0`, the master carries no routed-expert weights. Compact ragged execution, tiered PP graph caching, and 76 hot replicas selected from a real PP profile lift PP512 from 24.13 tok/s on 2 NUMA workers to 40.59 on 4 (+68.2%, latency -40.6%), with byte-identical 128-token output.
 - **raw-SWA decode ring on by default** (branch fa-decode-fix): q1 decode graph width decoupled from prompt length — fixed TG64 8.894→11.837/12.085 tok/s (+33~36%), TG512 +4~8%; automatic fallback to full-width semantics in multi-slot scenarios.
 - **q8 compact sparse FA on by default**: with q8_0 KV, q1 decode materializes only top-k selected rows — TG64 9.75→10.69 (+10%), TG512 +1.3%, now the fastest q1 decode path (beats f16 dense); f16 fused sparse stays opt-in (16K measured -12%, to be re-evaluated at longer context).
 - **Multi-stream (small-q) sparse FA** (opt-in, `LLAMA_DSV4_FUSED_INDEXED_FA=3/4`, `LLAMA_DSV4_Q8_SPARSE_FA=2`): sparse extension for multi-slot concurrent decode, verified three-way byte-identical; performance parity at ≤16K (weight-bandwidth bound), payoff targeted at 256K+ context.
@@ -130,6 +134,15 @@ Left: F16 KV — the default-on raw-SWA decode ring lifts fixed TG64 from 8.894 
 ### Two-machine expert-parallel (GLM-5.2, 100G RoCEv2 direct link)
 
 ![Two-machine EP](docs/benchmarks/dual_machine_ep.png)
+
+Latest true single-slot EP measurements (2026-08-10; GLM-5.2 UD-Q2_K_MXFP4; MoE layers 3–77; dense/attention on two RTX 3090s, CPU runs routed experts only):
+
+| Comparison | 2 NUMA workers, one machine | 4 NUMA workers, two machines | 4 / 2 |
+|---|---:|---:|---:|
+| Decode MoE-stage time (75 layers total, prompt cost removed) | 86.71 ms/token | 69.58 ms/token | **1.246×** |
+| PP512 (b512/ub256, three-run mean, same code) | 24.13 tok/s (21.22s) | **40.59 tok/s (12.62s)** | **1.682×** |
+
+The PP map is generated from that workload's `layer,expert,count` profile: each path keeps 64 primary experts plus 16–23 hot replicas (80–87 of 256 total), while the online dealer selects the least-loaded holder per token. Mean per-layer critical load versus ideal fell from 1.374× to 1.091×. Worker RSS is about 71–78GiB per NUMA node with no swap. Both the decode-MoE and PP paths passed a byte-identical 128-token reference check.
 
 ### Production server: DSV4-Flash, 8 slots × 1M context
 

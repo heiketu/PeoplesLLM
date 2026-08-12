@@ -26,6 +26,7 @@ add_library(llama
             llama-kv-cache.cpp
             llama-kv-cache-iswa.cpp
             llama-kv-cache-dsa.cpp
+            llama-kv-cache-msa.cpp
             llama-kv-cache-dsv4.cpp
             llama-memory.cpp
             llama-memory-hybrid.cpp
@@ -38,6 +39,7 @@ add_library(llama
             llama-model.cpp
             llama-quant.cpp
             llama-remote-ep.cpp
+            ../tools/epd/llama-ep-protocol.cpp
             ../tools/epd/llama-ep-transport.cpp
             llama-sampler.cpp
             llama-vocab.cpp

@@ -17,6 +17,14 @@
 
 namespace {
 
+bool gathered_send_enabled() {
+    static const bool value = []() {
+        const char * env = getenv("GGML_EP_RDMA_COALESCE");
+        return !(env && env[0] != '\0' && strcmp(env, "0") == 0);
+    }();
+    return value;
+}
+
 void set_err(std::string * err, const char * what) {
     if (err) {
         *err = std::string(what) + ": " + strerror(errno);
@@ -67,6 +75,13 @@ bool tcp_recv_all(void * vctx, void * data, size_t len) {
     return true;
 }
 
+void tcp_conn_shutdown(void * vctx) {
+    tcp_conn * c = static_cast<tcp_conn *>(vctx);
+    if (c->fd >= 0) {
+        ::shutdown(c->fd, SHUT_RDWR);
+    }
+}
+
 void tcp_conn_close(void * vctx) {
     tcp_conn * c = static_cast<tcp_conn *>(vctx);
     if (c->fd >= 0) {
@@ -95,7 +110,7 @@ llama_ep_transport * wrap_conn(int fd) {
     auto * c = new tcp_conn{fd};
     auto * t = new llama_ep_transport;
     t->ctx = c;
-    t->ops = {tcp_send_all, tcp_recv_all, tcp_conn_close};
+    t->ops = {tcp_send_all, tcp_recv_all, tcp_conn_shutdown, tcp_conn_close, nullptr};
     return t;
 }
 
@@ -281,18 +296,45 @@ uint32_t llama_ep_kernel_id() {
 }
 
 bool llama_ep_send_frame(llama_ep_transport * t, uint32_t type, const void * payload, size_t payload_len) {
+    if (payload_len > 0 && payload == nullptr) {
+        return false;
+    }
     const void * parts[1] = {payload};
     const size_t lens[1] = {payload_len};
-    return llama_ep_send_framev(t, type, parts, lens, payload ? 1 : 0);
+    return llama_ep_send_framev(t, type, parts, lens, payload_len > 0 ? 1 : 0);
 }
 
 bool llama_ep_send_framev(llama_ep_transport * t, uint32_t type, const void ** parts, const size_t * part_lens, size_t n_parts) {
+    if (t == nullptr || t->ops.send_all == nullptr || (n_parts > 0 && (parts == nullptr || part_lens == nullptr))) {
+        return false;
+    }
     llama_ep_frame_header hdr;
     hdr.magic = LLAMA_EP_MAGIC;
     hdr.type = type;
     hdr.payload_len = 0;
     for (size_t i = 0; i < n_parts; ++i) {
+        if ((part_lens[i] > 0 && parts[i] == nullptr) ||
+            part_lens[i] > LLAMA_EP_MAX_FRAME_BYTES - hdr.payload_len) {
+            return false;
+        }
         hdr.payload_len += part_lens[i];
+    }
+    // RDMA is message-oriented underneath the byte-stream facade. Sending the
+    // frame header and every payload field separately used up to seven SEND
+    // work requests for a TG REQ4 and exhausted the four-slot send ring in the
+    // middle of every layer. Let capable transports coalesce all pieces into
+    // the minimum number of registered messages. Keep a small stack vector so
+    // the hot path itself remains allocation-free.
+    if (t->ops.sendv_all != nullptr && gathered_send_enabled() && n_parts <= 15) {
+        const void * gathered_parts[16];
+        size_t gathered_lens[16];
+        gathered_parts[0] = &hdr;
+        gathered_lens[0] = sizeof(hdr);
+        for (size_t i = 0; i < n_parts; ++i) {
+            gathered_parts[i + 1] = parts[i];
+            gathered_lens[i + 1] = part_lens[i];
+        }
+        return t->ops.sendv_all(t->ctx, gathered_parts, gathered_lens, n_parts + 1);
     }
     if (!t->ops.send_all(t->ctx, &hdr, sizeof(hdr))) {
         return false;
@@ -306,6 +348,11 @@ bool llama_ep_send_framev(llama_ep_transport * t, uint32_t type, const void ** p
 }
 
 bool llama_ep_recv_frame(llama_ep_transport * t, uint32_t & type, std::vector<uint8_t> & payload) {
+    type = 0;
+    payload.clear();
+    if (t == nullptr || t->ops.recv_all == nullptr) {
+        return false;
+    }
     llama_ep_frame_header hdr;
     if (!t->ops.recv_all(t->ctx, &hdr, sizeof(hdr))) {
         return false;
@@ -313,8 +360,7 @@ bool llama_ep_recv_frame(llama_ep_transport * t, uint32_t & type, std::vector<ui
     if (hdr.magic != LLAMA_EP_MAGIC) {
         return false;
     }
-    // sanity cap: 1 GiB per frame
-    if (hdr.payload_len > (uint64_t) 1 << 30) {
+    if (hdr.payload_len > LLAMA_EP_MAX_FRAME_BYTES) {
         return false;
     }
     payload.resize((size_t) hdr.payload_len);

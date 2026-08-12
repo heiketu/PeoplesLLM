@@ -1443,6 +1443,7 @@ inline static void ggml_vec_geglu_f16(const int n, ggml_fp16_t * y, const ggml_f
 }
 
 void ggml_vec_swiglu_f32(const int n, float * y, const float * x, const float * g);
+void ggml_vec_swiglu_clamped_f32(const int n, float * y, const float * x, const float * g, float limit);
 
 inline static void ggml_vec_swiglu_f16(const int n, ggml_fp16_t * y, const ggml_fp16_t * x, const ggml_fp16_t * g) {
     for (int i = 0; i < n; ++i) {

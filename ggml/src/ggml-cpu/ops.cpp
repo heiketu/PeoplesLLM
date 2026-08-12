@@ -3296,6 +3296,9 @@ static void ggml_compute_forward_swiglu_f32(
     GGML_ASSERT(ggml_nrows(dst) == nr);
 
     const int32_t swapped = ggml_get_op_params_i32(dst, 1);
+    // Optional CPU-only fused clamp convention used by llama-epd. Ordinary
+    // SWIGLU tensors leave this zero and retain the original vector path.
+    const float clamp_limit = ggml_get_op_params_f32(dst, 2);
 
     // rows per thread
     const int dr = (nr + nth - 1)/nth;
@@ -3313,7 +3316,12 @@ static void ggml_compute_forward_swiglu_f32(
             src1_p += swapped ? 0 : nc;
         }
 
-        ggml_vec_swiglu_f32(nc, (float *) ((char *) dst->data + i1*(dst->nb[1])), src0_p, src1_p);
+        float * dst_p = (float *) ((char *) dst->data + i1*(dst->nb[1]));
+        if (clamp_limit > 0.0f) {
+            ggml_vec_swiglu_clamped_f32(nc, dst_p, src0_p, src1_p, clamp_limit);
+        } else {
+            ggml_vec_swiglu_f32(nc, dst_p, src0_p, src1_p);
+        }
 
 #ifndef NDEBUG
         for (int k = 0; k < nc; k++) {

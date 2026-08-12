@@ -445,3 +445,9 @@
 #define ggml_gemm_q8_0_4x4_q8_0_generic ggml_gemm_q8_0_4x4_q8_0
 #define ggml_gemm_q8_0_4x8_q8_0_generic ggml_gemm_q8_0_4x8_q8_0
 #endif
+
+// IQ4_XS 8x8 repack kernels exist only as the generic LUT implementation so
+// far; rename them to the arch-neutral names on every ISA. Drop these two
+// lines once native (AVX2/AVX512) kernels land and add per-arch remaps above.
+#define ggml_gemv_iq4_xs_8x8_q8_0_generic ggml_gemv_iq4_xs_8x8_q8_0
+#define ggml_gemm_iq4_xs_8x8_q8_0_generic ggml_gemm_iq4_xs_8x8_q8_0

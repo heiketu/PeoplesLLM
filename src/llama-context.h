@@ -320,6 +320,12 @@ private:
     // populated when cparams.output_layer_inp[il] is true
     std::vector<buffer_view<float>> embd_layer_inp;
 
+    // A layer-major decode can cover more tokens than cparams.n_batch. Keep
+    // its extracted layer inputs in a separate, full-prompt backing store so
+    // speculative draft encoders can consume the same contiguous rows as the
+    // regular token-major path. A subsequent regular decode clears it.
+    std::vector<std::vector<float>> embd_layer_inp_layer_major;
+
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active
         std::map<llama_seq_id, llama_sampler *> samplers;

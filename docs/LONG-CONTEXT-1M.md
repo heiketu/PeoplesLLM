@@ -23,9 +23,14 @@ F16 KV 的估算如下：
 | 2048 | 3,304 + 3,335 + 6,598 = **13,237** | 3,712 + 3,653 + 5,930 = **13,295** | 安全回退档 |
 | 1024 | 3,304 + 3,313 + 3,324 = **9,941** | 3,712 + 3,632 + 3,089 = **10,433** | 保守档 |
 
-结论：1M 默认上限暂定 `-b 4096 -ub 4096`。短上下文上最快的 ubatch 8192
-不能用于 1M。运行前要求每卡至少保留 2GiB；低于该余量自动降至 2048，不能靠
-CUDA OOM 后重试来做正常控制流。
+结论：对上面的单机静态 layer-split 口径，1M 上限暂定 `-b 4096 -ub 4096`。短上下文
+上最快的 ubatch 8192 不能用于 1M。运行前要求每卡至少保留 2GiB；低于该余量自动降至
+2048，不能靠 CUDA OOM 后重试来做正常控制流。
+
+四路 remote EP + DSpark 连续双卡布局的显存构成不同，必须按真实 server 重新测量。当前
+F16 `1M×1` 选择 `-b 256 -ub 256`：16K PP 三轮均值 269.36 tok/s，比 UB64 的
+235.37 tok/s 提升 14.4%，TG 热态差异约 -0.25%。UB2048 的 PP 更快但 TG 下降约 2.8%；
+UB4096/8192 均在 GPU0 compute buffer 分配阶段 OOM，不能套用上表的静态结论。
 
 ## KV 量化与预取预算
 
@@ -125,6 +130,41 @@ dense/attention 都在 CUDA，剩余限制是 CPU-MoE 与逐层 CPU/GPU 同步�
 
 ## 运行纪律与验收
 
+### 双 3090 + DSpark 当前生产实测（2026-08-13）
+
+静态 fit 数字不能替代 remote-EP + speculative server 的真实加载。本机当前后台使用
+F16 K/V、一个完整 1M slot 和 UB256：
+
+```sh
+llama-server \
+  -m DeepSeek-V4-Flash-Q4-mxfp4-0731.gguf \
+  -md dspark-DeepSeek-V4-Flash-MXFP4.gguf \
+  --spec-type draft-dspark --spec-draft-n-max 3 --spec-draft-p-min 0 \
+  -dev CUDA0,CUDA1 -sm layer -ts 1,0 \
+  -ot '^token_embd\.weight$=CUDA1,^output.*=CUDA1' \
+  --spec-draft-device CUDA1 \
+  -ngl all -ncmoe 99 -ngld all -b 256 -ub 256 \
+  -c 1048576 -np 1 \
+  --no-kv-unified -fa on -fit off
+```
+
+43 层 target dense/attention/router 与 target KV 连续位于 CUDA0；DSpark 与 draft KV 位于
+CUDA1。DSpark sidecar 复用 target 的 token embedding 和 LM head，故这两个边界张量也放
+CUDA1，不能把两套 scheduler 的 device list 完全隔离。16K PP 三轮均值 269.36 tok/s，
+固定 128-token 请求最终热态四轮均值 36.84 tok/s。Q8 KV 多槽容量档实测如下：
+
+| 配置 | GPU0/GPU1 已用 | 单请求热态 TG | 结论 |
+|---|---:|---:|---|
+| `1M×2` Q8、默认 split | 19,106 / 9,900 MiB | 34.168 tok/s | 对照 |
+| `1M×2` Q8、连续布局 | 16,094 / 12,300 MiB | 34.436 tok/s | +0.79% |
+| `1M×3` Q8、连续布局 | 20,456 / 12,304 MiB | 34.260 tok/s | 容量优先；比两槽 -0.51% |
+| `1M×4` Q8、连续布局 | 未完成加载 | — | CUDA0 申请 2.73GiB PP compute buffer 时 OOM |
+
+Q8 三槽均由 `/slots` 确认 `n_ctx=1048576`、`speculative=true`。三个 slot 同时生成的总吞吐
+约 41.6 tok/s，因此第三槽是容量扩展而不是聚合吞吐优化。Q8 不保证与 F16 bit-exact；短
+请求已完成单槽重复稳定性和三个独立算术 chat 顺序/并发隔离验收，接近 1M 的长距离质量
+回归仍是独立 release gate。
+
 所有大模型进程必须持有：
 
 ```sh
@@ -134,7 +174,7 @@ flock -x /tmp/xllama-bench.lock <command>
 1M release gate 至少包含：
 
 1. 启动前记录 RAM、swap、两卡显存和残留模型进程；不满足 2GiB/卡保留线则不启动。
-2. 先通过静态 fit，再按 1K → 2K → 4K ubatch 阶梯验证，禁止直接跳到未知大档。
+2. 先通过静态 fit，再按适合该布局的 ubatch 阶梯验证；remote EP + DSpark 从 128→256→512，单机静态档再按 1K→2K→4K，禁止直接跳到未知大档。
 3. 记录加载后、首个 ubatch、稳态和退出前的 RAM/VRAM 峰值；swap 持续增长视为失败。
 4. 固定 seed、temperature=0 做非空输出对拍；KV 量化还需单独做长距离质量验收。
 5. 性能使用 ABBA 顺序复测；任何吞吐提升都不能以缩短实际 context 或静默降档获得。

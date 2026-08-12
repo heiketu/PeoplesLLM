@@ -15,10 +15,14 @@ add_library(${TARGET} STATIC
     server-common.h
     server-context.cpp
     server-context.h
+    server-prefill-scheduler.cpp
+    server-prefill-scheduler.h
     server-stream.cpp
     server-stream.h
     server-tools.cpp
     server-tools.h
+    server-mcp.cpp
+    server-mcp.h
     server-schema.cpp
     server-schema.h
 )

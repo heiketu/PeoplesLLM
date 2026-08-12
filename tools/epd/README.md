@@ -2,12 +2,127 @@
 
 两部件：
 
-- `llama-epd`：worker 守护进程。加载 GGUF（只读 mmap，懒分页），按 `--layers`/`--experts`
+- `llama-epd`：worker 守护进程。加载 GGUF（默认只读 mmap，也可 `--no-mmap` 常驻匿名内存），按 `--layers`/`--experts`
   认领范围，监听 TCP，对每个 REQ 计算指定层的指定路由专家 FFN（gate→silu→×up→down，
   加 router 权重求和）并返回合并结果。无 attention、无 router。
 - master 侧（`src/llama-remote-ep.{h,cpp}` + `src/llama-graph.cpp` 挂点）：默认关闭。
   开启后 `build_moe_ffn` 在指定层把 hidden + top-k ids + router 权重经
   `ggml_map_custom3` 阻塞式发给 worker，RESP 写回图，后续残差照旧。
+- `llama-ep-topology.h` / `llama-ep-capability.h`：共享所有权覆盖、稀疏 bitmap 与 CAP
+  payload 校验；dealer 只接收已经验证的 holder 表，不再混入协议解析。
+
+## 2026-08-12：四 NUMA 真 EP 快速上手
+
+下面的拓扑是 master/slave 每个 NUMA node 一个 worker，四路共同计算**同一个 slot** 的
+routed experts。target 的 dense/attention/router 与 DSpark draft 留在 master 双 GPU；
+`KLOCAL=0` 时 master 不复制 routed-expert 权重。这和四台机器各跑一个完整 slot 是两回事。
+
+### 1. 构建
+
+```bash
+sudo apt install -y cmake ninja-build build-essential numactl libnuma-dev \
+    rdma-core libibverbs-dev librdmacm-dev
+cmake -S . -B build-cpu -G Ninja -DGGML_CUDA=OFF -DGGML_NATIVE=ON \
+    -DCMAKE_BUILD_TYPE=Release
+cmake --build build-cpu -j --target llama-epd llama-ep-transport-bench
+```
+
+配置阶段必须看到 `EP RDMA transport (RoCEv2): ON`。master 与 slave 必须同步同一构建的
+worker 二进制/动态库和协议代码；两边各自准备同内容 GGUF。
+
+### 2. 专家所有权图
+
+无画像时可以用 `--expert-mod 0/4` … `3/4` 做严格无副本基线。生产先采集真实流量：
+
+```bash
+GGML_REMOTE_EP_FREQ=1 GGML_REMOTE_EP_FREQ_FILE=/tmp/router-freq.csv \
+  GGML_REMOTE_EP=1 ... llama-server ...
+
+python3 tools/epd/ep-map-from-freq.py /tmp/router-freq.csv \
+  -w 4 -e 256 --extra-per-worker 64 --json > /tmp/ep-map.json
+```
+
+decode/speculative verify 还可用 `GGML_REMOTE_EP_DEBUG=1 GGML_REMOTE_EP_TRACE_ROUTER=1`
+采小 batch 共激活 trace，再交给 `ep-map-from-trace.py --repeat-cost 250` 加副本。
+strict 图要求每个专家恰好一个 holder；有副本的图必须在 master 开
+`GGML_REMOTE_EP_SCHED_MAX_EFFORT=1`，但仍不允许任何专家缺失。
+
+### 3. 启动四个 worker
+
+| worker | 主机 | 数据地址 | NUMA | 端口 | map index |
+|---|---|---|---:|---:|---:|
+| w0 | master | 10.0.0.1 | 0 | 29202 | 0 |
+| w1 | master | 10.0.0.1 | 1 | 29203 | 1 |
+| w2 | slave | 10.0.0.2 | 0 | 29200 | 2 |
+| w3 | slave | 10.0.0.2 | 1 | 29201 | 3 |
+
+每路执行一次（替换 `IDX/NODE/PORT/MODEL`）：
+
+```bash
+IDX=0 NODE=0 PORT=29202 MODEL=/path/to/target.gguf MAP=/tmp/ep-map.json
+EXPERTS=$(jq -r ".workers[$IDX].expert_list" "$MAP")
+env GGML_REMOTE_EP_RDMA=1 GGML_EPD_POLL=50 GGML_EPD_HUGEPAGES=0 \
+  numactl --cpunodebind="$NODE" --membind="$NODE" \
+  build-cpu/bin/llama-epd -m "$MODEL" --port "$PORT" --layers 0-42 \
+    --expert-list "$EXPERTS" -t 36 --no-autotune --no-mmap
+```
+
+每 NUMA 一个 worker 已由外部 `numactl --membind` 保证权重本地性，不应再设置跨节点
+`GGML_EPD_NUMA=weighted`。只有单个 worker 同时跨两个 NUMA node 时才使用 weighted。
+
+正确 ready 条件是**本次启动** journal 里的 `llama-epd: listening`，不是 `ss` 刚看到端口；
+transient unit 重用同名时用 `journalctl --since "$START"` 排除旧日志。RDMA 还必须同时满足：
+
+```bash
+journalctl --user -u WORKER.service --since "$START" | grep -E 'listening|\[rdma\]'
+rdma resource show qp
+```
+
+代码只识别 `GGML_REMOTE_EP_RDMA=1`，不存在 `GGML_EPD_RDMA`。master 与所有 worker 两侧
+必须都设置。`GGML_EP_RDMA_SPIN=1` 只是 CQ busy-poll；当前 Ice Lake/ConnectX-5 仅 master
+开启有净收益，worker 不开。
+
+### 4. master 与每槽 1M
+
+当前 DSV4 + DSpark 正式配置的关键 env：
+
+```bash
+env \
+  GGML_REMOTE_EP=1 GGML_REMOTE_EP_LAYERS=0-42 \
+  GGML_REMOTE_EP_SCHED=1 GGML_REMOTE_EP_SCHED_KLOCAL=0 \
+  GGML_REMOTE_EP_SCHED_MAX_EFFORT=1 GGML_REMOTE_EP_SCHED_PP=1 \
+  GGML_REMOTE_EP_SCHED_ENDPOINTS=10.0.0.1:29202,10.0.0.1:29203,10.0.0.2:29200,10.0.0.2:29201 \
+  GGML_REMOTE_EP_RDMA=1 GGML_EP_RDMA_SPIN=1 \
+  GGML_REMOTE_EP_PIPE=0 \
+  GGML_REMOTE_EP_PARALLEL_IO=1 GGML_REMOTE_EP_WEIGHT_ON_MASTER=1 \
+  GGML_REMOTE_EP_SCHED_TG_REPEAT_COST=250 \
+  GGML_REMOTE_EP_SCHED_PP_REPEAT_COST=250 \
+  GGML_REMOTE_EP_RECONNECT_TIMEOUT_MS=90000 \
+  GGML_CUDA_BATCHED_TOPK=1 GGML_CUDA_DSV4_KV_REUSE=1 \
+  build-cuda/bin/llama-server \
+    -m /path/to/target.gguf -md /path/to/dspark.gguf \
+    --spec-type draft-dspark --spec-draft-n-max 3 --spec-draft-p-min 0 \
+    -dev CUDA0,CUDA1 -sm layer -ts 1,0 \
+    -ot '^token_embd\.weight$=CUDA1,^output.*=CUDA1' \
+    --spec-draft-device CUDA1 \
+    -ngl all -ncmoe 99 -ngld all -t 72 -tb 72 -b 256 -ub 256 \
+    -c 1048576 -np 1 --no-kv-unified -fa on -fit off \
+    --numa distribute --no-warmup --no-ui --host 0.0.0.0 --port 18108
+```
+
+`-c` 是总 context；每槽完整 1M 的通式为
+`-c $((1048576*n)) -np n --no-kv-unified`。当前质量/吞吐配置是 F16 `1M×1`、UB256；
+16K PP 三轮均值 269.36 tok/s，比旧 UB64 提升 14.4%。PP repeat-affinity 显式设
+`GGML_REMOTE_EP_SCHED_PP_REPEAT_COST=250`：同组 6 轮均值 263.555，对默认 1000 的
+261.108 tok/s 提升 0.94%；默认值没有改变。双 3090 的 Q8 连续布局另行实测
+`1M×3` 容量档：20,456/12,304MiB，单请求只比同布局 `1M×2` 慢 0.51%；`1M×4` 在 PP
+compute buffer 预留阶段 OOM。使用多槽时必须用 `/slots` 核对每槽均为
+`n_ctx=1048576`。DSpark 会复用
+target embedding/output，不能把 draft 与 target scheduler 的 device list 完全隔离；上述布局
+只在输入/最终 logits 边界跨卡，43 层 target 与 target KV 不跨层搬运。当前
+`llama-fit-params` 对该 remote-EP 组合会 segfault，容量验收固定 `-fit off` 真实启动。
+`0.0.0.0` 会对所有网卡开放，生产应配 API key、TLS/反向代理或防火墙白名单。完整 env 逐项
+解释见 [PEOPLESLLM-PARAMS.md](../../docs/PEOPLESLLM-PARAMS.md)。
 
 ## 配置（master，env，风格对齐 GGML_NUMA_EP）
 
@@ -19,8 +134,12 @@
 | `GGML_REMOTE_EP_LAYERS` | 全部 | 远端层范围 `A-B`；范围外的层走本地 |
 | `GGML_REMOTE_EP_DEBUG` | 关 | 置 1 每次 RPC 打印 send/wait 耗时（master）；worker 端置 1 每 REQ 打印 compute 耗时 |
 | `GGML_REMOTE_EP_RDMA` | 关 | 置 1 传输层改用 RDMA（RoCEv2，rdma_cm 自动建连）。需编译时检测到 libibverbs+librdmacm（CMake 打印 `EP RDMA transport (RoCEv2): ON`）；无卡/建连失败时打 warning 并自动回退 TCP。master 与 worker 需同时置 1（协议不同，不互通）。**2026-07-31 大帧塌陷已修复（根因 rdma_cm 默认 min_rnr_timer ~80ms，建连后改 0.01ms），大帧 5.5GB/s ≥2× TCP，全场景可用** |
+| `GGML_EP_RDMA_COALESCE` | 开 | RDMA 把 frame header 与分散 payload 合并到最少的已注册 SEND slot，避免 REQ4 逐段占满 send ring；`=0` 回到旧路径。单-slot ABBA 无可测 TG 增益，默认开启是为多 slot 下的 WR 容量与稳定性 |
+| `GGML_REMOTE_EP_SCHED_PP_REPEAT_COST` | `1000` | PP 同批次再次命中同一专家时的边际虚拟成本（0–1000）；当前 DSV4 生产显式设 250，同组 A/B +0.94% |
+| `GGML_REMOTE_EP_SCHED_REPEAT_ACCOUNTING` | 关 | 实验性地用“新专家 + repeat 边际成本”统一队列与服务率单位。DSV4 单-slot ABBA 实测 -1.45%，生产保持关，仅真多 stream 调度实验时开 |
+| `GGML_REMOTE_EP_RECONNECT_TIMEOUT_MS` | `0` | SCHED endpoint 传输失败后，允许等待 worker 重启并重发已暂存请求的最长毫秒数（0 保持旧的一次立即重连；最大 300000）。pure EP 常驻服务建议 90000；重连后 expert map、kernel ID、CAP 位必须与初次协商相同，否则拒绝继续；超时/能力变化仍是致命错误，因为 master 没有本地专家结果可回退 |
 | `GGML_REMOTE_EP_PIPELINE` | 关 | 置 1 启用流水线分块投递：多 token 层（PP）把 token 维切成块，W=1 滑动窗口发送（发块 i 后收块 i-1 的响应），worker 计算与 master 收发重叠。协议不变（每块是一个普通 REQ 帧），逐 token 数值不变；decode（1 token）不受影响自动走原路径。TCP/RDMA 均可用 |
-| `GGML_REMOTE_EP_PIPELINE_CHUNK` | 256 | 每块 token 数上限；再按隐藏层字节数封顶（TCP ≤3MiB、RDMA ≤1.5MiB，保证 W=1 窗口在 socket buffer / RDMA 接收环容量内，不会死锁） |
+| `GGML_REMOTE_EP_PIPELINE_CHUNK` | 256 | 每块 token 数上限；再按隐藏层字节数封顶（TCP ≤3MiB、RDMA ≤12MiB，保证 W=1 窗口在 socket buffer / RDMA 接收环容量内，不会死锁） |
 | `GGML_REMOTE_EP_MIRROR` | 关 | 置 1 启用层镜像 + 专家 slot 拆分：master 同时加载远程层专家权重（这些层不再 TENSOR_SKIP），每层 MoE 沿 slot 维切两半——slot [0,k_r) 发 worker（只发不等的 send op），slot [k_r,k) 在 master 本地走与单机 MoE 完全相同的链路，wait op 收 partial_r 后按 slot 升序合并（与全远程基线结合顺序一致，逐字对拍 bit 一致）。decode 与 PP 均生效；详见下文实测节 |
 | `GGML_REMOTE_EP_MIRROR_LAYERS` | =远程层范围 | 镜像层子集 `A-B`（须落在 `GGML_REMOTE_EP_LAYERS` 内） |
 | `GGML_REMOTE_EP_MIRROR_KREMOTE` | n_expert_used/2 | 发远程的 slot 数 k_r，clamp 到 [1, n_expert_used-1] |
@@ -32,6 +151,10 @@ worker 侧另有：
 | `GGML_EP_PREFAULT` | 关 | 置 1 启动时预触认领层专家权重的全部 mmap 页（多线程），消除冷专家首次命中时页入造成的多 ms compute 尖峰 |
 | `GGML_EP_PREFAULT_THREADS` | 16 | 预触线程数 |
 | `GGML_EPD_AUTOTUNE` | 开 | 置 0 关闭启动线程自动标定（同 `--no-autotune`） |
+| `GGML_EPD_AUTOTUNE_ROWS` | 自动 | 覆盖标定使用的每端点 decode assignment 数；默认按 `ceil(top_k × owned_experts/full_experts)` 估算，四路 strict GLM 为 2，热点副本约为 3 |
+| `GGML_EPD_REPACK` | 开 | 置 0 保留原始 GGUF 权重布局；默认只对按量化格式与实测策略判定有利的权重使用 CPU_REPACK |
+| `GGML_EPD_FUSE_GATE_UP` | 开 | 对类型和形状兼容的 separate gate/up 在加载期合并为一个 repacked 张量；总权重字节不变，每层减少一次 MMID 调度与一次激活量化；置 0 用于 A/B |
+| `GGML_EPD_SHARED_Q8_MIN_TOKENS` | 2 | gate/up 无法融合时的 fallback：从该 token 数起共享一次 Q8_0/Q8_K 激活量化；1-token TG 保持各投影内部量化，置 0 关闭，置 1 强制所有形状共享 |
 
 worker 选项 `--no-mmap`：启动时把**认领层**的专家权重按张量一次性顺序 pread 进匿名内存
 （per-tensor posix_memalign，64B 对齐校验），张量指向该缓冲区，进程退出时 free。行为：启动慢
@@ -42,14 +165,54 @@ worker 选项 `--no-mmap`：启动时把**认领层**的专家权重按张量一
 ## 启动线程自动标定（autotune）
 
 **仅当未显式传 `-t` 时生效**（显式 `-t` 行为完全不变）。模型映射 + 层认领 + prefault 之后、
-listen 之前，worker 在认领层中取首层 + 中间层共 2 个代表层，以 decode 形态（n_tokens=1、
-top-k 从 `<arch>.expert_used_count` 读）构造 dummy 输入，对候选线程阶梯
-`{16, 24, 32, 48, 物理核数}`（物理核数按 sysfs topology 去重 (package, core)，不计 HT）
-各跑 2 warmup + 5 轮取中位，选 knee point：**边际收益 < 3% 的最小线程数**（专家 FFN 是带宽
-敏感型，过饱和点后加线程只增 barrier 开销）。标定切换线程走与服务完全相同的
+listen 之前，worker 在认领层中取首层 + 中间层共 2 个代表层，以真实 SCHED/REQ2 紧凑
+decode 形态构造 dummy 输入：top-k 从 `<arch>.expert_used_count` 读取，每端点行数默认按
+`ceil(top_k × owned_experts/full_experts)` 估算（可由 `GGML_EPD_AUTOTUNE_ROWS` 覆盖），
+图形为 `n_ids=1` 并复用同一 token hidden。对候选线程阶梯
+`{16, 24, 32, 36, 物理核数}`（物理核数只在当前 CPU affinity/cpuset 内按 sysfs topology
+去重 (package, core)，不计 HT）
+各跑 2 warmup + 5 轮取中位，选择**全局最佳耗时 3% 以内的最小线程数**（避免局部噪声
+让相邻阶梯过早停止；专家 FFN 是带宽敏感型，过饱和点后加线程只增 barrier 开销）。
+标定切换线程走与服务完全相同的
 `ggml_backend_cpu_set_n_threads` 路径，总耗时 <1s。每个候选的 ms/iter 与最终选择均打日志。
 
 实测（slave 2×36 核/144 HT，DSV4 8 层 35-42）：见下文"启动线程自动标定实测"。
+
+### AVX512 worker 路径复测（2026-08-11）
+
+真实 GLM-5.2 张量复测发现，CPU_REPACK trait 曾用零字节 backend buffer 探测；该 buffer
+不会触发 CPU_REPACK 的 `init_tensor`，因而支持的 IQ2_XS/IQ3_XXS 张量也会静默保留 raw
+布局。现改为一个对齐的非零 probe unit，并以实际张量再次验证。layer 3、64 专家、32
+线程的 warm REQ2 受控 A/B 如下（只计 worker CPU MoE compute）：
+
+| 形态 | separate gate/up | 加载期融合 | 结果 |
+| --- | ---: | ---: | --- |
+| PP128，`n_sel=476` | 33.14~36.73 ms | **31.53~31.60 ms** | 输出逐字节一致 |
+| TG，ragged top-3 | 0.505~0.595 ms | **0.460~0.477 ms** | 输出逐字节一致 |
+
+同层 IQ3_XXS down 的真实形状中，repack 在 PP128 为 2.654 ms，对 raw 4.592 ms
+（1.73×）；TG 两者均约 0.090 ms，说明低 assignment TG 不能仅因 ISA/格式名强制选
+repack，后续 AMX 也必须遵守同一 workload-aware dispatch 原则。
+
+REQ2/REQ4 紧凑图把每个 `(token, expert)` assignment 放在 `ne12`，同时保持
+`ne11=1`。旧 CPU_REPACK 激活准备只在 `ne11` 上分线程，导致生产 TG 的多行
+F32→Q8 全由线程 0 串行完成。现在按完整 `(ne12,ne11)` 行空间分摊，仍以整行为
+独立量化单元，因此生成字节不变，单行路径也不引入 block 切分开销。六行、窄输出
+量化微基准中，K=7168 从 31~33 µs 降至 19~20 µs，K=2048 从 17~20 µs 降至
+约 15 µs；生产 DSV4 单槽四 NUMA EP 两次六轮均值为 36.573/36.902 tok/s，
+对旧 worker 36.280 为约 +0.8~1.7%。全部输出 SHA256 相同且 draft/accepted
+均为 145/78。另一个让每个线程直接遍历共享 active-expert 表的方案虽缩短窄输出
+微基准，端到端却降至 36.295 tok/s，已完整删除。
+
+MXFP4 shared-weight AVX512 内核已覆盖 NR2..8 且 bit-exact 测试通过，但真实
+expert-first 热路放宽为 2–8 行后，排除首个冷请求的五轮均值 267.128，对旧 2–4 行
+268.443 tok/s 为 -0.49%。生产派发因此恢复 2–4 行；NR5..8 仅保留为内核能力和后续
+其他调度形状的实验入口，不宣称端到端加速。
+
+加载期转换采用逐张量即时回收：一个原始张量完成 repack 后立即对其 mmap 页完整内区间
+执行 `MADV_DONTNEED`，不会等整模转换完再同时保留 raw + repack。layer 3、64 专家样例
+转换并回收 0.72 GiB 后，稳定 `VmRSS=784752 kB`、`RssFile=8148 kB`；`--no-mmap`
+匿名权重则保持原有的转换后立即 free 行为。
 
 仅当层为 SILU+gate MoE、无 expert bias/scale、非 warmup 图时走远端；
 不满足时自动回退本地路径。连接懒建立、跨 decode 复用，传输错误自动重连重试一次。
@@ -193,7 +356,12 @@ listen；`--selftest` PASS（max_abs_diff=0）。
 切成 `[u32 len + payload]` 块并在接收端拼回字节流；等待走 ibv comp channel 阻塞（不 spin）。
 `GGML_REMOTE_EP_RDMA=1`（默认关）同时置在 master 与 worker；CMake 检测不到
 libibverbs/librdmacm 时不编译该后端，env 开了但无卡/建连失败打 warning 自动回退 TCP，
-纯 TCP 环境行为零变化。`GGML_EP_RDMA_SPIN=1` 为调试开关（busy-poll CQ）。
+纯 TCP 环境行为零变化。`GGML_EP_RDMA_SPIN=1` 为 busy-poll CQ 性能档：2026-08-12
+四路 DSV4 实测只在 master 开约 +2.7%，worker 同开反而略降；它会持续占核，不能全局照抄。
+`GGML_EP_RDMA_COALESCE=1`（默认）会把 frame header 和 payload pieces 收集到最少的
+已注册 SEND slot；`=0` 可回退逐段发送。真 RDMA loopback 已通过，生产 ABBA 为
+34.795 vs 34.804 tok/s，在单 slot 下无可测速度收益；该改动用于减少多 slot
+时 send-ring/WR 压力，不作为 TG 提速项宣传。
 
 微基准（`llama-ep-transport-bench`，master↔slave 跨机，echo 往返，同会话 tcp1→rdma1→rdma2→tcp2）：
 
@@ -471,3 +639,57 @@ PP 不再塌陷；RDMA ≥ TCP 全部档位（rdmafix1 状态 PP1020 2.3× TCP �
 为并行 agent 调 RAPL 功耗墙导致的 master 本地 prefill 带宽波动（待 agent-14
 结论），与传输层无关。正确性：gen48（temp0/seed42）RDMA 修复后两轮 + TCP 轮
 与单机基线 md5 全部一致（47cfde37...，逐字 IDENTICAL）。
+
+## 单 slot 四 NUMA 真 EP（2026-08-10，GLM-5.2 全 75 个 MoE 层）
+
+生产拓扑不再是“每个 node 复制整模跑四个 slot”，而是 master 与 slave 的每个 NUMA
+node 各一个 `llama-epd` worker，四路共同计算**同一个 slot**。`KLOCAL=0` 时 master
+不加载层 3–77 的 routed-expert 权重；worker 只加载自己拥有的稀疏专家集合。
+
+本轮落地的关键修复：
+
+- REQ2/REQ3 ragged 分配改为每个真实 `(token, expert)` 一行、`n_ids=1` 的紧凑图；
+  删除“全批补到最忙 token 的本地专家数”造成的冗余 matmul。相同 `ub256` PP512
+  从 23.69 提升到 30.89 tok/s（单轮 A/B）。
+- 小 TG 的 ragged hidden 改为 request-side 串行紧凑 memcpy，避免额外的
+  GET_ROWS 图调度/barrier；大 batch 仍使用图侧 GET_ROWS。
+- 只缓存 ≤`GGML_EPD_GRAPH_CACHE_MAX_ROWS`（默认 64）的 decode 小图，并由
+  `GGML_EPD_GRAPH_CACHE_MIB` 设置 LRU 字节预算（默认 512 MiB）；大 PP 图每次
+  重建、复用单块 grow-only allocator。2 NUMA worker 连扫 ub128/256/512 后仍稳定在
+  115.1GiB/worker、swap 零增长，不再因 ragged shape 永久累计几十 GiB。
+- RDMA 连接改为独立 CM event channel，断连进入 pump；transport 增加 shutdown，
+  receiver thread 可 join。多轮 bench 后 worker 回到 NLWP=1，不再泄漏线程。
+- master merge 可用 `GGML_REMOTE_EP_MERGE_THREADS` 按 token 并行；默认 8，但
+  n_tokens<64 自动单线程。1/4/8/16 扫频以 8 最优；同热态正式 A/B 约 +1.9%。
+
+PP512 的真实画像由以下方式生成：
+
+```bash
+GGML_REMOTE_EP_FREQ=1 \
+GGML_REMOTE_EP_FREQ_FILE=glm52p-pp512-freq.csv \
+  llama-bench ... -p 512 -n 0 -b 512 -ub 256
+
+tools/epd/ep-map-from-freq.py glm52p-pp512-freq.csv \
+  -w 4 -e 256 --extra-per-worker 32 --json > glm52p-pp512-map.json
+```
+
+生成器保持每路 64 个 primary，并只接受确实改善逐层归一化负载的第二 holder；最终
+四路拥有 84/81/87/80 个专家（20/17/23/16 个副本）。在线 dealer 在 holder 集合内
+按整批累计负载与跨 stream 在飞工作择轻端点；默认的完成反馈分 TG/PP
+学习每路 `us/assignment`。可选 `GGML_REMOTE_EP_SCHED_REPEAT_ACCOUNTING=1`
+会把在飞队列和样本都改成 `us/new-expert-equivalent`（新专家权重流 + repeat 边际成本）；
+但 DSV4 单-slot 稳态 ABBA 为默认口径 36.280 vs 开启 35.754 tok/s（-1.45%），
+故只保留为真多 slot 待验证开关。该服务率反馈尚未计入本节 40.59 tok/s 的 08-10 实测。`--max-holders 4` 支持多 holder 实验，但本机 A/B 39.54
+tok/s，低于默认双 holder 的 40.59，故生产保持默认 `--max-holders 2`。
+
+同代码、同模型、同参数三轮结果（GLM-5.2 UD-Q2_K_MXFP4；dense/attention 在双 3090；
+CPU 只算层 3–77 routed experts）：
+
+| 拓扑 | 专家布局 | PP512 (b512/ub256) | wall | 对 2 NUMA |
+|---|---|---:|---:|---:|
+| 单机 2 NUMA worker | strict 128+128，无重叠 | 24.13 tok/s | 21.22s | 1.000× |
+| 双机 4 NUMA worker | 64 primary/路 + PP 热点副本 | **40.59 tok/s** | **12.62s** | **1.682×** |
+
+热点映射把逐层关键路径负载/理想平均从 1.374× 降到 1.091×，峰值 3.50×→1.50×；
+四路 RSS 约 71–78GiB/NUMA、swap 无增长。75 层、128 token 的 decode 对拍逐字节
+`MATCH`；PP 路径同样保持每 token 内全局 slot 升序左结合，数值顺序未改变。

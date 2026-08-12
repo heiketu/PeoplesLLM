@@ -111,12 +111,12 @@ static int cmd_ping(const char * kind, const char * host, int port) {
         return 1;
     }
 
-    static const size_t sizes[]   = {64, 4096, 65536, 1048576, 4194304, 16777216};
-    static const char * names[]   = {"ping64B", "act4K", "act64K", "act1M", "act4M", "act16M"};
-    static const int    samples[] = {2000, 2000, 1000, 200, 100, 50};
-    const int n_sizes = 6;
+    static const size_t sizes[]   = {64, 4096, 65536, 1048576, 4194304, 16777216, 67108864};
+    static const char * names[]   = {"ping64B", "act4K", "act64K", "act1M", "act4M", "act16M", "act64M"};
+    static const int    samples[] = {2000, 2000, 1000, 200, 100, 50, 10};
+    const int n_sizes = 7;
 
-    std::vector<uint8_t> buf(16 << 20, 0x5a);
+    std::vector<uint8_t> buf(64 << 20, 0x5a);
     std::vector<double>  us;
 
     printf("{\"transport\":\"%s\",\"host\":\"%s\",\"results\":[\n", kind, host);
@@ -129,9 +129,16 @@ static int cmd_ping(const char * kind, const char * host, int port) {
         for (int i = 0; i < n; ++i) {
             const uint32_t hdr = (uint32_t) len;
             const double t0 = now_s();
-            if (!t->ops.send_all(t->ctx, &hdr, sizeof(hdr)) ||
-                !t->ops.send_all(t->ctx, buf.data(), len) ||
-                !t->ops.recv_all(t->ctx, buf.data(), len)) {
+            bool sent = false;
+            if (t->ops.sendv_all != nullptr) {
+                const void * parts[2] = {&hdr, buf.data()};
+                const size_t lens[2] = {sizeof(hdr), len};
+                sent = t->ops.sendv_all(t->ctx, parts, lens, 2);
+            } else {
+                sent = t->ops.send_all(t->ctx, &hdr, sizeof(hdr)) &&
+                    t->ops.send_all(t->ctx, buf.data(), len);
+            }
+            if (!sent || !t->ops.recv_all(t->ctx, buf.data(), len)) {
                 fprintf(stderr, "io error at size %zu iter %d\n", len, i);
                 return 1;
             }

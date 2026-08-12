@@ -184,6 +184,365 @@ static void test_invalid_endpoint_count() {
     CHECK(!llama_ep_dealer_plan_build(in, p), "negative endpoint count must fail");
 }
 
+// KLOCAL=0 pure EP: four disjoint shards own every slot; the master owns none.
+static void test_pure_ep_4workers() {
+    const int k = 8, n_tokens = 2, n_exp = 16, n_ep = 4;
+    int32_t ids[n_tokens * k] = {
+        0, 4, 8, 12, 3, 7, 11, 15,
+        14, 10, 6, 2, 13, 9, 5, 1,
+    };
+    uint64_t holders[n_exp];
+    for (int e = 0; e < n_exp; ++e) {
+        holders[e] = 2ull << (e / 4); // one endpoint only; no master bit
+    }
+
+    llama_ep_dealer_input in;
+    in.n_tokens = n_tokens; in.k = k; in.n_endpoints = n_ep; in.m_star = 0;
+    in.ids = ids; in.holders = holders;
+    llama_ep_dealer_plan a, b;
+    CHECK(llama_ep_dealer_plan_build(in, a) && llama_ep_dealer_plan_build(in, b),
+          "pure four-worker plans should succeed");
+    CHECK(a.m_local == 0 && a.local_ids.empty(),
+          "master must have no local expert slots");
+    CHECK(a.owner == b.owner, "pure four-worker plan must be deterministic");
+    for (int i = 0; i < n_tokens * k; ++i) {
+        CHECK(a.owner[(size_t) i] == (uint8_t) (1 + ids[i] / 4),
+              "slot %d expert %d owner=%u", i, ids[i], (unsigned) a.owner[(size_t) i]);
+    }
+    for (int i = 0; i < n_ep; ++i) {
+        CHECK(a.eps[(size_t) i].slot.size() == 4,
+              "endpoint %d selections=%zu", i, a.eps[(size_t) i].slot.size());
+    }
+}
+
+static void test_exact_shard_cover() {
+    const int32_t valid_first[4] = {0, 4, 8, 12};
+    const int32_t valid_last [4] = {4, 8, 12, 16};
+    CHECK(llama_ep_exact_shard_cover(16, 4, valid_first, valid_last),
+          "four disjoint shards should exactly cover all experts");
+
+    const int32_t gap_first[4] = {0, 4, 9, 12};
+    CHECK(!llama_ep_exact_shard_cover(16, 4, gap_first, valid_last),
+          "a gap must fail strict KLOCAL=0 topology validation");
+
+    const int32_t overlap_last[4] = {5, 8, 12, 16};
+    CHECK(!llama_ep_exact_shard_cover(16, 4, valid_first, overlap_last),
+          "an overlap must fail strict KLOCAL=0 topology validation");
+    CHECK(llama_ep_full_shard_cover(16, 4, valid_first, overlap_last),
+          "max-effort topology should permit overlap when coverage is complete");
+
+    const int32_t out_of_range_last[4] = {4, 8, 12, 17};
+    CHECK(!llama_ep_exact_shard_cover(16, 4, valid_first, out_of_range_last),
+          "an out-of-range shard must fail topology validation");
+}
+
+static void test_sparse_holder_cover() {
+    uint64_t holders[16];
+    for (int e = 0; e < 16; ++e) {
+        holders[e] = 1ull << (e % 4); // 4n+r sparse exact cover
+    }
+    CHECK(llama_ep_holder_cover(16, 4, holders, true),
+          "modulo sparse ownership should be an exact cover");
+    holders[3] |= 1ull << 2;
+    CHECK(!llama_ep_holder_cover(16, 4, holders, true),
+          "sparse overlap must fail strict cover");
+    CHECK(llama_ep_holder_cover(16, 4, holders, false),
+          "sparse overlap is valid max-effort coverage");
+    holders[7] = 0;
+    CHECK(!llama_ep_holder_cover(16, 4, holders, false),
+          "sparse gap must fail max-effort coverage");
+    holders[7] = 1ull << 5;
+    CHECK(!llama_ep_holder_cover(16, 4, holders, false),
+          "out-of-endpoint holder bit must fail coverage");
+}
+
+static void test_pure_ep_overlap_balance() {
+    const int k = 8, n_exp = 8, n_ep = 4;
+    int32_t ids[k] = {0, 1, 2, 3, 4, 5, 6, 7};
+    uint64_t holders[n_exp];
+    for (int e = 0; e < n_exp; ++e) {
+        holders[e] = 0x1e; // all four endpoints, no master
+    }
+    llama_ep_dealer_input in;
+    in.n_tokens = 1; in.k = k; in.n_endpoints = n_ep; in.m_star = 0;
+    in.ids = ids; in.holders = holders;
+    llama_ep_dealer_plan p;
+    CHECK(llama_ep_dealer_plan_build(in, p), "replicated pure-EP plan should succeed");
+    for (int i = 0; i < n_ep; ++i) {
+        CHECK(p.eps[(size_t) i].slot.size() == 2,
+              "dynamic dealer should balance 8 slots as 2/2/2/2 (ep%d=%zu)",
+              i, p.eps[(size_t) i].slot.size());
+    }
+}
+
+static void test_replicated_tie_rotation() {
+    uint64_t holders[256];
+    for (int e = 0; e < 256; ++e) {
+        holders[e] = 0x1e; // all four endpoints, no master
+    }
+    int totals[4] = {0, 0, 0, 0};
+    for (int e = 0; e < 256; ++e) {
+        int32_t id = e;
+        llama_ep_dealer_input in;
+        in.n_tokens = 1; in.k = 1; in.n_endpoints = 4; in.m_star = 0;
+        in.ids = &id; in.holders = holders;
+        llama_ep_dealer_plan p;
+        CHECK(llama_ep_dealer_plan_build(in, p), "rotated plan for expert %d", e);
+        if (!p.owner.empty() && p.owner[0] >= 1 && p.owner[0] <= 4) {
+            ++totals[p.owner[0] - 1];
+        }
+    }
+    CHECK(totals[0] == 64 && totals[1] == 64 && totals[2] == 64 && totals[3] == 64,
+          "rotated ties should be unbiased, got %d/%d/%d/%d",
+          totals[0], totals[1], totals[2], totals[3]);
+}
+
+// Replica balancing must span the complete PP batch. With a per-token reset,
+// these overlapping holder masks produce 3/0/1/2 assignments; cumulative load
+// produces the optimal 2/1/1/2 split.
+static void test_batch_wide_replica_balance() {
+    const int n_tokens = 2, k = 3, n_exp = 3, n_ep = 4;
+    int32_t ids[n_tokens * k] = {0, 1, 2, 0, 1, 2};
+    uint64_t holders[n_exp] = {
+        (uint64_t) 0x5 << 1, // ep0 + ep2
+        (uint64_t) 0xa << 1, // ep1 + ep3
+        (uint64_t) 0x9 << 1, // ep0 + ep3
+    };
+    llama_ep_dealer_input in;
+    in.n_tokens = n_tokens; in.k = k; in.n_endpoints = n_ep; in.m_star = 0;
+    in.ids = ids; in.holders = holders;
+    llama_ep_dealer_plan p;
+    CHECK(llama_ep_dealer_plan_build(in, p), "batch-wide replica plan should succeed");
+    const size_t expected[n_ep] = {2, 1, 1, 2};
+    for (int i = 0; i < n_ep; ++i) {
+        CHECK(p.eps[(size_t) i].slot.size() == expected[i],
+              "batch endpoint %d expected %zu assignments, got %zu",
+              i, expected[i], p.eps[(size_t) i].slot.size());
+    }
+}
+
+static void test_inflight_load_avoidance() {
+    const int k = 4, n_exp = 4, n_ep = 4;
+    int32_t ids[k] = {0, 1, 2, 3};
+    uint64_t holders[n_exp] = {0x1e, 0x1e, 0x1e, 0x1e};
+    int64_t initial[n_ep] = {100, 0, 0, 0};
+    llama_ep_dealer_input in;
+    in.n_tokens = 1; in.k = k; in.n_endpoints = n_ep; in.m_star = 0;
+    in.ids = ids; in.holders = holders; in.initial_remote_load = initial;
+    llama_ep_dealer_plan p;
+    CHECK(llama_ep_dealer_plan_build(in, p), "in-flight-aware plan should succeed");
+    CHECK(p.eps[0].slot.empty(), "busy endpoint must receive no new work");
+    CHECK(p.eps[1].slot.size() + p.eps[2].slot.size() + p.eps[3].slot.size() == k,
+          "all assignments should go to idle endpoints");
+
+    initial[0] = -1;
+    CHECK(!llama_ep_dealer_plan_build(in, p), "negative initial load must fail");
+}
+
+static void test_service_rate_weighting() {
+    const int k = 8, n_exp = 8, n_ep = 2;
+    int32_t ids[k] = {0, 1, 2, 3, 4, 5, 6, 7};
+    uint64_t holders[n_exp];
+    for (int e = 0; e < n_exp; ++e) {
+        holders[e] = 0x6; // both remote endpoints, no master
+    }
+    const int64_t cost[n_ep] = {4, 1}; // endpoint 0 takes 4x work per assignment
+    llama_ep_dealer_input in;
+    in.n_tokens = 1; in.k = k; in.n_endpoints = n_ep; in.m_star = 0;
+    in.ids = ids; in.holders = holders; in.remote_assignment_cost = cost;
+    llama_ep_dealer_plan p;
+    CHECK(llama_ep_dealer_plan_build(in, p), "service-weighted plan should succeed");
+    CHECK(p.eps[1].slot.size() > p.eps[0].slot.size(),
+          "faster endpoint should receive more replicas, got %zu/%zu",
+          p.eps[0].slot.size(), p.eps[1].slot.size());
+
+    const int64_t invalid[n_ep] = {0, 1};
+    in.remote_assignment_cost = invalid;
+    CHECK(!llama_ep_dealer_plan_build(in, p), "zero assignment cost must fail");
+}
+
+static void test_decode_activation_penalty() {
+    const int k = 8, n_exp = 8, n_ep = 4;
+    int32_t ids[k] = {0, 1, 2, 3, 4, 5, 6, 7};
+    uint64_t holders[n_exp];
+    for (int e = 0; e < n_exp; ++e) {
+        holders[e] = 0x1e; // all four remote endpoints, no master
+    }
+    const int64_t cost[n_ep] = {1000, 1000, 1000, 1000};
+    const int64_t penalty[n_ep] = {4000, 4000, 4000, 4000};
+    llama_ep_dealer_input in;
+    in.n_tokens = 1; in.k = k; in.n_endpoints = n_ep; in.m_star = 0;
+    in.ids = ids; in.holders = holders;
+    in.remote_assignment_cost = cost;
+    in.remote_activation_penalty = penalty;
+    llama_ep_dealer_plan p;
+    CHECK(llama_ep_dealer_plan_build(in, p), "activation-aware plan should succeed");
+    int fanout = 0;
+    for (const auto & ep : p.eps) {
+        fanout += !ep.slot.empty();
+    }
+    CHECK(fanout == 2, "activation penalty should reduce fanout to two, got %d", fanout);
+
+    const int64_t invalid[n_ep] = {-1, 0, 0, 0};
+    in.remote_activation_penalty = invalid;
+    CHECK(!llama_ep_dealer_plan_build(in, p), "negative activation penalty must fail");
+}
+
+static void test_repeat_expert_affinity() {
+    const int n_tokens = 2, k = 2, n_exp = 2, n_ep = 2;
+    int32_t ids[n_tokens * k] = {0, 1, 0, 1};
+    uint64_t holders[n_exp] = {0x6, 0x6};
+    const int64_t cost[n_ep] = {1000, 1000};
+    const int64_t repeat[n_ep] = {100, 100};
+    llama_ep_dealer_input in;
+    in.n_tokens = n_tokens; in.k = k; in.n_endpoints = n_ep; in.m_star = 0;
+    in.ids = ids; in.holders = holders;
+    in.remote_assignment_cost = cost;
+    in.remote_repeat_assignment_cost = repeat;
+    llama_ep_dealer_plan p;
+    CHECK(llama_ep_dealer_plan_build(in, p), "repeat-aware plan should succeed");
+    CHECK(p.owner[0] == p.owner[2] && p.owner[1] == p.owner[3],
+          "repeated experts should keep endpoint affinity, owners=%d/%d/%d/%d",
+          p.owner[0], p.owner[1], p.owner[2], p.owner[3]);
+
+    const int64_t invalid[n_ep] = {1001, 100};
+    in.remote_repeat_assignment_cost = invalid;
+    CHECK(!llama_ep_dealer_plan_build(in, p), "repeat cost above full cost must fail");
+}
+
+// Prefill uses the same repeat-aware greedy policy without the small-TG local
+// refinement pass. Rows of two hot experts should stay on their respective
+// replicas across a multi-token batch, halving duplicate weight streams while
+// preserving an even assignment count.
+static void test_prefill_repeat_affinity() {
+    const int n_tokens = 16, k = 2, n_exp = 2, n_ep = 2;
+    int32_t ids[n_tokens * k];
+    for (int t = 0; t < n_tokens; ++t) {
+        ids[t * k + 0] = 0;
+        ids[t * k + 1] = 1;
+    }
+    uint64_t holders[n_exp] = {0x6, 0x6};
+    const int64_t cost[n_ep] = {1000, 1000};
+    const int64_t repeat[n_ep] = {250, 250};
+    llama_ep_dealer_input in;
+    in.n_tokens = n_tokens; in.k = k; in.n_endpoints = n_ep; in.m_star = 0;
+    in.ids = ids; in.holders = holders;
+    in.remote_assignment_cost = cost;
+    in.remote_repeat_assignment_cost = repeat;
+    llama_ep_dealer_plan p;
+    CHECK(llama_ep_dealer_plan_build(in, p), "prefill repeat-aware plan should succeed");
+    CHECK(p.eps[0].slot.size() == n_tokens && p.eps[1].slot.size() == n_tokens,
+          "prefill affinity should retain even rows, got %zu/%zu",
+          p.eps[0].slot.size(), p.eps[1].slot.size());
+    for (int expert = 0; expert < n_exp; ++expert) {
+        int holders_used = 0;
+        for (int endpoint = 0; endpoint < n_ep; ++endpoint) {
+            bool found = false;
+            for (const int32_t assigned : p.eps[(size_t) endpoint].expert) {
+                found = found || assigned == expert;
+            }
+            holders_used += found;
+        }
+        CHECK(holders_used == 1, "prefill expert %d should use one replica, got %d", expert, holders_used);
+    }
+}
+
+static void test_decode_global_replica_refinement() {
+    const int n_tokens = 2, k = 6, n_exp = 225, n_ep = 4;
+    int32_t ids[n_tokens * k] = {
+        64, 182, 178, 110, 50, 34,
+        64, 182, 178, 170, 110, 224,
+    };
+    uint64_t holders[n_exp] = {};
+    holders[64]  = 0x1a; // endpoints 0, 2, 3
+    holders[182] = 0x0a; // endpoints 0, 2
+    holders[178] = 0x10; // endpoint 3
+    holders[110] = 0x14; // endpoints 1, 3
+    holders[50]  = 0x18; // endpoints 2, 3
+    holders[34]  = 0x10; // endpoint 3
+    holders[170] = 0x18; // endpoints 2, 3
+    holders[224] = 0x08; // endpoint 2
+    const int64_t cost[n_ep] = {1000, 1000, 1000, 1000};
+    const int64_t repeat[n_ep] = {250, 250, 250, 250};
+    llama_ep_dealer_input in;
+    in.n_tokens = n_tokens; in.k = k; in.n_endpoints = n_ep; in.m_star = 0;
+    in.ids = ids; in.holders = holders;
+    in.remote_assignment_cost = cost;
+    in.remote_repeat_assignment_cost = repeat;
+    llama_ep_dealer_plan p;
+    CHECK(llama_ep_dealer_plan_build(in, p), "global replica refinement plan should succeed");
+
+    int32_t counts[n_ep][n_exp] = {};
+    for (int pos = 0; pos < n_tokens * k; ++pos) {
+        const int endpoint = (int) p.owner[(size_t) pos] - 1;
+        CHECK(endpoint >= 0 && endpoint < n_ep, "pure EP slot must remain remote");
+        CHECK(holders[ids[pos]] & (2ull << endpoint), "refined owner must hold its expert");
+        ++counts[endpoint][ids[pos]];
+    }
+    int64_t critical = 0;
+    for (int endpoint = 0; endpoint < n_ep; ++endpoint) {
+        int64_t load = 0;
+        for (int expert = 0; expert < n_exp; ++expert) {
+            if (counts[endpoint][expert] > 0) {
+                load += cost[endpoint] + (counts[endpoint][expert] - 1) * repeat[endpoint];
+            }
+        }
+        if (load > critical) {
+            critical = load;
+        }
+    }
+    CHECK(critical == 3000, "refinement should reduce critical work to 3000, got %lld",
+          (long long) critical);
+}
+
+static void test_reusable_workspace_is_transparent() {
+    const int n_tokens = 2, k = 8, n_exp = 16, n_ep = 4;
+    int32_t ids[n_tokens * k] = {
+        0, 1, 2, 3, 4, 5, 6, 7,
+        0, 1, 8, 9, 10, 11, 12, 13,
+    };
+    uint64_t holders[n_exp];
+    for (int e = 0; e < n_exp; ++e) {
+        holders[e] = 0x1e;
+    }
+    const int64_t cost[n_ep] = {1000, 1000, 1000, 1000};
+    const int64_t repeat[n_ep] = {250, 250, 250, 250};
+
+    llama_ep_dealer_input in;
+    in.n_tokens = n_tokens; in.k = k; in.n_endpoints = n_ep; in.m_star = 0;
+    in.ids = ids; in.holders = holders;
+    in.remote_assignment_cost = cost;
+    in.remote_repeat_assignment_cost = repeat;
+
+    llama_ep_dealer_plan expected;
+    CHECK(llama_ep_dealer_plan_build(in, expected), "convenience plan should succeed");
+
+    llama_ep_dealer_plan plan;
+    llama_ep_dealer_workspace workspace;
+    CHECK(llama_ep_dealer_plan_build(in, plan, workspace), "workspace plan should succeed");
+    CHECK(plan.owner == expected.owner && plan.local_ids == expected.local_ids,
+          "workspace API must preserve owner/local plan");
+    for (int i = 0; i < n_ep; ++i) {
+        CHECK(plan.eps[(size_t) i].token == expected.eps[(size_t) i].token &&
+              plan.eps[(size_t) i].slot == expected.eps[(size_t) i].slot &&
+              plan.eps[(size_t) i].expert == expected.eps[(size_t) i].expert,
+              "workspace API endpoint %d differs", i);
+    }
+
+    const uint8_t * owner_data = plan.owner.data();
+    const int32_t * ep0_data = plan.eps[0].token.data();
+    const int64_t * load_data = workspace.load.data();
+    const int32_t * counts_data = workspace.counts.data();
+    for (int iteration = 0; iteration < 64; ++iteration) {
+        CHECK(llama_ep_dealer_plan_build(in, plan, workspace),
+              "workspace rebuild %d should succeed", iteration);
+        CHECK(plan.owner == expected.owner, "workspace rebuild %d changed owners", iteration);
+        CHECK(plan.owner.data() == owner_data && plan.eps[0].token.data() == ep0_data &&
+              workspace.load.data() == load_data && workspace.counts.data() == counts_data,
+              "workspace rebuild %d unexpectedly reallocated stable buffers", iteration);
+    }
+}
+
 int main() {
     test_full_replica_1ep();
     test_partitioned_2ep();
@@ -193,6 +552,19 @@ int main() {
     test_infeasible_local();
     test_determinism();
     test_invalid_endpoint_count();
+    test_pure_ep_4workers();
+    test_exact_shard_cover();
+    test_sparse_holder_cover();
+    test_pure_ep_overlap_balance();
+    test_replicated_tie_rotation();
+    test_batch_wide_replica_balance();
+    test_inflight_load_avoidance();
+    test_service_rate_weighting();
+    test_decode_activation_penalty();
+    test_decode_global_replica_refinement();
+    test_repeat_expert_affinity();
+    test_prefill_repeat_affinity();
+    test_reusable_workspace_is_transparent();
     if (failures == 0) {
         printf("ep-dealer-test: PASS (all cases)\n");
         return 0;

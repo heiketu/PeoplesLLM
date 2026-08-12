@@ -11,15 +11,18 @@
 // A perf mode (--perf) times legacy vec_dot vs repack gemv/gemm.
 
 #include "ggml.h"
+#include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "repack.h"
 #include "quants.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
 #include <chrono>
 #include <thread>
 #include <utility>
@@ -131,6 +134,124 @@ void free_repacked(repacked_weights & w) {
     w = repacked_weights();
 }
 
+std::vector<float> make_random_f32(int64_t n, uint32_t seed);
+
+bool make_expert_weights(
+        ggml_type type,
+        int nc,
+        int k,
+        int n_experts,
+        bool use_repack,
+        repacked_weights & out) {
+    const ggml_type_traits * traits = ggml_get_type_traits(type);
+    ggml_quantize_init(type);
+
+    const std::vector<float> plane = make_random_f32((int64_t) nc * k, 31415);
+    const size_t row_bytes = ggml_row_size(type, k);
+    const size_t plane_bytes = row_bytes * nc;
+    std::vector<char> raw_plane(plane_bytes);
+    if (traits->from_float_ref) {
+        for (int r = 0; r < nc; ++r) {
+            traits->from_float_ref(plane.data() + (size_t) r * k,
+                                   raw_plane.data() + row_bytes * r, k);
+        }
+    } else {
+        const std::vector<float> imatrix((size_t) k, 1.0f);
+        ggml_quantize_chunk(type, plane.data(), raw_plane.data(), 0, nc, k, imatrix.data());
+    }
+
+    out.raw.resize(plane_bytes * n_experts);
+    for (int expert = 0; expert < n_experts; ++expert) {
+        memcpy(out.raw.data() + (size_t) expert * plane_bytes, raw_plane.data(), plane_bytes);
+    }
+
+    struct ggml_init_params params = {1 * 1024 * 1024, nullptr, true};
+    out.ctx = ggml_init(params);
+    if (out.ctx == nullptr) {
+        return false;
+    }
+    out.tensor = ggml_new_tensor_3d(out.ctx, type, k, nc, n_experts);
+    out.nbytes = ggml_nbytes(out.tensor);
+    out.buffer = ggml_backend_buft_alloc_buffer(
+        use_repack ? ggml_backend_cpu_repack_buffer_type() : ggml_backend_cpu_buffer_type(), out.nbytes);
+    if (out.buffer == nullptr) {
+        return false;
+    }
+    ggml_backend_tensor_alloc(out.buffer, out.tensor, ggml_backend_buffer_get_base(out.buffer));
+    if (use_repack && out.tensor->extra == nullptr) {
+        free_repacked(out);
+        return false;
+    }
+    ggml_backend_tensor_set(out.tensor, out.raw.data(), 0, out.raw.size());
+    out.data = out.tensor->data;
+    return true;
+}
+
+// Build two expert tensors in one CPU_REPACK buffer, matching the EPD loader.
+// Besides being more realistic, this avoids measuring two independent buffer
+// mappings as if they were the gate/up pair of one worker.
+bool make_expert_weight_pair(
+        ggml_type type,
+        int nc,
+        int k,
+        int n_experts,
+        bool use_repack,
+        repacked_weights & out,
+        ggml_tensor *& second) {
+    const ggml_type_traits * traits = ggml_get_type_traits(type);
+    ggml_quantize_init(type);
+
+    const std::vector<float> plane = make_random_f32((int64_t) nc * k, 31415);
+    const size_t row_bytes = ggml_row_size(type, k);
+    const size_t plane_bytes = row_bytes * nc;
+    std::vector<char> raw_plane(plane_bytes);
+    if (traits->from_float_ref) {
+        for (int r = 0; r < nc; ++r) {
+            traits->from_float_ref(plane.data() + (size_t) r * k,
+                                   raw_plane.data() + row_bytes * r, k);
+        }
+    } else {
+        const std::vector<float> imatrix((size_t) k, 1.0f);
+        ggml_quantize_chunk(type, plane.data(), raw_plane.data(), 0, nc, k, imatrix.data());
+    }
+
+    out.raw.resize(plane_bytes * n_experts);
+    for (int expert = 0; expert < n_experts; ++expert) {
+        memcpy(out.raw.data() + (size_t) expert * plane_bytes, raw_plane.data(), plane_bytes);
+    }
+
+    const ggml_init_params params = {1 * 1024 * 1024, nullptr, true};
+    out.ctx = ggml_init(params);
+    if (out.ctx == nullptr) return false;
+    out.tensor = ggml_new_tensor_3d(out.ctx, type, k, nc, n_experts);
+    second = ggml_new_tensor_3d(out.ctx, type, k, nc, n_experts);
+    out.nbytes = ggml_nbytes(out.tensor);
+
+    ggml_backend_buffer_type_t buft = use_repack ?
+        ggml_backend_cpu_repack_buffer_type() : ggml_backend_cpu_buffer_type();
+    const size_t first_alloc = ggml_backend_buft_get_alloc_size(buft, out.tensor);
+    const size_t second_alloc = ggml_backend_buft_get_alloc_size(buft, second);
+    out.buffer = ggml_backend_buft_alloc_buffer(buft, first_alloc + second_alloc);
+    if (out.buffer == nullptr) {
+        free_repacked(out);
+        second = nullptr;
+        return false;
+    }
+
+    char * base = (char *) ggml_backend_buffer_get_base(out.buffer);
+    ggml_backend_tensor_alloc(out.buffer, out.tensor, base);
+    ggml_backend_tensor_alloc(out.buffer, second, base + first_alloc);
+    if (use_repack && (out.tensor->extra == nullptr || second->extra == nullptr)) {
+        free_repacked(out);
+        second = nullptr;
+        return false;
+    }
+    ggml_backend_tensor_set(out.tensor, out.raw.data(), 0, out.raw.size());
+    ggml_backend_tensor_set(second, out.raw.data(), 0, out.raw.size());
+    out.data = out.tensor->data;
+    return true;
+}
+
 std::vector<float> make_random_f32(int64_t n, uint32_t seed) {
     std::mt19937                    rng(seed);
     std::normal_distribution<float> dist(0.0f, 1.0f);
@@ -176,6 +297,10 @@ struct kernel_fns {
     void (*gemm)(int, float *, size_t, const void *, const void *, int, int);
     void (*gemm_generic)(int, float *, size_t, const void *, const void *, int, int);
     ggml_type    act_type = GGML_TYPE_Q8_K;
+    // Most repack kernels use the same activation format as the legacy
+    // vec_dot path. IQ4_XS is different: repack uses Q8_0 while legacy uses
+    // Q8_K, so only native-vs-generic is an apples-to-apples comparison.
+    bool         compare_legacy = true;
 };
 
 bool test_type(const kernel_fns & fn, int nc, int k, const std::vector<int> & gemm_nrs, bool verbose) {
@@ -205,13 +330,48 @@ bool test_type(const kernel_fns & fn, int nc, int k, const std::vector<int> & ge
         diff_stats st_ng, st_nl;
         for (int c = 0; c < nc; c++) {
             if (has_gen_gemv) diff_update(st_ng, s_nat[c], s_gen[c], tol);
-            float ref = 0.0f;
-            fn.vec_dot(k, &ref, 0, rw.raw.data() + row_bytes * c, 0, q8.data(), 0, 1);
-            diff_update(st_nl, s_nat[c], ref, tol);
+            if (fn.compare_legacy) {
+                float ref = 0.0f;
+                fn.vec_dot(k, &ref, 0, rw.raw.data() + row_bytes * c, 0, q8.data(), 0, 1);
+                diff_update(st_nl, s_nat[c], ref, tol);
+            }
         }
-        printf("  [%s] gemv nc=%-4d k=%-5d native-vs-generic: max_abs=%.3g max_rel=%.3g bad=%d | native-vs-legacy: max_abs=%.3g max_rel=%.3g bad=%d\n",
-               fn.name, nc, k, st_ng.max_abs, st_ng.max_rel, st_ng.n_bad, st_nl.max_abs, st_nl.max_rel, st_nl.n_bad);
-        ok = ok && (!has_gen_gemv || st_ng.n_bad == 0) && st_nl.n_bad == 0;
+        if (fn.compare_legacy && has_gen_gemv) {
+            printf("  [%s] gemv nc=%-4d k=%-5d native-vs-generic: max_abs=%.3g max_rel=%.3g bad=%d | native-vs-legacy: max_abs=%.3g max_rel=%.3g bad=%d\n",
+                   fn.name, nc, k, st_ng.max_abs, st_ng.max_rel, st_ng.n_bad, st_nl.max_abs, st_nl.max_rel, st_nl.n_bad);
+        } else if (fn.compare_legacy) {
+            printf("  [%s] gemv nc=%-4d k=%-5d native-vs-generic: SKIPPED (no separate generic kernel) | native-vs-legacy: max_abs=%.3g max_rel=%.3g bad=%d\n",
+                   fn.name, nc, k, st_nl.max_abs, st_nl.max_rel, st_nl.n_bad);
+        } else if (has_gen_gemv) {
+            printf("  [%s] gemv nc=%-4d k=%-5d native-vs-generic: max_abs=%.3g max_rel=%.3g bad=%d | native-vs-legacy: SKIPPED (different activation format)\n",
+                   fn.name, nc, k, st_ng.max_abs, st_ng.max_rel, st_ng.n_bad);
+        } else {
+            printf("  [%s] gemv nc=%-4d k=%-5d native-vs-generic: SKIPPED (no native override) | native-vs-legacy: SKIPPED (different activation format)\n",
+                   fn.name, nc, k);
+        }
+        ok = ok && (!has_gen_gemv || st_ng.n_bad == 0) && (!fn.compare_legacy || st_nl.n_bad == 0);
+    }
+
+    if (fn.type == GGML_TYPE_MXFP4) {
+        for (int nr = 2; nr <= 8; ++nr) {
+            const std::vector<float> x = make_random_f32((int64_t) nr * k, 780 + nr);
+            const size_t qrow_bytes = ggml_row_size(GGML_TYPE_Q8_0, k);
+            std::vector<char> q8(qrow_bytes * nr);
+            for (int r = 0; r < nr; ++r) {
+                quantize_row_q8_0(x.data() + (size_t) r * k, q8.data() + (size_t) r * qrow_bytes, k);
+            }
+            std::vector<float> batched((size_t) nr * nc, 0.0f);
+            std::vector<float> separate((size_t) nr * nc, 0.0f);
+            fn.gemv(k, batched.data(), nc, rw.data, q8.data(), nr, nc);
+            for (int r = 0; r < nr; ++r) {
+                fn.gemv(k, separate.data() + (size_t) r * nc, nc, rw.data,
+                        q8.data() + (size_t) r * qrow_bytes, 1, nc);
+            }
+            const bool exact = memcmp(batched.data(), separate.data(), batched.size() * sizeof(float)) == 0;
+            printf("  [MXFP4] gemv small rows nc=%-4d k=%-5d nr=%d batched-vs-separate: %s\n",
+                   nc, k, nr, exact ? "bit-exact" : "FAILED");
+            ok = ok && exact;
+        }
     }
 
     // ---- gemm: native vs generic vs legacy vec_dot ----
@@ -226,19 +386,35 @@ bool test_type(const kernel_fns & fn, int nc, int k, const std::vector<int> & ge
 
         diff_stats st_ng, st_nl;
         for (int r = 0; r < nr; r++) {
-            // legacy reference needs the plain block_q8_K layout for row r
-            std::vector<char> q8row = quantize_act_row(std::vector<float>(x.begin() + (size_t) r * k, x.begin() + (size_t) (r + 1) * k), k, fn.act_type);
+            // Legacy reference needs the plain activation layout for row r.
+            std::vector<char> q8row;
+            if (fn.compare_legacy) {
+                q8row = quantize_act_row(std::vector<float>(x.begin() + (size_t) r * k, x.begin() + (size_t) (r + 1) * k), k, fn.act_type);
+            }
             for (int c = 0; c < nc; c++) {
                 const double a = s_nat[(size_t) r * nc + c];
                 if (has_gen_gemm) diff_update(st_ng, a, s_gen[(size_t) r * nc + c], tol);
-                float ref = 0.0f;
-                fn.vec_dot(k, &ref, 0, rw.raw.data() + row_bytes * c, 0, q8row.data(), 0, 1);
-                diff_update(st_nl, a, ref, tol);
+                if (fn.compare_legacy) {
+                    float ref = 0.0f;
+                    fn.vec_dot(k, &ref, 0, rw.raw.data() + row_bytes * c, 0, q8row.data(), 0, 1);
+                    diff_update(st_nl, a, ref, tol);
+                }
             }
         }
-        printf("  [%s] gemm nc=%-4d k=%-5d nr=%-3d native-vs-generic: max_abs=%.3g max_rel=%.3g bad=%d | native-vs-legacy: max_abs=%.3g max_rel=%.3g bad=%d\n",
-               fn.name, nc, k, nr, st_ng.max_abs, st_ng.max_rel, st_ng.n_bad, st_nl.max_abs, st_nl.max_rel, st_nl.n_bad);
-        ok = ok && (!has_gen_gemm || st_ng.n_bad == 0) && st_nl.n_bad == 0;
+        if (fn.compare_legacy && has_gen_gemm) {
+            printf("  [%s] gemm nc=%-4d k=%-5d nr=%-3d native-vs-generic: max_abs=%.3g max_rel=%.3g bad=%d | native-vs-legacy: max_abs=%.3g max_rel=%.3g bad=%d\n",
+                   fn.name, nc, k, nr, st_ng.max_abs, st_ng.max_rel, st_ng.n_bad, st_nl.max_abs, st_nl.max_rel, st_nl.n_bad);
+        } else if (fn.compare_legacy) {
+            printf("  [%s] gemm nc=%-4d k=%-5d nr=%-3d native-vs-generic: SKIPPED (no separate generic kernel) | native-vs-legacy: max_abs=%.3g max_rel=%.3g bad=%d\n",
+                   fn.name, nc, k, nr, st_nl.max_abs, st_nl.max_rel, st_nl.n_bad);
+        } else if (has_gen_gemm) {
+            printf("  [%s] gemm nc=%-4d k=%-5d nr=%-3d native-vs-generic: max_abs=%.3g max_rel=%.3g bad=%d | native-vs-legacy: SKIPPED (different activation format)\n",
+                   fn.name, nc, k, nr, st_ng.max_abs, st_ng.max_rel, st_ng.n_bad);
+        } else {
+            printf("  [%s] gemm nc=%-4d k=%-5d nr=%-3d native-vs-generic: SKIPPED (no native override) | native-vs-legacy: SKIPPED (different activation format)\n",
+                   fn.name, nc, k, nr);
+        }
+        ok = ok && (!has_gen_gemm || st_ng.n_bad == 0) && (!fn.compare_legacy || st_nl.n_bad == 0);
     }
 
     GGML_UNUSED(verbose);
@@ -271,24 +447,54 @@ void perf_type(const kernel_fns & fn, int nc, int k, int nr, int nthreads, int n
         }
     }
 
-    // times total wall time per iteration (columns partitioned across threads)
+    // Times kernel wall time per iteration with columns partitioned across a
+    // persistent team. Thread creation occurs before the timed region.
     auto time_it = [&](const char * label, auto && body) {
-        body(slices[0].first, slices[0].second); // warmup
-        const auto t0 = std::chrono::steady_clock::now();
+        for (const auto & sl : slices) {
+            body(sl.first, sl.second);
+        }
+        std::chrono::steady_clock::time_point t0;
+        std::chrono::steady_clock::time_point t1;
         if ((int) slices.size() <= 1) {
+            t0 = std::chrono::steady_clock::now();
             for (int i = 0; i < n_iter; i++) body(0, nc);
+            t1 = std::chrono::steady_clock::now();
         } else {
+            std::atomic<int> ready{0};
+            std::atomic<bool> go{false};
             std::vector<std::thread> ths;
             ths.reserve(slices.size());
             for (const auto & sl : slices) {
-                ths.emplace_back([&, sl] { for (int i = 0; i < n_iter; i++) body(sl.first, sl.second); });
+                ths.emplace_back([&, sl] {
+                    ready.fetch_add(1, std::memory_order_release);
+                    while (!go.load(std::memory_order_acquire)) {
+                        std::this_thread::yield();
+                    }
+                    for (int i = 0; i < n_iter; i++) {
+                        body(sl.first, sl.second);
+                    }
+                });
             }
-            for (auto & th : ths) th.join();
+            while (ready.load(std::memory_order_acquire) != (int) slices.size()) {
+                std::this_thread::yield();
+            }
+            t0 = std::chrono::steady_clock::now();
+            go.store(true, std::memory_order_release);
+            for (auto & th : ths) {
+                th.join();
+            }
+            t1 = std::chrono::steady_clock::now();
         }
-        const auto t1 = std::chrono::steady_clock::now();
         const double us = std::chrono::duration<double, std::micro>(t1 - t0).count() / n_iter;
         printf("  [%s] %-28s %12.1f us\n", fn.name, label, us);
         return us;
+    };
+
+    auto report = [&](const char * label, double us, double matrix_reads) {
+        const double seconds = us / 1e6;
+        const double gbps = seconds > 0.0 ? matrix_reads * rw.nbytes / seconds / 1e9 : 0.0;
+        const double gops = seconds > 0.0 ? 2.0 * nc * (double) k * nr / seconds / 1e9 : 0.0;
+        printf("  [%s] %-28s %8.1f GB/s matrix  %8.1f GOP/s\n", fn.name, label, gbps, gops);
     };
 
     // legacy: nr rows x nc cols via per-row vec_dot (dot only, acts pre-quantized)
@@ -297,28 +503,399 @@ void perf_type(const kernel_fns & fn, int nc, int k, int nr, int nthreads, int n
         q8rows[r] = quantize_act_row(std::vector<float>(x.begin() + (size_t) r * k, x.begin() + (size_t) (r + 1) * k), k, fn.act_type);
     }
     std::vector<float> s((size_t) nr * nc);
-    const double t_legacy = time_it("legacy vec_dot (nr rows)", [&](int c0, int ncols) {
-        for (int r = 0; r < nr; r++) {
-            for (int c = c0; c < c0 + ncols; c++) {
-                fn.vec_dot(k, &s[(size_t) r * nc + c], 0, rw.raw.data() + row_bytes * c, 0, q8rows[r].data(), 0, 1);
+    double t_legacy = 0.0;
+    if (fn.compare_legacy) {
+        t_legacy = time_it("legacy vec_dot (nr rows)", [&](int c0, int ncols) {
+            for (int r = 0; r < nr; r++) {
+                for (int c = c0; c < c0 + ncols; c++) {
+                    fn.vec_dot(k, &s[(size_t) r * nc + c], 0, rw.raw.data() + row_bytes * c, 0, q8rows[r].data(), 0, 1);
+                }
             }
-        }
-    });
+        });
+        report("legacy useful rates", t_legacy, nr);
+    }
 
     if (nr == 1) {
         const double t = time_it("repack gemv", [&](int c0, int ncols) {
             fn.gemv(k, s.data() + c0, nc, (const char *) rw.data + row_bytes * c0, q8rows[0].data(), 1, ncols);
         });
-        printf("  [%s] speedup gemv vs legacy:      %.2fx\n", fn.name, t_legacy / t);
+        report("repack gemv useful rates", t, 1.0);
+        if (fn.compare_legacy) {
+            printf("  [%s] speedup gemv vs legacy:      %.2fx\n", fn.name, t_legacy / t);
+        }
+    } else if (fn.type == GGML_TYPE_MXFP4 && nr <= 8) {
+        const size_t qrow_bytes = ggml_row_size(GGML_TYPE_Q8_0, k);
+        std::vector<char> q8_plain(qrow_bytes * nr);
+        for (int r = 0; r < nr; ++r) {
+            memcpy(q8_plain.data() + (size_t) r * qrow_bytes, q8rows[r].data(), qrow_bytes);
+        }
+
+        const double t_separate = time_it("repack gemv separate rows", [&](int c0, int ncols) {
+            for (int r = 0; r < nr; ++r) {
+                fn.gemv(k, s.data() + (size_t) r * nc + c0, nc,
+                        (const char *) rw.data + row_bytes * c0,
+                        q8_plain.data() + (size_t) r * qrow_bytes, 1, ncols);
+            }
+        });
+        report("separate gemv useful rates", t_separate, nr);
+
+        const double t_shared = time_it("repack gemv shared weight", [&](int c0, int ncols) {
+            fn.gemv(k, s.data() + c0, nc, (const char *) rw.data + row_bytes * c0,
+                    q8_plain.data(), nr, ncols);
+        });
+        report("shared gemv useful rates", t_shared, 1.0);
+        printf("  [MXFP4] shared-weight speedup nr=%-3d: %.2fx\n", nr, t_separate / t_shared);
+        if (nr > 4) {
+            const double t_split4 = time_it("repack gemv shared chunks 4", [&](int c0, int ncols) {
+                for (int r = 0; r < nr; r += 4) {
+                    const int tr = std::min(4, nr - r);
+                    fn.gemv(k, s.data() + (size_t) r * nc + c0, nc,
+                            (const char *) rw.data + row_bytes * c0,
+                            q8_plain.data() + (size_t) r * qrow_bytes, tr, ncols);
+                }
+            });
+            report("shared chunks-4 rates", t_split4, (nr + 3) / 4);
+            printf("  [MXFP4] one-call vs chunks-4 nr=%-3d: %.2fx\n", nr, t_split4 / t_shared);
+        }
     } else {
         std::vector<char> q8 = quantize_acts_4x8(x, nr, k, fn.act_type);
         const double t = time_it(("repack gemm nr=" + std::to_string(nr)).c_str(), [&](int c0, int ncols) {
             fn.gemm(k, s.data() + c0, nc, (const char *) rw.data + row_bytes * c0, q8.data(), nr, ncols);
         });
-        printf("  [%s] speedup gemm nr=%-3d vs legacy: %.2fx\n", fn.name, nr, t_legacy / t);
+        report("repack gemm useful rates", t, 1.0);
+        if (fn.compare_legacy) {
+            printf("  [%s] speedup gemm nr=%-3d vs legacy: %.2fx\n", fn.name, nr, t_legacy / t);
+        }
     }
 
     free_repacked(rw);
+}
+
+bool perf_mul_mat_id(
+        const kernel_fns & fn,
+        int nc,
+        int k,
+        int n_experts,
+        int rows_per_expert,
+        int nthreads,
+        int n_iter,
+        bool use_repack,
+        int n_active_experts = 0,
+        bool rotate_experts = false,
+        const std::vector<int> * active_rows = nullptr) {
+    repacked_weights rw;
+    if (!make_expert_weights(fn.type, nc, k, n_experts, use_repack, rw)) {
+        fprintf(stderr, "[%s] failed to create %s expert tensor\n", fn.name, use_repack ? "repacked" : "generic");
+        return false;
+    }
+
+    const int n_active = n_active_experts > 0 ? n_active_experts : n_experts;
+    int n_tokens = n_active * rows_per_expert;
+    if (active_rows != nullptr) {
+        GGML_ASSERT((int) active_rows->size() == n_active);
+        n_tokens = 0;
+        for (int count : *active_rows) {
+            GGML_ASSERT(count > 0);
+            n_tokens += count;
+        }
+    }
+    ggml_tensor * hidden = ggml_new_tensor_3d(rw.ctx, GGML_TYPE_F32, k, 1, n_tokens);
+    ggml_tensor * ids = ggml_new_tensor_2d(rw.ctx, GGML_TYPE_I32, 1, n_tokens);
+    ggml_set_input(hidden);
+    ggml_set_input(ids);
+    ggml_tensor * result = ggml_mul_mat_id(rw.ctx, rw.tensor, hidden, ids);
+    ggml_cgraph * graph = ggml_new_graph(rw.ctx);
+    ggml_build_forward_expand(graph, result);
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    ggml_gallocr_t gallocr = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
+    if (backend == nullptr || gallocr == nullptr || !ggml_gallocr_alloc_graph(gallocr, graph)) {
+        fprintf(stderr, "[%s] failed to allocate MUL_MAT_ID graph\n", fn.name);
+        if (gallocr) ggml_gallocr_free(gallocr);
+        if (backend) ggml_backend_free(backend);
+        free_repacked(rw);
+        return false;
+    }
+
+    struct ggml_threadpool_params tpp = ggml_threadpool_params_default(nthreads);
+    ggml_threadpool_t threadpool = ggml_threadpool_new(&tpp);
+    if (threadpool == nullptr) {
+        fprintf(stderr, "[%s] failed to create threadpool\n", fn.name);
+        ggml_gallocr_free(gallocr);
+        ggml_backend_free(backend);
+        free_repacked(rw);
+        return false;
+    }
+    ggml_backend_cpu_set_n_threads(backend, nthreads);
+    ggml_backend_cpu_set_threadpool(backend, threadpool);
+
+    std::vector<float> hidden_data = make_random_f32((int64_t) n_tokens * k, 2718);
+    std::vector<int32_t> id_data((size_t) n_tokens);
+    auto fill_ids = [&](int iter) {
+        const int base = rotate_experts ? (iter * n_active) % n_experts : 0;
+        if (active_rows != nullptr) {
+            int token = 0;
+            for (int active = 0; active < n_active; ++active) {
+                for (int row = 0; row < (*active_rows)[(size_t) active]; ++row) {
+                    id_data[(size_t) token++] = (base + active) % n_experts;
+                }
+            }
+            GGML_ASSERT(token == n_tokens);
+        } else {
+            for (int token = 0; token < n_tokens; ++token) {
+                id_data[(size_t) token] = (base + token % n_active) % n_experts;
+            }
+        }
+    };
+    fill_ids(0);
+    ggml_backend_tensor_set(hidden, hidden_data.data(), 0, hidden_data.size() * sizeof(float));
+    ggml_backend_tensor_set(ids, id_data.data(), 0, id_data.size() * sizeof(int32_t));
+
+    if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "[%s] MUL_MAT_ID warmup failed\n", fn.name);
+        ggml_backend_free(backend);
+        ggml_threadpool_free(threadpool);
+        ggml_gallocr_free(gallocr);
+        free_repacked(rw);
+        return false;
+    }
+
+    double elapsed_ms = 0.0;
+    for (int iter = 0; iter < n_iter; ++iter) {
+        // Graph inputs may share the gallocr arena with dead intermediates.
+        // Real callers upload them for every request; do the same outside the
+        // timed region so repeated microbench iterations remain valid.
+        fill_ids(iter + 1);
+        ggml_backend_tensor_set(hidden, hidden_data.data(), 0, hidden_data.size() * sizeof(float));
+        ggml_backend_tensor_set(ids, id_data.data(), 0, id_data.size() * sizeof(int32_t));
+        const auto start = std::chrono::steady_clock::now();
+        if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "[%s] MUL_MAT_ID compute failed\n", fn.name);
+            ggml_backend_free(backend);
+            ggml_threadpool_free(threadpool);
+            ggml_gallocr_free(gallocr);
+            free_repacked(rw);
+            return false;
+        }
+        const auto end = std::chrono::steady_clock::now();
+        elapsed_ms += std::chrono::duration<double, std::milli>(end - start).count();
+    }
+    const double ms = elapsed_ms / n_iter;
+    const double seconds = ms / 1000.0;
+    const double useful_weight_bytes = (double) rw.nbytes * n_active / n_experts;
+    const double weight_gbps = seconds > 0.0 ? useful_weight_bytes / seconds / 1e9 : 0.0;
+    const double gops = seconds > 0.0 ?
+        2.0 * nc * (double) k * n_tokens / seconds / 1e9 : 0.0;
+    std::vector<float> checksum_data(std::min<int64_t>(result->ne[0], 16));
+    ggml_backend_tensor_get(result, checksum_data.data(), 0, checksum_data.size() * sizeof(float));
+    double checksum = 0.0;
+    for (float value : checksum_data) {
+        checksum += value;
+    }
+    printf("MMID_RESULT layout=%s type=%s nc=%d k=%d experts=%d active_experts=%d rotate=%d "
+           "rows_per_expert=%d tokens=%d threads=%d iterations=%d ms=%.3f weight_gbps=%.3f gops=%.3f checksum=%.9g\n",
+           use_repack ? "repack" : "generic", fn.name, nc, k, n_experts, n_active, rotate_experts ? 1 : 0,
+           rows_per_expert, n_tokens, nthreads,
+           n_iter, ms, weight_gbps, gops, checksum);
+
+    ggml_backend_free(backend);
+    ggml_threadpool_free(threadpool);
+    ggml_gallocr_free(gallocr);
+    free_repacked(rw);
+    return true;
+}
+
+bool test_mmid_prequantized_q8_k() {
+    // GLM-5.2 gate/up dimensions: the earlier small k=2048 probe missed
+    // stride/workspace errors that only appear at the real 6144-wide row.
+    constexpr int nc = 2048;
+    constexpr int k = 6144;
+    constexpr int n_experts = 2;
+    constexpr int n_tokens = 2;
+
+    repacked_weights rw;
+    ggml_tensor * second_weight = nullptr;
+    if (!make_expert_weight_pair(GGML_TYPE_IQ2_XS, nc, k, n_experts, true, rw, second_weight)) {
+        printf("[MMID shared Q8_K] SKIPPED: IQ2_XS repack unavailable\n");
+        return true;
+    }
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    constexpr int nthreads = 36;
+    ggml_threadpool_params tpp = ggml_threadpool_params_default(nthreads);
+    ggml_threadpool_t threadpool = ggml_threadpool_new(&tpp);
+    if (backend == nullptr || threadpool == nullptr) {
+        printf("[MMID shared Q8_K] FAILED: backend allocation\n");
+        if (threadpool) ggml_threadpool_free(threadpool);
+        if (backend) ggml_backend_free(backend);
+        free_repacked(rw);
+        return false;
+    }
+    ggml_backend_cpu_set_n_threads(backend, nthreads);
+    ggml_backend_cpu_set_threadpool(backend, threadpool);
+
+    const std::vector<float> hidden_data = make_random_f32((int64_t) n_tokens * k, 4242);
+    const int32_t id_data[n_tokens] = {0, 1};
+
+    // Compute the ordinary F32-input result in an independent allocation, then
+    // release it. This prevents the additional reference branch from changing
+    // the allocator layout of the shared-Q8 graph and masking aliasing bugs.
+    ggml_tensor * hidden_ref = ggml_new_tensor_3d(rw.ctx, GGML_TYPE_F32, k, 1, n_tokens);
+    ggml_tensor * ids_ref = ggml_new_tensor_2d(rw.ctx, GGML_TYPE_I32, 1, n_tokens);
+    ggml_set_input(hidden_ref);
+    ggml_set_input(ids_ref);
+    ggml_tensor * result_ref = ggml_mul_mat_id(rw.ctx, rw.tensor, hidden_ref, ids_ref);
+    ggml_cgraph * graph_ref = ggml_new_graph(rw.ctx);
+    ggml_build_forward_expand(graph_ref, result_ref);
+    ggml_gallocr_t alloc_ref = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
+    bool ok = alloc_ref != nullptr && ggml_gallocr_alloc_graph(alloc_ref, graph_ref);
+    std::vector<float> expected((size_t) nc * n_tokens);
+    if (ok) {
+        ggml_backend_tensor_set(hidden_ref, hidden_data.data(), 0, hidden_data.size() * sizeof(float));
+        ggml_backend_tensor_set(ids_ref, id_data, 0, sizeof(id_data));
+        ok = ggml_backend_graph_compute(backend, graph_ref) == GGML_STATUS_SUCCESS;
+    }
+    if (ok) {
+        ggml_backend_tensor_get(result_ref, expected.data(), 0, expected.size() * sizeof(float));
+    }
+    if (alloc_ref) ggml_gallocr_free(alloc_ref);
+
+    ggml_tensor * hidden = ggml_new_tensor_3d(rw.ctx, GGML_TYPE_F32, k, 1, n_tokens);
+    ggml_tensor * ids = ggml_new_tensor_2d(rw.ctx, GGML_TYPE_I32, 1, n_tokens);
+    ggml_set_input(hidden);
+    ggml_set_input(ids);
+    ggml_tensor * hidden_q8 = ggml_cast(rw.ctx, hidden, GGML_TYPE_Q8_K);
+    ggml_tensor * result_q8_a = ggml_mul_mat_id(rw.ctx, rw.tensor, hidden_q8, ids);
+    ggml_tensor * result_q8_b = ggml_mul_mat_id(rw.ctx, second_weight, hidden_q8, ids);
+    ggml_tensor * combined = ggml_add(rw.ctx, result_q8_a, result_q8_b);
+    ggml_cgraph * graph_q8 = ggml_new_graph(rw.ctx);
+    ggml_build_forward_expand(graph_q8, combined);
+    ggml_gallocr_t alloc_q8 = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
+    ok = ok && alloc_q8 != nullptr && ggml_gallocr_alloc_graph(alloc_q8, graph_q8);
+    std::vector<float> actual((size_t) nc * n_tokens);
+    if (ok) {
+        ggml_backend_tensor_set(hidden, hidden_data.data(), 0, hidden_data.size() * sizeof(float));
+        ggml_backend_tensor_set(ids, id_data, 0, sizeof(id_data));
+        ok = ggml_backend_graph_compute(backend, graph_q8) == GGML_STATUS_SUCCESS;
+    }
+    if (ok) {
+        ggml_backend_tensor_get(combined, actual.data(), 0, actual.size() * sizeof(float));
+        for (size_t i = 0; i < actual.size(); ++i) {
+            if (actual[i] != expected[i] + expected[i]) {
+                ok = false;
+                break;
+            }
+        }
+    }
+    if (alloc_q8) ggml_gallocr_free(alloc_q8);
+    printf("[MMID shared Q8_K] F32-internal-vs-prequantized: %s\n", ok ? "bit-exact" : "FAILED");
+
+    ggml_backend_free(backend);
+    ggml_threadpool_free(threadpool);
+    free_repacked(rw);
+    return ok;
+}
+
+bool perf_mul_mat_id_pair(
+        const kernel_fns & fn,
+        int nc,
+        int k,
+        int n_experts,
+        int rows_per_expert,
+        int nthreads,
+        int n_iter,
+        bool use_repack,
+        bool shared_q8) {
+    if (fn.act_type != GGML_TYPE_Q8_0 && fn.act_type != GGML_TYPE_Q8_K) {
+        fprintf(stderr, "[%s] unsupported shared activation type\n", fn.name);
+        return false;
+    }
+
+    repacked_weights gate;
+    ggml_tensor * up_tensor = nullptr;
+    if (!make_expert_weight_pair(fn.type, nc, k, n_experts, use_repack, gate, up_tensor)) {
+        fprintf(stderr, "[%s] failed to create paired expert tensors\n", fn.name);
+        free_repacked(gate);
+        return false;
+    }
+
+    const int n_tokens = n_experts * rows_per_expert;
+    ggml_tensor * hidden = ggml_new_tensor_3d(gate.ctx, GGML_TYPE_F32, k, 1, n_tokens);
+    ggml_tensor * ids = ggml_new_tensor_2d(gate.ctx, GGML_TYPE_I32, 1, n_tokens);
+    ggml_set_input(hidden);
+    ggml_set_input(ids);
+    ggml_tensor * input = shared_q8 ? ggml_cast(gate.ctx, hidden, fn.act_type) : hidden;
+    ggml_tensor * gate_out = ggml_mul_mat_id(gate.ctx, gate.tensor, input, ids);
+    ggml_tensor * up_out = ggml_mul_mat_id(gate.ctx, up_tensor, input, ids);
+    // Keep both projection results live through a common consumer, matching
+    // the gate/up -> SwiGLU lifetime in the EPD graph.
+    ggml_tensor * combined = ggml_add(gate.ctx, gate_out, up_out);
+    ggml_cgraph * graph = ggml_new_graph(gate.ctx);
+    ggml_build_forward_expand(graph, combined);
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    ggml_gallocr_t gallocr = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
+    if (backend == nullptr || gallocr == nullptr || !ggml_gallocr_alloc_graph(gallocr, graph)) {
+        fprintf(stderr, "[%s] failed to allocate paired MUL_MAT_ID graph\n", fn.name);
+        if (gallocr) ggml_gallocr_free(gallocr);
+        if (backend) ggml_backend_free(backend);
+        free_repacked(gate);
+        return false;
+    }
+
+    ggml_threadpool_params tpp = ggml_threadpool_params_default(nthreads);
+    ggml_threadpool_t threadpool = ggml_threadpool_new(&tpp);
+    if (threadpool == nullptr) {
+        fprintf(stderr, "[%s] failed to create paired benchmark threadpool\n", fn.name);
+        ggml_gallocr_free(gallocr);
+        ggml_backend_free(backend);
+        free_repacked(gate);
+        return false;
+    }
+    ggml_backend_cpu_set_n_threads(backend, nthreads);
+    ggml_backend_cpu_set_threadpool(backend, threadpool);
+
+    const std::vector<float> hidden_data = make_random_f32((int64_t) n_tokens * k, 2718);
+    std::vector<int32_t> id_data((size_t) n_tokens);
+    for (int token = 0; token < n_tokens; ++token) {
+        id_data[(size_t) token] = token % n_experts;
+    }
+    ggml_backend_tensor_set(hidden, hidden_data.data(), 0, hidden_data.size() * sizeof(float));
+    ggml_backend_tensor_set(ids, id_data.data(), 0, id_data.size() * sizeof(int32_t));
+
+    bool ok = ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
+    double elapsed_ms = 0.0;
+    for (int iter = 0; ok && iter < n_iter; ++iter) {
+        ggml_backend_tensor_set(hidden, hidden_data.data(), 0, hidden_data.size() * sizeof(float));
+        ggml_backend_tensor_set(ids, id_data.data(), 0, id_data.size() * sizeof(int32_t));
+        const auto start = std::chrono::steady_clock::now();
+        ok = ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
+        const auto end = std::chrono::steady_clock::now();
+        elapsed_ms += std::chrono::duration<double, std::milli>(end - start).count();
+    }
+    if (ok) {
+        const double ms = elapsed_ms / n_iter;
+        const double seconds = ms / 1000.0;
+        const double weight_gbps = (2.0 * gate.nbytes) / seconds / 1e9;
+        const double gops = 4.0 * nc * (double) k * n_tokens / seconds / 1e9;
+        std::vector<float> checksum_data(std::min<int64_t>(combined->ne[0], 16));
+        ggml_backend_tensor_get(combined, checksum_data.data(), 0, checksum_data.size() * sizeof(float));
+        double checksum = 0.0;
+        for (float value : checksum_data) checksum += value;
+        printf("MMID_PAIR_RESULT layout=%s quant=%s type=%s nc=%d k=%d experts=%d rows_per_expert=%d tokens=%d "
+               "threads=%d iterations=%d ms=%.3f weight_gbps=%.3f gops=%.3f checksum=%.9g\n",
+               use_repack ? "repack" : "generic", shared_q8 ? "shared" : "internal",
+               fn.name, nc, k, n_experts, rows_per_expert, n_tokens,
+               nthreads, n_iter, ms, weight_gbps, gops, checksum);
+    } else {
+        fprintf(stderr, "[%s] paired MUL_MAT_ID compute failed\n", fn.name);
+    }
+
+    ggml_backend_free(backend);
+    ggml_threadpool_free(threadpool);
+    ggml_gallocr_free(gallocr);
+    free_repacked(gate);
+    return ok;
 }
 
 // ---- mxfp4 unrepack (inverse transform) bit-exact tests and bandwidth bench ----
@@ -617,6 +1194,29 @@ void bench_unrepack(int nthreads, double gib) {
 } // namespace
 
 int main(int argc, char ** argv) {
+    if (argc > 1 && std::string(argv[1]) == "--q2-policy") {
+        const char * value = getenv("GGML_REPACK_Q2_K");
+        const bool expected = value ? atoi(value) != 0 : !ggml_cpu_has_avx512_vnni();
+        const bool actual = repack_supported(GGML_TYPE_Q2_K, 2048, 4096);
+        printf("Q2_POLICY avx512_vnni=%d expected_repack=%d actual_repack=%d\n",
+               ggml_cpu_has_avx512_vnni(), expected, actual);
+        return expected == actual ? 0 : 1;
+    }
+
+    if (argc > 1 && std::string(argv[1]) == "--iq4-xs-policy") {
+        const char * value = getenv("GGML_REPACK_IQ4_XS");
+        const bool expected = value && atoi(value) != 0;
+        const bool actual = repack_supported(GGML_TYPE_IQ4_XS, 6144, 2048);
+        printf("IQ4_XS_POLICY expected_repack=%d actual_repack=%d\n", expected, actual);
+        return expected == actual ? 0 : 1;
+    }
+
+#if defined(_WIN32)
+    _putenv_s("GGML_REPACK_Q2_K", "1");
+#else
+    setenv("GGML_REPACK_Q2_K", "1", 1);
+#endif
+
     const bool perf = argc > 1 && std::string(argv[1]) == "--perf";
 
     if (argc > 1 && std::string(argv[1]) == "--unrepack-bench") {
@@ -649,12 +1249,215 @@ int main(int argc, char ** argv) {
           ggml_gemm_q6_K_8x8_q8_K, ggml_gemm_q6_K_8x8_q8_K_generic },
         { GGML_TYPE_IQ4_NL, "IQ4_NL", ggml_vec_dot_iq4_nl_q8_0, ggml_gemv_iq4_nl_8x8_q8_0, ggml_gemv_iq4_nl_8x8_q8_0_generic,
           ggml_gemm_iq4_nl_8x8_q8_0, ggml_gemm_iq4_nl_8x8_q8_0_generic, GGML_TYPE_Q8_0 },
+        // IQ4_XS currently has only the arch-neutral LUT repack kernels. Its
+        // legacy path also uses Q8_K rather than Q8_0, so neither comparison
+        // is numerically equivalent; graph-level tests cover this type.
+        { GGML_TYPE_IQ4_XS, "IQ4_XS", ggml_vec_dot_iq4_xs_q8_K, ggml_gemv_iq4_xs_8x8_q8_0, nullptr,
+          ggml_gemm_iq4_xs_8x8_q8_0, nullptr, GGML_TYPE_Q8_0, false },
         { GGML_TYPE_MXFP4, "MXFP4", ggml_vec_dot_mxfp4_q8_0, ggml_gemv_mxfp4_8x8_q8_0, ggml_gemv_mxfp4_8x8_q8_0_generic,
           ggml_gemm_mxfp4_8x8_q8_0, ggml_gemm_mxfp4_8x8_q8_0_generic, GGML_TYPE_Q8_0 },
         // Q8_0 has no generic 8x8 kernels; native-vs-generic checks are skipped for it
         { GGML_TYPE_Q8_0, "Q8_0", ggml_vec_dot_q8_0_q8_0, ggml_gemv_q8_0_8x8_q8_0, nullptr,
           ggml_gemm_q8_0_8x8_q8_0, nullptr, GGML_TYPE_Q8_0 },
     };
+
+    if (argc > 1 && std::string(argv[1]) == "--mmid-perf") {
+        if (argc < 8) {
+            fprintf(stderr, "usage: %s --mmid-perf NC K EXPERTS ROWS_PER_EXPERT THREADS TYPE [ITERS] [repack|generic]\n", argv[0]);
+            return 1;
+        }
+        const int nc = atoi(argv[2]);
+        const int k = atoi(argv[3]);
+        const int n_experts = atoi(argv[4]);
+        const int rows_per_expert = atoi(argv[5]);
+        const int nthreads = atoi(argv[6]);
+        const std::string only = argv[7];
+        const int n_iter = argc > 8 ? atoi(argv[8]) : 5;
+        const std::string layout = argc > 9 ? argv[9] : "repack";
+        if (layout != "repack" && layout != "generic") {
+            fprintf(stderr, "MMID layout must be repack or generic\n");
+            return 1;
+        }
+        if (nc < 8 || nc % 8 != 0 || k < 1 || n_experts < 1 || rows_per_expert < 1 ||
+            nthreads < 1 || n_iter < 1) {
+            fprintf(stderr, "invalid MMID benchmark dimensions\n");
+            return 1;
+        }
+        for (const auto & fn : types) {
+            if (only == fn.name) {
+                return perf_mul_mat_id(fn, nc, k, n_experts, rows_per_expert, nthreads, n_iter, layout == "repack") ? 0 : 1;
+            }
+        }
+        fprintf(stderr, "unknown repack type '%s'\n", only.c_str());
+        return 1;
+    }
+
+    if (argc > 1 && std::string(argv[1]) == "--mmid-routed-perf") {
+        if (argc < 9) {
+            fprintf(stderr, "usage: %s --mmid-routed-perf NC K EXPERTS ACTIVE_EXPERTS ROWS_PER_EXPERT THREADS TYPE [ITERS] [repack|generic]\n", argv[0]);
+            return 1;
+        }
+        const int nc = atoi(argv[2]);
+        const int k = atoi(argv[3]);
+        const int n_experts = atoi(argv[4]);
+        const int n_active_experts = atoi(argv[5]);
+        const int rows_per_expert = atoi(argv[6]);
+        const int nthreads = atoi(argv[7]);
+        const std::string only = argv[8];
+        const int n_iter = argc > 9 ? atoi(argv[9]) : 64;
+        const std::string layout = argc > 10 ? argv[10] : "repack";
+        if (layout != "repack" && layout != "generic") {
+            fprintf(stderr, "MMID layout must be repack or generic\n");
+            return 1;
+        }
+        if (nc < 8 || nc % 8 != 0 || k < 1 || n_experts < 1 || n_active_experts < 1 ||
+                n_active_experts > n_experts || rows_per_expert < 1 || nthreads < 1 || n_iter < 1) {
+            fprintf(stderr, "invalid routed MMID benchmark dimensions\n");
+            return 1;
+        }
+        for (const auto & fn : types) {
+            if (only == fn.name) {
+                return perf_mul_mat_id(fn, nc, k, n_experts, rows_per_expert, nthreads, n_iter,
+                                       layout == "repack", n_active_experts, true) ? 0 : 1;
+            }
+        }
+        fprintf(stderr, "unknown repack type '%s'\n", only.c_str());
+        return 1;
+    }
+
+    if (argc > 1 && std::string(argv[1]) == "--mmid-skew-perf") {
+        if (argc < 9) {
+            fprintf(stderr, "usage: %s --mmid-skew-perf NC K EXPERTS COUNTS THREADS TYPE ITERS [repack|generic]\n", argv[0]);
+            return 1;
+        }
+        const int nc = atoi(argv[2]);
+        const int k = atoi(argv[3]);
+        const int n_experts = atoi(argv[4]);
+        std::vector<int> active_rows;
+        {
+            const std::string spec = argv[5];
+            size_t off = 0;
+            while (off <= spec.size()) {
+                const size_t comma = spec.find(',', off);
+                const std::string item = spec.substr(off, comma == std::string::npos ? comma : comma - off);
+                const int count = atoi(item.c_str());
+                if (count < 1 || count > 4) {
+                    fprintf(stderr, "COUNTS entries must be in [1, 4]\n");
+                    return 1;
+                }
+                active_rows.push_back(count);
+                if (comma == std::string::npos) break;
+                off = comma + 1;
+            }
+        }
+        const int nthreads = atoi(argv[6]);
+        const std::string only = argv[7];
+        const int n_iter = atoi(argv[8]);
+        const std::string layout = argc > 9 ? argv[9] : "repack";
+        if ((layout != "repack" && layout != "generic") || nc < 8 || nc % 8 != 0 || k < 1 ||
+                n_experts < 1 || active_rows.empty() || (int) active_rows.size() > n_experts ||
+                nthreads < 1 || n_iter < 1) {
+            fprintf(stderr, "invalid skewed MMID benchmark arguments\n");
+            return 1;
+        }
+        for (const auto & fn : types) {
+            if (only == fn.name) {
+                return perf_mul_mat_id(fn, nc, k, n_experts, 1, nthreads, n_iter,
+                                       layout == "repack", (int) active_rows.size(), true, &active_rows) ? 0 : 1;
+            }
+        }
+        fprintf(stderr, "unknown repack type '%s'\n", only.c_str());
+        return 1;
+    }
+
+    if (argc > 1 && std::string(argv[1]) == "--mmid-pair-perf") {
+        if (argc < 10) {
+            fprintf(stderr, "usage: %s --mmid-pair-perf NC K EXPERTS ROWS_PER_EXPERT THREADS TYPE ITERS shared|internal|generic\n", argv[0]);
+            return 1;
+        }
+        const int nc = atoi(argv[2]);
+        const int k = atoi(argv[3]);
+        const int n_experts = atoi(argv[4]);
+        const int rows_per_expert = atoi(argv[5]);
+        const int nthreads = atoi(argv[6]);
+        const std::string only = argv[7];
+        const int n_iter = atoi(argv[8]);
+        const std::string quant = argv[9];
+        if (quant != "shared" && quant != "internal" && quant != "generic") {
+            fprintf(stderr, "paired MMID mode must be shared, internal, or generic\n");
+            return 1;
+        }
+        if (nc < 8 || nc % 8 != 0 || k < 1 || n_experts < 1 || rows_per_expert < 1 ||
+                nthreads < 1 || n_iter < 1) {
+            fprintf(stderr, "invalid paired MMID benchmark dimensions\n");
+            return 1;
+        }
+        for (const auto & fn : types) {
+            if (only == fn.name) {
+                return perf_mul_mat_id_pair(fn, nc, k, n_experts, rows_per_expert, nthreads, n_iter,
+                                            quant != "generic", quant == "shared") ? 0 : 1;
+            }
+        }
+        fprintf(stderr, "unknown repack type '%s'\n", only.c_str());
+        return 1;
+    }
+
+    if (argc > 1 && std::string(argv[1]) == "--perf-shape") {
+        if (argc < 5) {
+            fprintf(stderr, "usage: %s --perf-shape NC K THREADS [TYPE] [NR[,NR...]]\n", argv[0]);
+            return 1;
+        }
+        const int nc = atoi(argv[2]);
+        const int k = atoi(argv[3]);
+        const int nthreads = atoi(argv[4]);
+        const std::string only = argc > 5 ? argv[5] : "";
+        std::vector<int> nrs = {1, 4, 8, 16, 32};
+        if (argc > 6) {
+            nrs.clear();
+            const std::string spec = argv[6];
+            size_t off = 0;
+            while (off <= spec.size()) {
+                const size_t comma = spec.find(',', off);
+                const std::string item = spec.substr(off, comma == std::string::npos ? comma : comma - off);
+                const int nr = atoi(item.c_str());
+                if (nr != 1 && (nr < 4 || nr % 4 != 0)) {
+                    fprintf(stderr, "NR must be 1 or a positive multiple of 4\n");
+                    return 1;
+                }
+                nrs.push_back(nr);
+                if (comma == std::string::npos) {
+                    break;
+                }
+                off = comma + 1;
+            }
+        }
+        if (nc < 8 || nc % 8 != 0 || k < 1 || nthreads < 1 || nrs.empty()) {
+            fprintf(stderr, "NC must be a positive multiple of 8; K, THREADS, and NR must be positive\n");
+            return 1;
+        }
+        printf("== shape nc=%d k=%d threads=%d ==\n", nc, k, nthreads);
+        bool matched = false;
+        for (const auto & fn : types) {
+            if (!only.empty() && only != fn.name) {
+                continue;
+            }
+            matched = true;
+            if (!repack_supported(fn.type, nc, k)) {
+                printf("  [%s] SKIPPED: no CPU_REPACK kernel for this build\n", fn.name);
+                continue;
+            }
+            for (const int nr : nrs) {
+                const int64_t dots = (int64_t) nc * nr;
+                const int n_iter = dots > 200000 ? 4 : (dots > 50000 ? 8 : 20);
+                perf_type(fn, nc, k, nr, nthreads, n_iter);
+            }
+        }
+        if (!matched) {
+            fprintf(stderr, "unknown repack type '%s'\n", only.c_str());
+            return 1;
+        }
+        return 0;
+    }
 
     if (perf) {
         const int nthreads = argc > 2 ? atoi(argv[2]) : 1;
@@ -703,6 +1506,8 @@ int main(int argc, char ** argv) {
             ok &= test_type(fn, 64, 1024, { 8 }, false);
         }
     }
+
+    ok &= test_mmid_prequantized_q8_k();
 
     printf("[MXFP4] unrepack (inverse transform) bit-exact roundtrips\n");
     ok &= test_unrepack_layout(8, 128, 512, false);   // k=4096 gate/up row
