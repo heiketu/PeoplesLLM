@@ -1313,7 +1313,10 @@ static bool remote_ep_sched_negotiate(remote_ep_state & st) {
     bool ok = true;
     std::string err;
     for (auto & ep : st.sched_eps) {
-        if (!remote_ep_sched_ep_connect(ep, err) || !remote_ep_sched_ep_cap(ep, err)) {
+        // startup races with worker (re)starts — the port may answer a probe
+        // before the worker is ready, or a worker may briefly be down. Use the
+        // same grace period as runtime reconnects instead of aborting.
+        if (!remote_ep_sched_ep_connect_with_grace(ep, err) || !remote_ep_sched_ep_cap(ep, err)) {
             if (st.sched_klocal == 0) {
                 LLAMA_LOG_ERROR("%s: pure EP endpoint %s:%d: %s; no local expert fallback exists\n",
                         __func__, ep.host.c_str(), ep.port, err.c_str());
