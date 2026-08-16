@@ -127,3 +127,7 @@ PP 极限档把 `-b/-ub` 提到 2048 时，热态约 318.08 tok/s，相对同组
 默认。历史 F16 `1M×2` 的 35.526 tok/s、并发总计 42.998 tok/s继续作为对照。
 
 > 所有数字均为实测，口径与复现方式见 `docs/CHANGES.md` 与 `docs/benchmarks/`（绘图脚本同目录）。已实测否决的路线（full tensor split -44%、meta-backend TP -20%、跨 tile 双 scheduler）也记录在案。
+
+## 上游合并回归（2026-08-17，merge 4df29be4f / 96 提交）
+
+同机同口径（DSV4-Flash mxfp4，-ngl 99 -ncmoe 99 -t 72 NUMA_EP+HIER_BARRIER+PREFETCH，--load-mode none，-b 4096 -ub 1024）：合并后 tg512 **24.24±0.14**（合并前 24.4-25.0，持平）；pp2048 **282.99±4.39**（合并前 ≈299，**-5.4%**，差异来自上游图/调度改动，本分支路径未动）。AVX2-only 构建（build-avx2）纯 CPU 烟测通过：pp512 73.22 / tg128 6.63。
