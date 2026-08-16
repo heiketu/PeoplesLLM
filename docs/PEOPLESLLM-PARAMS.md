@@ -1,3 +1,5 @@
+> **本文档已由 [PARAMETERS.md](PARAMETERS.md) 取代**（按场景重组、修正过时默认值）。保留此文件仅作历史参考。
+
 # PeoplesLLM 参数手册（local 分支相对 vendor 主线的新增可调参数）
 
 > 适用范围：`llama-src` 仓库 `local` 分支（基线 `vendor`）。本文档由 `git diff vendor..local` 全量盘点生成，

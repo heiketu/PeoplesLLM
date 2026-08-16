@@ -89,7 +89,7 @@ int main(int argc, char ** argv) {
 
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = n_gpu;
-    mparams.use_mmap     = false;
+    mparams.load_mode    = LLAMA_LOAD_MODE_NONE;
 
     // --ncmoe N: keep the routed experts of the first N layers on CPU, same
     // override list -ncmoe builds in common/arg.cpp (terminated entry at end)

@@ -56,116 +56,32 @@ Test platform: dual Xeon 8360Y (Ice Lake, 152 threads, 251G RAM) + 2× RTX 3090 
 
 DeepSeek-V4 / DSV4-Flash (incl. native MXFP4), GLM-5.2 (DSA), MiniMax-M3; plus a byte-level GGUF repair toolchain (quant-block corruption scan + patch — fixed 138 corrupted blocks in the official GLM-5.2 file that caused garbled output).
 
-## Latest progress (2026-08-06–11)
+## Quick start
 
-- **Completed AVX512 EPD path:** fixed a zero-byte CPU_REPACK trait probe that silently left real-model tensors on raw kernels; compatible separate gate/up tensors now fuse at load time, raw mmap pages are reclaimed immediately after each tensor conversion, and thread autotuning measures each worker's actual compact assignment shape. In a controlled GLM-5.2 layer-3/64-expert A/B, warm REQ2 PP128 fell from 33.14–36.73 ms to 31.53–31.60 ms and TG from 0.505–0.595 ms to 0.460–0.477 ms, with identical output. These figures cover CPU MoE worker compute only, excluding GPU dense/attention.
-- **Dynamic feedback for heterogeneous workers:** the hot-replica dealer no longer assumes all four NUMA workers run at the same rate. It learns idle-queue TG and PP service times independently and schedules against in-flight virtual work. Pure policy, overflow, and dealer regressions pass; this change is not included in the 40.59 tok/s result below and awaits a quiet-window four-worker rerun.
-- **True four-NUMA, single-slot EP (GLM-5.2):** one worker per NUMA node on both master and slave; with `KLOCAL=0`, the master carries no routed-expert weights. Compact ragged execution, tiered PP graph caching, and 76 hot replicas selected from a real PP profile lift PP512 from 24.13 tok/s on 2 NUMA workers to 40.59 on 4 (+68.2%, latency -40.6%), with byte-identical 128-token output.
-- **raw-SWA decode ring on by default** (branch fa-decode-fix): q1 decode graph width decoupled from prompt length — fixed TG64 8.894→11.837/12.085 tok/s (+33~36%), TG512 +4~8%; automatic fallback to full-width semantics in multi-slot scenarios.
-- **q8 compact sparse FA on by default**: with q8_0 KV, q1 decode materializes only top-k selected rows — TG64 9.75→10.69 (+10%), TG512 +1.3%, now the fastest q1 decode path (beats f16 dense); f16 fused sparse stays opt-in (16K measured -12%, to be re-evaluated at longer context).
-- **Multi-stream (small-q) sparse FA** (opt-in, `LLAMA_DSV4_FUSED_INDEXED_FA=3/4`, `LLAMA_DSV4_Q8_SPARSE_FA=2`): sparse extension for multi-slot concurrent decode, verified three-way byte-identical; performance parity at ≤16K (weight-bandwidth bound), payoff targeted at 256K+ context.
-- **GPU streaming prefill** (plan A, server integration): full-tile path PP 63→127.6 tok/s (2×) on long prompts; automatic fallback to chunked via an eligibility gate under compact ring SWA cache, `--swa-full` to enable; fingerprints bit-exact across all four test groups.
-- **IQ2_XXS AVX512 kernel**: gemv micro-bench **17×**; full-model A/B flat (3.78→3.71, bottleneck is the uncovered expert mul_mat_id) — a micro-benchmark win with model-level extension still pending.
+```bash
+# CUDA build (single-machine hybrid inference)
+cmake -B build-cuda -DGGML_CUDA=ON && cmake --build build-cuda -j
 
-## Benchmarks
+# Production recipe: DSV4-Flash mxfp4, dual-socket NUMA EP + GPU offload
+GGML_NUMA_EP=1 GGML_NUMA_HIER_BARRIER=1 GGML_REPACK_GEMV_PREFETCH=1 \
+  build-cuda/bin/llama-server -m model.gguf -ngl 99 -ncmoe 99 -t 72 \
+  --numa distribute -fa 1 -b 4096 -ub 1024
+```
 
-### vs upstream llama.cpp (same machine, same methodology A/B)
-
-DeepSeek-V4 284B (Q3_K), 14 expert layers on GPU, 72 threads:
-
-![DSV4 vs upstream](docs/benchmarks/dsv4_vs_upstream.png)
-
-Both row-window EP and mirror beat upstream: **PP 2.1-2.2×, TG +9%**; row-window EP additionally halves expert memory. For PP-first or single-socket scenarios the isolate config reaches pp512 370 tok/s.
-
-### Full-range re-measurement vs upstream (2026-08-07, DSV4-Flash 284B mxfp4, production shape)
-
-![vs mainline 2026-08-07](docs/benchmarks/vs_mainline_20260807.png)
-
-Upstream `e9fa0781f` vs this branch (incl. Q2_K/mxfp4 VNNI dpbusd conversion), same-machine same-methodology llama-bench A/B. **GPU offload (-ngl 99 -ncmoe 99 EP, production shape): PP +40~59% across the board (pp2048 265.1 vs 166.5, pp8192 257.7 vs 164.5, pp16384 227.5 vs 163.1), TG +20% (23.3 vs 19.5)**. Pure CPU (-ngl 0): PP +48% (135.1 vs 91.3); TG is a known regression (3.7 vs 8.1, -54%, unrelated to EP, root-cause isolation in progress — production is GPU-offload and unaffected). Q2_K repack after dpbusd conversion improved end-to-end PP 164→218 (+33%) but still trails --no-repack (244), so Q2_K keeps the `--no-repack` recommendation.
-
-### GLM-5.2 745B: IQ traits + gemm dispatch
-
-![GLM traits](docs/benchmarks/glm_traits.png)
-
-### CPU kernels: 8×8 repack vs upstream legacy vec_dot
-
-![CPU kernel speedup](docs/benchmarks/cpu_kernel_speedup.png)
-
-gemv (decode) ≈1× is the physical memory-bandwidth ceiling; the prefill gemm gains come from amortizing weight-read bandwidth via 8×8 repacking. Full 300-cell dataset reproducible via `tests/test-repack-kernels --perf`.
-
-### NUMA locality: why EP/mirror structurally beat upstream distribute
-
-![NUMA locality](docs/benchmarks/numa_locality.png)
-
-Upstream `--numa distribute` interleaves weight pages across both sockets, so ~50% of every weight read crosses UPI; measured cross-socket read bandwidth is only ~38% of local (53.7-54.6 vs 136-143 GB/s, membw2, 76 threads/socket). Row-window EP and mirror achieve ~100% local reads structurally: 279.2 GB/s combined effective bandwidth vs 177.6 GB/s for the upstream interleave pattern — **+57%**. Full bandwidth matrix in `docs/CHANGES.md`.
-
-### Pure-CPU inference (-ngl 0, same-machine A/B)
-
-![Pure CPU vs upstream](docs/benchmarks/pure_cpu_vs_upstream.png)
-
-DSV4 284B Q3_K on pure CPU (72 threads, interleave): **PP +38%, TG +17-18%**. Re-measured 2026-08-05 under loaded environment; to be finalized in a quiet window.
-
-### Multi-slot concurrency & hybrid re-measurement (2026-08-05)
-
-![Multi-slot concurrency](docs/benchmarks/multislot_concurrency.png)
-
-llama-server 8-slot concurrency (512 tok each): **the EP (row-window) config leads upstream at every concurrency level — +22% at 1 slot, +18% at 8 slots (74.5 vs 63.2 tok/s)**. Mirror remains a compatibility option; at 8 slots it trails upstream by 7% (per-token weight traffic is amortized at high concurrency, devaluing its structural bandwidth advantage) — use `GGML_NUMA_EP=1` for production multi-user serving. Hybrid config (14 expert layers on 2 GPUs), same-methodology llama-bench: EP pp512 **227.8 vs upstream 158.4 (+44%)**, tg512 31.3 vs 29.1 (+7.5%); mirror pp512 200.2 (+26%).
-
-### Long context: layer-major prefill (DSV4-Flash, 16K)
-
-![16K PP progression](docs/benchmarks/longctx_pp_progression.png)
-
-![MXFP4 Hybrid CPU audit & dual-GPU EP](docs/benchmarks/mxfp4_hybrid_cpu_audit.png)
-
-The native MXFP4 build (155GB; 137GiB experts as a single CPU_REPACK copy on dual-socket NUMA EP) gained +144% on 4K PP after a three-part CPU audit.
-
-### Long-context decode (16K, fixed-workload A/B)
-
-![16K TG improvements](docs/benchmarks/longctx_tg_improvements.png)
-
-Long-context TG degradation was root-caused to the physical dense scan of GPU attention/KV and is being fixed item by item (the raw-SWA ring went default-on on 08-06 — see next section). 16K GPU-side breakdown (Nsight):
-
-![16K hotspot breakdown](docs/benchmarks/longctx_hotspots.png)
-
-### FA decode structural fixes: TG64 progression (2026-08-06/07)
-
-![FA decode TG64 progression / 累积演进](docs/benchmarks/fa_decode_tg64_progression.png)
-
-Left: F16 KV — the default-on raw-SWA decode ring lifts fixed TG64 from 8.894 to 12.085 tok/s (+36%), with automatic multi-slot fallback. Right: q8_0 KV — compact sparse FA materializes only top-k selected rows, 9.75→10.69 (+9.6%), overtaking f16 dense (9.66) as the fastest q1 decode path. Multi-stream sparse FA (opt-in) is at parity up to 16K; its payoff is targeted at 256K+ context.
-
-### Two-machine expert-parallel (GLM-5.2, 100G RoCEv2 direct link)
-
-![Two-machine EP](docs/benchmarks/dual_machine_ep.png)
-
-Latest true single-slot EP measurements (2026-08-10; GLM-5.2 UD-Q2_K_MXFP4; MoE layers 3–77; dense/attention on two RTX 3090s, CPU runs routed experts only):
-
-| Comparison | 2 NUMA workers, one machine | 4 NUMA workers, two machines | 4 / 2 |
-|---|---:|---:|---:|
-| Decode MoE-stage time (75 layers total, prompt cost removed) | 86.71 ms/token | 69.58 ms/token | **1.246×** |
-| PP512 (b512/ub256, three-run mean, same code) | 24.13 tok/s (21.22s) | **40.59 tok/s (12.62s)** | **1.682×** |
-
-The PP map is generated from that workload's `layer,expert,count` profile: each path keeps 64 primary experts plus 16–23 hot replicas (80–87 of 256 total), while the online dealer selects the least-loaded holder per token. Mean per-layer critical load versus ideal fell from 1.374× to 1.091×. Worker RSS is about 71–78GiB per NUMA node with no swap. Both the decode-MoE and PP paths passed a byte-identical 128-token reference check.
-
-### Production server: DSV4-Flash, 8 slots × 1M context
-
-![Flash PP/TG curve](docs/benchmarks/flash_pp_tg_curve.png)
-
-8 slots sharing 1M context (128K each); PP peaks at 511 tok/s (ubatch 1024-4096); TG stays flat at 20-25 tok/s across all input lengths.
-
-> All numbers are measured; methodology and reproduction in `docs/CHANGES.md` and `docs/benchmarks/` (plot scripts included). Rejected routes (full tensor split -44%, meta-backend TP -20%, cross-tile dual scheduler) are also documented.
+Two-machine EP, pure-CPU and AVX2-only builds, and full deployment details: **[docs/QUICKSTART.md](docs/QUICKSTART.md)** (Chinese).
 
 ## Docs
 
-- **[docs/CHANGES.md](docs/CHANGES.md)** — full changelog (NUMA architecture, CPU kernel format matrix, fused ops, distributed EP; Chinese)
-- **[docs/PEOPLESLLM-PARAMS.md](docs/PEOPLESLLM-PARAMS.md)** — all env/CLI parameters and production recipes
-- **[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)** — build, test and branch conventions
-- **[docs/LONG-CONTEXT-1M.md](docs/LONG-CONTEXT-1M.md)** — 1M-context memory/VRAM budget and acceptance gates
+- **[docs/QUICKSTART.md](docs/QUICKSTART.md)** — build, recommended single-/dual-machine configs, common pitfalls
+- **[docs/PARAMETERS.md](docs/PARAMETERS.md)** — full env/CLI parameter manual and production recipes
+- **[docs/BENCHMARKS.md](docs/BENCHMARKS.md)** — complete measured data and iteration history (same-machine A/B vs upstream)
+- **[docs/CHANGES.md](docs/CHANGES.md)** — technical changelog (NUMA, CPU kernels, fused ops, distributed EP)
 - **[tools/epd/README.md](tools/epd/README.md)** — two-machine EP quick start
 
 ## Status
 
-Early development; `main` branch = production-ready. Ongoing: GPU prefill toward vLLM/KTransformers-class throughput (16K target 1000+ tok/s), CPU/GPU joint pipelining, and a unified weight representation for GPU-prefill/CPU-decode. Upstream tracking: based on llama.cpp `e8f19cc0a` (2026-07-16); `vendor` branch holds the base, merged regularly.
+Early development. Validate output hashes, slot contexts and VRAM headroom yourself before production use. Upstream sync target: llama.cpp `4df29be4f` (2026-08-15, 96 commits merged; AVX2/AVX512 dual-build regression passed (tg flat, pp -5.4% attributed to upstream changes, see BENCHMARKS)). Ongoing: GPU prefill throughput, CPU/GPU cooperative pipelining, unified weight representation.
 
 ## License & Copyright
 
-This project is a fork of [llama.cpp](https://github.com/ggml-org/llama.cpp). **The original project is copyrighted by ggml-org and the llama.cpp contributors** and released under the MIT License. All modifications in this fork are likewise released under the MIT License, with the original copyright and license notices retained (see [LICENSE](LICENSE)).
+This project is a fork of [llama.cpp](https://github.com/ggml-org/llama.cpp). **Copyright of the original project belongs to ggml-org and all llama.cpp contributors**, released under the MIT license. All changes in this fork are likewise released under the MIT license, preserving the original copyright notices and license text (see [LICENSE](LICENSE)).
