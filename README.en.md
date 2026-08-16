@@ -22,7 +22,9 @@ Test platform: dual Xeon 8360Y (Ice Lake, 152 threads, 251G RAM) + 2× RTX 3090 
 | **AVX512/VNNI/VBMI 8×8 repack kernels** (Q2_K–Q6_K, Q8_0, MXFP4, IQ1_S/IQ1_M/IQ2_XXS) | All CPU compute; biggest win on long-prompt batches | prefill gemm up to **4.9×** (micro-bench); GLM-5.2 end-to-end **PP 4.1×** |
 | **IQ2_XXS AVX512 repack gemv/gemm kernel** (x8 layout) | CPU inference of IQ2_XXS-weight models | gemv micro-bench **17×**; full-model A/B still flat (bottleneck is the uncovered expert mul_mat_id) — model-level gains pending extension |
 | **NUMA mirror** (`--numa mirror`) | Dual-socket servers with RAM to spare | Best TG (**+9%** vs upstream), zero cross-socket UPI traffic |
-| **NUMA row-window EP** (`GGML_NUMA_EP=1`) | RAM-constrained, loading oversized models | **Half the expert memory**, TG matches mirror, single-writer dst rows with zero merge |
+| **NUMA row-window EP** (`GGML_NUMA_EP=1`) | RAM-constrained, loading oversized models; also works inside EPD workers spanning NUMA nodes | **Half the expert memory**, TG matches mirror, single-writer dst rows with zero merge; ABAB-measured hybrid tg512 **+49%**, pure-CPU tg128 **+61%** (incl. load-degradation resistance), pp +6~12% |
+| **Hierarchical barrier** (`GGML_NUMA_HIER_BARRIER=1`) | Multi-NUMA-node inference | +0.9% (noise-level but free) — recommended always-on |
+| **repack gemv software prefetch** (`GGML_REPACK_GEMV_PREFETCH=1`) | repack-kernel decode | TG **+2.6%** — recommended always-on |
 | **Fused ops** (hyper-connection HC, MoE router, RMS_NORM absorption, DSA Lightning Indexer) | DSV4 / GLM everywhere | Eliminates decomposed paths and intermediate activation traffic |
 | **MTP speculative decoding** | DSV4 decode | Further TG gains (all numbers here are without MTP) |
 

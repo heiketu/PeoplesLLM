@@ -22,7 +22,9 @@ llama.cpp 特化分支，面向双路/多路 CPU 服务器 + 消费级 GPU：CPU
 | **AVX512/VNNI/VBMI 8×8 repack 内核**（Q2_K~Q6_K、Q8_0、MXFP4、IQ1_S/IQ1_M/IQ2_XXS 全格式） | 所有 CPU 计算；长 prompt 批量收益最大 | prefill gemm 微基准最高 **4.9×**；GLM-5.2 端到端 **PP 4.1×** |
 | **IQ2_XXS AVX512 repack gemv/gemm 内核**（x8 布局） | IQ2_XXS 权重模型 CPU 推理 | gemv 微基准 **17×**；全模型 A/B 暂持平（瓶颈在专家 mul_mat_id 未覆盖），模型级收益待扩展 |
 | **NUMA 镜像 mirror**（`--numa mirror`） | 双路服务器、内存充裕 | TG 最优（vs 主线 **+9%**），跨插槽 UPI 流量归零 |
-| **NUMA 行窗 EP**（`GGML_NUMA_EP=1`） | 内存受限、超大模型装载 | 专家权重**内存减半**，TG 追平 mirror，dst 行单写者零归并 |
+| **NUMA 行窗 EP**（`GGML_NUMA_EP=1`） | 内存受限、超大模型装载；EPD worker 单机跨 node 同样适用 | 专家权重**内存减半**，TG 追平 mirror，dst 行单写者零归并；ABAB 实测混合 tg512 **+49%**、纯 CPU tg128 **+61%**（含抗负载退化），pp +6~12% |
+| **层级 barrier**（`GGML_NUMA_HIER_BARRIER=1`） | 多 NUMA 节点推理 | +0.9%（噪声级但零成本），建议常开 |
+| **repack gemv 软件预取**（`GGML_REPACK_GEMV_PREFETCH=1`） | repack 内核 decode | TG **+2.6%**，建议常开 |
 | **融合算子**（超连接 HC、MoE router、RMS_NORM 吸收、DSA 闪电索引器） | DSV4 / GLM 全场景 | 消除分解路径与中间激活读写，PP 固定开销显著降低 |
 | **MTP 投机解码** | DSV4 decode | TG 进一步提升（本文数据均未开 MTP） |
 
@@ -141,13 +143,16 @@ env \
   GGML_REMOTE_EP_RECONNECT_TIMEOUT_MS=90000 \
   GGML_CUDA_BATCHED_TOPK=1 \
   GGML_CUDA_DSV4_KV_REUSE=1 \
+  GGML_REPACK_GEMV_PREFETCH=1 \
+  GGML_NUMA_EP=1 \
+  GGML_NUMA_HIER_BARRIER=1 \
   build-cuda/bin/llama-server \
     -m "$TARGET" -md "$DRAFT" \
-    --spec-type draft-dspark --spec-draft-n-max 3 --spec-draft-p-min 0 \
+    --spec-type draft-dspark --spec-draft-n-max 2 --spec-draft-p-min 0 \
     -dev CUDA0,CUDA1 -sm layer -ts 1,0 \
     -ot '^token_embd\.weight$=CUDA1,^output.*=CUDA1' \
     --spec-draft-device CUDA1 \
-    -ngl all -ncmoe 99 -ngld all -t 72 -tb 72 -b 256 -ub 256 \
+    -ngl all -ncmoe 99 -ngld all -t 72 -tb 72 -b 4096 -ub 1024 \
     -c 1048576 -np 1 \
     --no-kv-unified -fa on -fit off \
     --numa distribute --no-warmup --no-ui --host 0.0.0.0 --port 18108
