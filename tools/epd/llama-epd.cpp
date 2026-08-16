@@ -43,6 +43,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
+#include "ggml-shard-plan.h"
 #include "gguf.h"
 
 #include <algorithm>
@@ -845,6 +846,85 @@ static void ep_repack_weights(ep_model & m) {
 
     LOG("llama-epd: repack: %zu/%zu tensors converted, %zu gate/up pairs fused in %.1f s\n",
         jobs.size(), wts.size(), fused_count, (ggml_time_us() - t0) / 1e6);
+}
+
+// GGML_NUMA_EP=1 per-node row-window placement. Mirrors
+// llama_model::numa_ep_place_experts (src/llama-model.cpp) for the epd loader:
+// within every repacked expert tensor, each NUMA node's row window (the rows
+// the compute side claims for that node, in 128-row blocks) is mbind()'d with
+// MPOL_MF_MOVE onto that node, so the repack gemv/gemm kernels read node-local
+// memory instead of interleaved/first-touch placement. Must run after
+// ep_repack_weights (t->data must point into the CPU_REPACK buffer); tensors
+// that kept the raw layout have no per-node claim path and are skipped.
+static void ep_numa_tp_place(ep_model & m) {
+    const char * env = getenv("GGML_NUMA_EP");
+    if (!env || atoi(env) == 0) {
+        return;
+    }
+    const int n_nodes = ggml_numa_node_count();
+    if (n_nodes < 2) {
+        LOG("llama-epd: numa-ep: GGML_NUMA_EP set but ggml reports %d node(s); placement skipped\n", n_nodes);
+        return;
+    }
+    long pg = sysconf(_SC_PAGESIZE);
+    if (pg <= 0) {
+        pg = 4096;
+    }
+
+    const int64_t t0 = ggml_time_us();
+    int n_placed = 0;
+    size_t placed_bytes = 0;
+    int n_raw = 0;
+    for (auto & kv : m.layers) {
+        const ep_layer & L = kv.second;
+        for (ggml_tensor * t : {L.gate_up, L.gate, L.up, L.down}) {
+            if (t == nullptr || t->data == nullptr || t->ne[2] <= 1) {
+                continue;
+            }
+            if (t->extra == nullptr) {
+                ++n_raw; // raw layout: the generic mul_mat_id path claims no per-node rows
+                continue;
+            }
+            const int64_t n_expert = t->ne[2];
+            const size_t eb = t->nb[2]; // bytes per expert plane (contiguous along ne[2])
+            // per-node row window inside each expert plane; must match the compute side
+            // in repack.cpp (rows claimed in blocks of ep_chunk, windows aligned to 128
+            // rows so any ep_chunk <= 128 divides them evenly)
+            const int64_t ne1 = t->ne[1];
+            const size_t rb = t->nb[1];
+            char * base = (char *) t->data;
+            for (int64_t e = 0; e < n_expert; ++e) {
+                char * ebase = base + e * eb;
+                for (int n = 0; n < n_nodes; ++n) {
+                    ggml_shard_window window;
+                    if (!ggml_shard_window_equal(ne1, (size_t) n_nodes, (size_t) n, 128, window)) {
+                        continue;
+                    }
+                    const int64_t r0 = window.begin;
+                    const int64_t r1 = window.end;
+                    if (r1 <= r0) {
+                        continue;
+                    }
+                    char * p = ebase + r0 * rb;
+                    size_t sz = (size_t) (r1 - r0) * rb;
+                    // keep the boundary page on the earlier node: only bind whole pages
+                    const uintptr_t up = ((uintptr_t) p + pg - 1) & ~((uintptr_t) pg - 1);
+                    if (n > 0) {
+                        if ((size_t) (up - (uintptr_t) p) >= sz) {
+                            continue;
+                        }
+                        sz -= up - (uintptr_t) p;
+                        p = (char *) up;
+                    }
+                    ggml_numa_bind(p, sz, n);
+                }
+            }
+            ++n_placed;
+            placed_bytes += ggml_nbytes(t);
+        }
+    }
+    LOG("llama-epd: numa-ep: placed %.2f GiB of expert weights across %d nodes (%d tensors, %d raw-layout tensors skipped) in %.1f s\n",
+        placed_bytes / 1073741824.0, n_nodes, n_placed, n_raw, (ggml_time_us() - t0) / 1e6);
 }
 
 // probe one tensor name in the global map; returns nullptr if absent
@@ -2972,7 +3052,29 @@ int main(int argc, char ** argv) {
     // NUMA placement policy (GGML_EPD_NUMA): must run before any weight
     // allocation/first-touch (both --no-mmap pread buffers and mmap page-ins
     // follow the process mempolicy)
-    ep_numa_apply_policy();
+    //
+    // GGML_NUMA_EP=1 switches to per-node expert row-window placement (NUMA TP
+    // across this worker's sockets): ggml NUMA must be initialized before any
+    // weight loading so thread affinity and the repack per-node row claims see
+    // the real node count. A process-wide GGML_EPD_NUMA policy would fight the
+    // per-window mbind placement, so it is skipped unless explicitly set.
+    const char * numa_ep_env = getenv("GGML_NUMA_EP");
+    const bool numa_ep = numa_ep_env && atoi(numa_ep_env) != 0;
+    if (numa_ep) {
+        ggml_numa_init(GGML_NUMA_STRATEGY_DISTRIBUTE);
+        if (ggml_numa_node_count() < 2) {
+            LOG("llama-epd: numa-ep: GGML_NUMA_EP set but only %d NUMA node(s) detected; running without placement\n",
+                    ggml_numa_node_count());
+        } else if (getenv("GGML_EPD_NUMA") == nullptr) {
+            LOG("llama-epd: numa-ep: %d NUMA nodes; per-node expert row windows after repack (GGML_EPD_NUMA process policy skipped)\n",
+                    ggml_numa_node_count());
+        } else {
+            LOG("llama-epd: numa-ep: WARNING: GGML_EPD_NUMA is also set; process mempolicy may conflict with row-window placement\n");
+            ep_numa_apply_policy();
+        }
+    } else {
+        ep_numa_apply_policy();
+    }
 
     ggml_backend_load_all(); // no-op for static builds, keeps dl builds working
 
@@ -2987,6 +3089,10 @@ int main(int argc, char ** argv) {
         LOG("llama-epd: arch=%s n_layer=%d, owning %zu MoE layers, sparse experts %zu/%d (global ids %d..%d)\n",
                 m.arch.c_str(), m.n_layer, m.layers.size(), m.expert_map.local_to_global.size(),
                 m.expert_map.n_expert, m.expert_map.first, m.expert_map.last - 1);
+    }
+
+    if (numa_ep) {
+        ep_numa_tp_place(m);
     }
 
     if (selftest) {
