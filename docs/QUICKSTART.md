@@ -53,6 +53,21 @@ cmake --build build-avx2 -j --target llama-epd llama-server
 `GGML_AVX512=OFF`、`GGML_VNNI=OFF`）。注意 `GGML_REPACK_GEMV_PREFETCH` 等 AVX-512 GEMV
 内核旋钮在 AVX2 构建上无效；slave 若是 AVX2-only 机器，预期带宽与 EP 收益都要打折。
 
+### 1.4 AMX 机器（Sapphire Rapids / Emerald Rapids / Granite Rapids）
+
+```bash
+cmake -S . -B build-amx \
+    -DGGML_NATIVE=OFF -DGGML_CUDA=OFF \
+    -DGGML_AVX512=ON -DGGML_AVX512_VNNI=ON -DGGML_AVX512_VBMI=ON -DGGML_AVX512_BF16=ON \
+    -DGGML_AMX_TILE=ON -DGGML_AMX_INT8=ON -DGGML_AMX_BF16=ON \
+    -DCMAKE_CXX_FLAGS="-mavx512vpopcntdq -mgfni" -DCMAKE_C_FLAGS="-mavx512vpopcntdq -mgfni"
+cmake --build build-amx -j
+```
+
+AMX buft 只在运行时 `arch_prctl` 授权成功（真 AMX 硬件或 SDE 模拟）时注册，非 AMX 机器自动
+回退 CPU_REPACK，无需额外开关。权重布局与 gemv/gemm 分流细节见 [PARAMETERS.md](PARAMETERS.md) §8。
+无 AMX 硬件时用 Intel SDE 验证正确性：`sde64 -spr -- <prog>`。
+
 ---
 
 ## 2. 推荐配置一：单机混合推理（2 × GPU + 双路 CPU）

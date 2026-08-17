@@ -21,14 +21,19 @@
 // AMX type_trais
 namespace ggml::cpu::amx {
 class tensor_traits : public ggml::cpu::tensor_traits {
-    bool work_size(int /* n_threads */, const struct ggml_tensor * op, size_t & size) override {
-        size = ggml_backend_amx_desired_wsize(op);
+    bool work_size(int n_threads, const struct ggml_tensor * op, size_t & size) override {
+        size = op->op == GGML_OP_MUL_MAT_ID ? ggml_backend_amx_mmid_desired_wsize(n_threads, op)
+                                            : ggml_backend_amx_desired_wsize(op);
         return true;
     }
 
     bool compute_forward(struct ggml_compute_params * params, struct ggml_tensor * op) override {
         if (op->op == GGML_OP_MUL_MAT) {
             ggml_backend_amx_mul_mat(params, op);
+            return true;
+        }
+        if (op->op == GGML_OP_MUL_MAT_ID) {
+            ggml_backend_amx_mul_mat_id(params, op);
             return true;
         }
         return false;
@@ -143,7 +148,7 @@ static size_t ggml_backend_amx_buffer_type_get_alignment(ggml_backend_buffer_typ
 namespace ggml::cpu::amx {
 class extra_buffer_type : ggml::cpu::extra_buffer_type {
     bool supports_op(ggml_backend_dev_t, const struct ggml_tensor * op) override {
-        if (op->op != GGML_OP_MUL_MAT) {
+        if (op->op != GGML_OP_MUL_MAT && op->op != GGML_OP_MUL_MAT_ID) {
             return false;
         }
         auto * src0 = op->src[0];
@@ -158,6 +163,8 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
         if (src1->buffer && !ggml_backend_buft_is_host(src1->buffer->buft)) {
             return false;
         }
+        // dst cols (MUL_MAT: ne[1] of src0; MUL_MAT_ID: rows per expert) must fill
+        // whole 2*TILE_N kernel blocks
         if (op->ne[0] % (TILE_N * 2)) {
             return false;
         }
@@ -166,12 +173,17 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
             case GGML_TYPE_Q4_0:
             case GGML_TYPE_Q4_1:
             case GGML_TYPE_Q8_0:
+            case GGML_TYPE_MXFP4:
                 alignment = TILE_K;
                 break;
             case GGML_TYPE_Q4_K:
             case GGML_TYPE_Q5_K:
             case GGML_TYPE_Q6_K:
             case GGML_TYPE_IQ4_XS:
+            case GGML_TYPE_Q2_K:
+            case GGML_TYPE_IQ2_XXS:
+            case GGML_TYPE_IQ2_XS:
+            case GGML_TYPE_IQ3_XXS:
                 alignment = 256; // QK_K
                 break;
             case GGML_TYPE_F16:
@@ -186,11 +198,31 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
         if (src1->type != GGML_TYPE_F32) {
             return false;
         }
+        if (op->op == GGML_OP_MUL_MAT_ID) {
+            auto * ids = op->src[2];
+            if (src0->type == GGML_TYPE_F16) {
+                return false; // MUL_MAT_ID only has quantized AMX kernels
+            }
+            // src0 is [K, N, n_expert], one packed matrix per expert
+            if (ggml_n_dims(src0) != 3 || src0->ne[3] != 1 || src0->ne[1] % (TILE_N * 2)) {
+                return false;
+            }
+            if (ids->type != GGML_TYPE_I32) {
+                return false;
+            }
+            if (ids->buffer && !ggml_backend_buft_is_host(ids->buffer->buft)) {
+                return false;
+            }
+            // one expert list per src1 token row; src1 slots may broadcast
+            if (ids->ne[1] != src1->ne[2] || ids->ne[0] % src1->ne[1] != 0) {
+                return false;
+            }
+        }
         return true;
     }
 
     ggml::cpu::tensor_traits * get_tensor_traits(const struct ggml_tensor * op) override {
-        if (op->op == GGML_OP_MUL_MAT && op->src[0]->buffer &&
+        if ((op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID) && op->src[0]->buffer &&
             op->src[0]->buffer->buft == ggml_backend_amx_buffer_type()) {
             return (ggml::cpu::tensor_traits *) op->src[0]->extra;
         }

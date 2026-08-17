@@ -111,5 +111,10 @@ inline bool qtype_has_amx_kernels(const enum ggml_type type) {
         (type == GGML_TYPE_Q4_K) ||
         (type == GGML_TYPE_Q5_K) ||
         (type == GGML_TYPE_Q6_K) ||
-        (type == GGML_TYPE_IQ4_XS);
+        (type == GGML_TYPE_IQ4_XS) ||
+        (type == GGML_TYPE_Q2_K) ||
+        (type == GGML_TYPE_IQ2_XXS) ||
+        (type == GGML_TYPE_IQ2_XS) ||
+        (type == GGML_TYPE_IQ3_XXS) ||
+        (type == GGML_TYPE_MXFP4);
 }

@@ -3197,7 +3197,7 @@ void ggml_vec_dot_iq2_xxs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const 
 #else
             const __m512i sav512m = _mm512_and_si512(sav512, m127);
             const __m512i sp = _mm512_popcnt_epi32(sav512m);
-            const __m128i sb = _mm512_cvtepi32_epi8(_mm512_or_si512(sav512m, _mm512_slli_epi32(_mm512_and_si512(sp, mone32), 7)));
+            const __m128i sb = _mm512_cvtepi32_epi8(_mm512_or_si512(sav512m, _mm512_slli_epi32(_mm512_and_si512(sp, _mm512_set1_epi32(1)), 7)));
 #endif
             const __mmask64 neg_lo = (__mmask64)_mm_cvtsi128_si64(sb);
             const __mmask64 neg_hi = (__mmask64)_mm_extract_epi64(sb, 1);

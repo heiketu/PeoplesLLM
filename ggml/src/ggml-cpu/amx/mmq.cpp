@@ -10,6 +10,12 @@
 #include "simd-mappings.h"
 #include "quants.h"
 #include "ggml-quants.h"
+
+// grid/sign LUTs (iq2xxs_grid, iq2xs_grid, iq3xxs_grid, ksigns_iq2xs, kmask_iq2xs)
+// for the pack-time decode of the lookup-based quants (same mechanism as repack.cpp)
+#define GGML_COMMON_IMPL_CPP
+#include "ggml-common.h"
+
 #include <algorithm>
 #include <type_traits>
 
@@ -59,6 +65,11 @@ template <typename T> struct PackedTypes {};
 template <> struct PackedTypes<block_q4_0> { using type = int8_t; };
 template <> struct PackedTypes<block_q4_1> { using type = uint8_t; };
 template <> struct PackedTypes<block_q8_0> { using type = int8_t; };
+template <> struct PackedTypes<block_mxfp4> { using type = int8_t; };
+template <> struct PackedTypes<block_q2_K> { using type = int8_t; };
+template <> struct PackedTypes<block_iq2_xxs> { using type = int8_t; };
+template <> struct PackedTypes<block_iq2_xs> { using type = int8_t; };
+template <> struct PackedTypes<block_iq3_xxs> { using type = int8_t; };
 template <typename T> using packed_B_type = typename PackedTypes<T>::type;
 
 template <typename T>
@@ -68,14 +79,27 @@ struct do_compensate : std::integral_constant<bool,
 template <typename T>
 struct do_unpack : std::integral_constant<bool,
     std::is_same<T, block_q4_0>::value ||
-    std::is_same<T, block_q4_1>::value> {};
+    std::is_same<T, block_q4_1>::value ||
+    std::is_same<T, block_mxfp4>::value> {};
 
 template <typename T>
 struct is_type_qkk : std::integral_constant<bool,
     std::is_same<T, block_q4_K>::value ||
     std::is_same<T, block_q5_K>::value ||
     std::is_same<T, block_q6_K>::value ||
-    std::is_same<T, block_iq4_xs>::value> {};
+    std::is_same<T, block_iq4_xs>::value ||
+    std::is_same<T, block_q2_K>::value ||
+    std::is_same<T, block_iq2_xxs>::value ||
+    std::is_same<T, block_iq2_xs>::value ||
+    std::is_same<T, block_iq3_xxs>::value> {};
+
+// qkk kernel granularity: these types have one scale per 16 values
+// (the others have one scale per 32 values)
+template <typename T>
+struct qkk_group_16 : std::integral_constant<bool,
+    std::is_same<T, block_q6_K>::value ||
+    std::is_same<T, block_q2_K>::value ||
+    std::is_same<T, block_iq2_xs>::value> {};
 
 #define GGML_DISPATCH_FLOATING_TYPES(TYPE, ...)                                        \
     [&] {                                                                              \
@@ -116,6 +140,12 @@ struct is_type_qkk : std::integral_constant<bool,
                 constexpr int blck_size = QK8_0;                                       \
                 return __VA_ARGS__();                                                  \
             }                                                                          \
+            case GGML_TYPE_MXFP4: {                                                    \
+                using type = block_mxfp4;                                              \
+                using vec_dot_type = block_q8_0;                                       \
+                constexpr int blck_size = QK_MXFP4;                                    \
+                return __VA_ARGS__();                                                  \
+            }                                                                          \
             case GGML_TYPE_Q4_K: {                                                     \
                 using type = block_q4_K;                                               \
                 using vec_dot_type = block_q8_K;                                       \
@@ -136,6 +166,30 @@ struct is_type_qkk : std::integral_constant<bool,
             }                                                                          \
             case GGML_TYPE_IQ4_XS: {                                                   \
                 using type = block_iq4_xs;                                             \
+                using vec_dot_type = block_q8_K;                                       \
+                constexpr int blck_size = QK_K;                                        \
+                return __VA_ARGS__();                                                  \
+            }                                                                          \
+            case GGML_TYPE_Q2_K: {                                                     \
+                using type = block_q2_K;                                               \
+                using vec_dot_type = block_q8_K;                                       \
+                constexpr int blck_size = QK_K;                                        \
+                return __VA_ARGS__();                                                  \
+            }                                                                          \
+            case GGML_TYPE_IQ2_XXS: {                                                  \
+                using type = block_iq2_xxs;                                            \
+                using vec_dot_type = block_q8_K;                                       \
+                constexpr int blck_size = QK_K;                                        \
+                return __VA_ARGS__();                                                  \
+            }                                                                          \
+            case GGML_TYPE_IQ2_XS: {                                                   \
+                using type = block_iq2_xs;                                             \
+                using vec_dot_type = block_q8_K;                                       \
+                constexpr int blck_size = QK_K;                                        \
+                return __VA_ARGS__();                                                  \
+            }                                                                          \
+            case GGML_TYPE_IQ3_XXS: {                                                  \
+                using type = block_iq3_xxs;                                            \
                 using vec_dot_type = block_q8_K;                                       \
                 constexpr int blck_size = QK_K;                                        \
                 return __VA_ARGS__();                                                  \
@@ -226,8 +280,25 @@ inline void ggml_tile_config_init(void) {
 
 // we need an extra 16 * 4B (TILE_N * int32_t) for each NB/KB block for compensation.
 // See the notes `s8s8 igemm compensation in avx512-vnni` for detail.
+//
+// The lookup-based types (IQ2_XXS/IQ2_XS/IQ3_XXS) and Q2_K decode quants to 8-bit
+// at pack time (see pack_B below), so their tile size is a fixed custom layout
+// rather than sizeof(TB) + extras:
+//   Q2_K:     quants {QK_K} int8 + scales {16} int8 + mins {16} int8 + d/dmin fp16
+//   IQ2_XS:   quants {QK_K} int8 + scales {16} int8 + d fp16
+//   IQ2_XXS / IQ3_XXS: quants {QK_K} int8 + scales {8} int8 + d fp16
 template <typename TB>
 int get_tile_size() {
+    if (std::is_same<TB, block_q2_K>::value) {
+        return TILE_N * (QK_K + 16 + 16 + 2 + 2);
+    }
+    if (std::is_same<TB, block_iq2_xs>::value) {
+        return TILE_N * (QK_K + 16 + 2);
+    }
+    if (std::is_same<TB, block_iq2_xxs>::value ||
+        std::is_same<TB, block_iq3_xxs>::value) {
+        return TILE_N * (QK_K + 8 + 2);
+    }
     int tile_size = TILE_N * sizeof(TB);
     if (do_compensate<TB>::value) {
         tile_size += TILE_N * sizeof(int32_t);
@@ -245,6 +316,16 @@ int get_tile_size() {
 template <typename TB, int BLOCK_K>
 int get_row_size(int K) {
     int KB = K / BLOCK_K;
+    if (std::is_same<TB, block_q2_K>::value) {
+        return KB * (QK_K + 16 + 16 + 2 + 2);
+    }
+    if (std::is_same<TB, block_iq2_xs>::value) {
+        return KB * (QK_K + 16 + 2);
+    }
+    if (std::is_same<TB, block_iq2_xxs>::value ||
+        std::is_same<TB, block_iq3_xxs>::value) {
+        return KB * (QK_K + 8 + 2);
+    }
     int row_size = KB * sizeof(TB);
     if (do_compensate<TB>::value) {
         row_size += KB * sizeof(int32_t);
@@ -516,6 +597,16 @@ void unpack_A<block_q6_K>(int8_t * RESTRICT tile, const block_q8_K * RESTRICT A,
     }
 }
 
+template <>
+void unpack_A<block_q2_K>(int8_t * RESTRICT tile, const block_q8_K * RESTRICT A, int lda, int k, int nr) {
+    unpack_A<block_q6_K>(tile, A, lda, k, nr);
+}
+
+template <>
+void unpack_A<block_iq2_xs>(int8_t * RESTRICT tile, const block_q8_K * RESTRICT A, int lda, int k, int nr) {
+    unpack_A<block_q6_K>(tile, A, lda, k, nr);
+}
+
 #define MM256_SET_M128I(a, b) _mm256_insertf128_si256(_mm256_castsi128_si256(b), (a), 1)
 inline __m256i bytes_from_nibbles_32(const uint8_t * rsi) {
     const __m128i tmp = _mm_loadu_si128((const __m128i *)rsi);
@@ -748,6 +839,121 @@ inline void pack_qs<block_iq4_xs>(void * RESTRICT packed_B, const block_iq4_xs *
     }
 }
 
+// ---------------------------------------------------------------------------
+// pack-time decoders for the lookup-based types and Q2_K.
+//
+// The grid-LUT sign/index decode of IQ2_XXS/IQ2_XS/IQ3_XXS is too irregular to
+// redo on every tile load, so we decode once at pack time into plain int8
+// quants (values fit easily: |grid| <= 43) plus one int8 scale per group.
+// Q2_K likewise unpacks its 2-bit quants to uint8 (0..3). The decoded quants
+// are stored directly in the vnni tile layout, so unpack_B degenerates to a
+// memcpy and the qkk AMX/VNNI kernels work unchanged.
+// ---------------------------------------------------------------------------
+
+// pack 16 rows x QK_K decoded int8 quants (row-major {TILE_N, QK_K}) into the
+// vnni tile layout {8 k-groups of 32, 512B each} (same layout pack_qs<block_q8_0>
+// produces per 32-value group)
+inline void pack_qs_decoded(void * RESTRICT packed_B, const int8_t * RESTRICT dec) {
+    char * pb = (char *)packed_B;
+    for (int g = 0; g < QK_K / 32; ++g) {
+        __m256i v[8], v2[8];
+        for (int n = 0; n < 8; ++n) {
+            v[n] = _mm256_loadu_si256((const __m256i *)(dec + n * QK_K + g * 32));
+        }
+        transpose_8x8_32bit(v, v2);
+        for (int n = 0; n < 8; ++n) {
+            _mm256_storeu_si256((__m256i *)(pb + n * 64), v2[n]);
+        }
+        for (int n = 0; n < 8; ++n) {
+            v[n] = _mm256_loadu_si256((const __m256i *)(dec + (n + 8) * QK_K + g * 32));
+        }
+        transpose_8x8_32bit(v, v2);
+        for (int n = 0; n < 8; ++n) {
+            _mm256_storeu_si256((__m256i *)(pb + n * 64 + 32), v2[n]);
+        }
+        pb += 512;
+    }
+}
+
+// one row: 8 groups of 32, one scale per group (matches ggml_vec_dot_iq2_xxs_q8_K_generic)
+inline void decode_iq2_xxs_row(const block_iq2_xxs * RESTRICT x, int8_t * RESTRICT q8, int8_t * RESTRICT scales) {
+    const uint16_t * q2 = x->qs;
+    for (int ib32 = 0; ib32 < QK_K / 32; ++ib32) {
+        uint32_t aux32[2];
+        memcpy(aux32, q2, 2 * sizeof(uint32_t));
+        q2 += 4;
+        const uint8_t * aux8 = (const uint8_t *)aux32;
+        scales[ib32] = 2 * (aux32[1] >> 28) + 1;
+        int8_t * out = q8 + ib32 * 32;
+        for (int l = 0; l < 4; ++l) {
+            const uint8_t * grid = (const uint8_t *)(iq2xxs_grid + aux8[l]);
+            const uint8_t  signs = ksigns_iq2xs[(aux32[1] >> 7 * l) & 127];
+            for (int j = 0; j < 8; ++j) {
+                out[l * 8 + j] = signs & kmask_iq2xs[j] ? -(int8_t)grid[j] : (int8_t)grid[j];
+            }
+        }
+    }
+}
+
+// one row: 8 groups of 32, but one scale per 16 values (matches ggml_vec_dot_iq2_xs_q8_K_generic)
+inline void decode_iq2_xs_row(const block_iq2_xs * RESTRICT x, int8_t * RESTRICT q8, int8_t * RESTRICT scales) {
+    const uint16_t * q2 = x->qs;
+    const uint8_t  * sc = x->scales;
+    for (int ib32 = 0; ib32 < QK_K / 32; ++ib32) {
+        scales[2 * ib32 + 0] = 2 * (sc[ib32] & 0xf) + 1;
+        scales[2 * ib32 + 1] = 2 * (sc[ib32] >>  4) + 1;
+        int8_t * out = q8 + ib32 * 32;
+        for (int l = 0; l < 4; ++l) {
+            const uint8_t * grid = (const uint8_t *)(iq2xs_grid + (q2[l] & 511));
+            const uint8_t  signs = ksigns_iq2xs[q2[l] >> 9];
+            for (int j = 0; j < 8; ++j) {
+                out[l * 8 + j] = signs & kmask_iq2xs[j] ? -(int8_t)grid[j] : (int8_t)grid[j];
+            }
+        }
+        q2 += 4;
+    }
+}
+
+// one row: 8 groups of 32, one scale per group (matches ggml_vec_dot_iq3_xxs_q8_K_generic)
+inline void decode_iq3_xxs_row(const block_iq3_xxs * RESTRICT x, int8_t * RESTRICT q8, int8_t * RESTRICT scales) {
+    const uint8_t * q3  = x->qs;
+    const uint8_t * gas = x->qs + QK_K / 4;
+    for (int ib32 = 0; ib32 < QK_K / 32; ++ib32) {
+        uint32_t aux32;
+        memcpy(&aux32, gas, sizeof(uint32_t));
+        gas += sizeof(uint32_t);
+        scales[ib32] = 2 * (aux32 >> 28) + 1;
+        int8_t * out = q8 + ib32 * 32;
+        for (int l = 0; l < 4; ++l) {
+            const uint8_t * grid1 = (const uint8_t *)(iq3xxs_grid + q3[2 * l + 0]);
+            const uint8_t * grid2 = (const uint8_t *)(iq3xxs_grid + q3[2 * l + 1]);
+            const uint8_t  signs = ksigns_iq2xs[(aux32 >> 7 * l) & 127];
+            for (int j = 0; j < 4; ++j) {
+                out[l * 8 + j + 0] = signs & kmask_iq2xs[j + 0] ? -(int8_t)grid1[j] : (int8_t)grid1[j];
+                out[l * 8 + j + 4] = signs & kmask_iq2xs[j + 4] ? -(int8_t)grid2[j] : (int8_t)grid2[j];
+            }
+        }
+        q3 += 8;
+    }
+}
+
+// one row: 16 groups of 16, 4-bit scales and mins (matches ggml_vec_dot_q2_K_q8_K_generic)
+inline void decode_q2_K_row(const block_q2_K * RESTRICT x, int8_t * RESTRICT q8,
+                            int8_t * RESTRICT scales, int8_t * RESTRICT mins) {
+    const uint8_t * q2 = x->qs;
+    const uint8_t * sc = x->scales;
+    for (int g = 0; g < QK_K / 16; ++g) {
+        const int shift = 2 * ((g % 8) / 2);
+        const uint8_t * p = q2 + (g / 8) * 32 + (g % 2) * 16;
+        int8_t * out = q8 + g * 16;
+        for (int l = 0; l < 16; ++l) {
+            out[l] = (p[l] >> shift) & 3;
+        }
+        scales[g] = sc[g] & 0xF;
+        mins[g]   = sc[g] >> 4;
+    }
+}
+
 // pack B to vnni formats in 4bits or 8 bits
 void pack_B(void * RESTRICT packed_B, const block_q4_0 * RESTRICT B, int KB) {
     pack_qs(packed_B, B, KB);
@@ -765,6 +971,30 @@ void pack_B(void * RESTRICT packed_B, const block_q4_1 * RESTRICT B, int KB) {
         d0[n] = B[n * KB].d;
         m0[n] = B[n * KB].m;
     }
+}
+
+// packed_B layout (same nibble order as block_q4_0, scales are raw E8M0 bytes):
+//   quants {TILE_N, TILE_K/2}  uint8
+//   e      {TILE_N}            uint8 (E8M0 scales)
+void pack_B(void * RESTRICT packed_B, const block_mxfp4 * RESTRICT B, int KB) {
+    pack_qs(packed_B, B, KB);
+    uint8_t * e0 = reinterpret_cast<uint8_t *>((char *)packed_B + TILE_N * TILE_K / 2);
+    for (int n = 0; n < TILE_N; ++n) {
+        e0[n] = B[n * KB].e;
+    }
+}
+
+// convert 16 raw E8M0 bytes to 16 fp32 values, matching ggml_e8m0_to_fp32_half:
+//   e < 2  -> denormal pattern 0x00200000 << e  (2^-128, 2^-127)
+//   e >= 2 -> 2^(e-128) = bits (e-1)<<23
+// (e == 255 / NaN is not handled, same as the reference)
+inline __m512 e8m0_half_to_fp32_16(const uint8_t * e) {
+    const __m512i ve = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)e));
+    __m512i bits = _mm512_slli_epi32(_mm512_sub_epi32(ve, _mm512_set1_epi32(1)), 23);
+    const __mmask16 is_denorm = _mm512_cmplt_epu32_mask(ve, _mm512_set1_epi32(2));
+    const __m512i denorm_bits = _mm512_sllv_epi32(_mm512_set1_epi32(0x00200000), ve);
+    bits = _mm512_mask_mov_epi32(bits, is_denorm, denorm_bits);
+    return _mm512_castsi512_ps(bits);
 }
 
 inline void s8s8_compensation(void * RESTRICT packed_B) {
@@ -909,6 +1139,85 @@ void pack_B(void * RESTRICT packed_B, const block_iq4_xs * RESTRICT B, int KB) {
     }
 }
 
+// packed_B layout (decode-at-pack, see decoders above):
+//   quants {8, 8, TILE_N, 4}  int8  (vnni tiles, 512B per 32-value group)
+//   scales {8, TILE_N}        int8
+//   d      {TILE_N}           ggml_half
+void pack_B(void * RESTRICT packed_B, const block_iq2_xxs * RESTRICT B, int KB) {
+    int8_t dec[TILE_N * QK_K];
+    int8_t * scales = reinterpret_cast<int8_t *>((char *)packed_B + QK_K * TILE_N);
+    ggml_half * d = reinterpret_cast<ggml_half *>(scales + 8 * TILE_N);
+    for (int n = 0; n < TILE_N; ++n) {
+        int8_t sc[8];
+        decode_iq2_xxs_row(&B[n * KB], dec + n * QK_K, sc);
+        for (int g = 0; g < 8; ++g) {
+            scales[g * TILE_N + n] = sc[g];
+        }
+        d[n] = B[n * KB].d;
+    }
+    pack_qs_decoded(packed_B, dec);
+}
+
+// packed_B layout: same as IQ2_XXS
+void pack_B(void * RESTRICT packed_B, const block_iq3_xxs * RESTRICT B, int KB) {
+    int8_t dec[TILE_N * QK_K];
+    int8_t * scales = reinterpret_cast<int8_t *>((char *)packed_B + QK_K * TILE_N);
+    ggml_half * d = reinterpret_cast<ggml_half *>(scales + 8 * TILE_N);
+    for (int n = 0; n < TILE_N; ++n) {
+        int8_t sc[8];
+        decode_iq3_xxs_row(&B[n * KB], dec + n * QK_K, sc);
+        for (int g = 0; g < 8; ++g) {
+            scales[g * TILE_N + n] = sc[g];
+        }
+        d[n] = B[n * KB].d;
+    }
+    pack_qs_decoded(packed_B, dec);
+}
+
+// packed_B layout:
+//   quants {8, 8, TILE_N, 4}  int8  (vnni tiles, 512B per 32-value group)
+//   scales {16, TILE_N}       int8  (one scale per 16 values)
+//   d      {TILE_N}           ggml_half
+void pack_B(void * RESTRICT packed_B, const block_iq2_xs * RESTRICT B, int KB) {
+    int8_t dec[TILE_N * QK_K];
+    int8_t * scales = reinterpret_cast<int8_t *>((char *)packed_B + QK_K * TILE_N);
+    ggml_half * d = reinterpret_cast<ggml_half *>(scales + 16 * TILE_N);
+    for (int n = 0; n < TILE_N; ++n) {
+        int8_t sc[16];
+        decode_iq2_xs_row(&B[n * KB], dec + n * QK_K, sc);
+        for (int g = 0; g < 16; ++g) {
+            scales[g * TILE_N + n] = sc[g];
+        }
+        d[n] = B[n * KB].d;
+    }
+    pack_qs_decoded(packed_B, dec);
+}
+
+// packed_B layout:
+//   quants {8, 8, TILE_N, 4}  uint8 (vnni tiles, 512B per 32-value group)
+//   scales {16, TILE_N}       int8  (one scale per 16 values)
+//   mins   {8, TILE_N, 2}     int8  (pairwise interleaved, same as Q4_K)
+//   d      {TILE_N}           ggml_half
+//   dmin   {TILE_N}           ggml_half
+void pack_B(void * RESTRICT packed_B, const block_q2_K * RESTRICT B, int KB) {
+    int8_t dec[TILE_N * QK_K];
+    int8_t * scales = reinterpret_cast<int8_t *>((char *)packed_B + QK_K * TILE_N);
+    int8_t * mins = scales + 16 * TILE_N;
+    ggml_half * d = reinterpret_cast<ggml_half *>(mins + 16 * TILE_N);
+    ggml_half * dmin = d + TILE_N;
+    for (int n = 0; n < TILE_N; ++n) {
+        int8_t sc[16], mn[16];
+        decode_q2_K_row(&B[n * KB], dec + n * QK_K, sc, mn);
+        for (int g = 0; g < 16; ++g) {
+            scales[g * TILE_N + n] = sc[g];
+            mins[(g >> 1) * TILE_N * 2 + n * 2 + (g & 0x1)] = mn[g];
+        }
+        d[n] = B[n * KB].d;
+        dmin[n] = B[n * KB].dmin;
+    }
+    pack_qs_decoded(packed_B, dec);
+}
+
 template<typename TB, typename packed_B_t = packed_B_type<TB>>
 void unpack_B(packed_B_t * RESTRICT tile, const void * RESTRICT packed_B) {
     GGML_UNUSED(tile);
@@ -935,6 +1244,29 @@ void unpack_B<block_q4_1>(uint8_t * RESTRICT tile, const void * RESTRICT packed_
         __m512i bytes = _mm512_loadu_si512((const __m512i *)((const char *)packed_B + n * 32));
         const __m512i r0 = _mm512_and_si512(bytes, lowMask);
         const __m512i r1 = _mm512_and_si512(_mm512_srli_epi16(bytes, 4), lowMask);
+        _mm512_storeu_si512((__m512i *)(tile + n * 64 +  0), r0);
+        _mm512_storeu_si512((__m512i *)(tile + n * 64 + 64), r1);
+    }
+}
+
+// kvalues_fp4 LUT (e2m1 values, doubled), replicated in each 128-bit lane for _mm512_shuffle_epi8
+inline __m512i kvalues_fp4_128() {
+    return _mm512_set_epi8(
+        -12, -8, -6, -4, -3, -2, -1, 0, 12, 8, 6, 4, 3, 2, 1, 0,
+        -12, -8, -6, -4, -3, -2, -1, 0, 12, 8, 6, 4, 3, 2, 1, 0,
+        -12, -8, -6, -4, -3, -2, -1, 0, 12, 8, 6, 4, 3, 2, 1, 0,
+        -12, -8, -6, -4, -3, -2, -1, 0, 12, 8, 6, 4, 3, 2, 1, 0
+    );
+}
+
+template <>
+void unpack_B<block_mxfp4>(int8_t * RESTRICT tile, const void * RESTRICT packed_B) {
+    const __m512i values128 = kvalues_fp4_128();
+    const __m512i lowMask = _mm512_set1_epi8(0xF);
+    for (int n = 0; n < 8; n += 2) {
+        __m512i bytes = _mm512_loadu_si512((const __m512i *)((const char *)packed_B + n * 32));
+        const __m512i r0 = _mm512_shuffle_epi8(values128, _mm512_and_si512(bytes, lowMask));
+        const __m512i r1 = _mm512_shuffle_epi8(values128, _mm512_and_si512(_mm512_srli_epi16(bytes, 4), lowMask));
         _mm512_storeu_si512((__m512i *)(tile + n * 64 +  0), r0);
         _mm512_storeu_si512((__m512i *)(tile + n * 64 + 64), r1);
     }
@@ -1045,6 +1377,31 @@ void unpack_B<block_iq4_xs>(int8_t * RESTRICT tile, const void * RESTRICT packed
     }
 }
 
+// IQ2_XXS / IQ3_XXS store decoded 8-bit quants in the vnni tile layout:
+// unpack is a plain copy of the 512B k-group slice.
+template <>
+void unpack_B<block_iq2_xxs>(int8_t * RESTRICT tile, const void * RESTRICT packed_B, int k) {
+    memcpy(tile, (const char *)packed_B + k * (QK_K / 8) * TILE_N, 32 * TILE_N);
+}
+
+template <>
+void unpack_B<block_iq3_xxs>(int8_t * RESTRICT tile, const void * RESTRICT packed_B, int k) {
+    memcpy(tile, (const char *)packed_B + k * (QK_K / 8) * TILE_N, 32 * TILE_N);
+}
+
+// Q2_K / IQ2_XS have one scale per 16 values; k indexes 16-value groups, which are
+// the lower/upper half (256B) of the containing 32-value vnni tile. The upper half
+// of the tile needs no zeroing: unpack_A zero-pads A from 16 to 32 (as for Q6_K).
+template <>
+void unpack_B<block_q2_K>(int8_t * RESTRICT tile, const void * RESTRICT packed_B, int k) {
+    memcpy(tile, (const char *)packed_B + (k >> 1) * (QK_K / 8) * TILE_N + (k & 1) * 16 * TILE_N, 16 * TILE_N);
+}
+
+template <>
+void unpack_B<block_iq2_xs>(int8_t * RESTRICT tile, const void * RESTRICT packed_B, int k) {
+    memcpy(tile, (const char *)packed_B + (k >> 1) * (QK_K / 8) * TILE_N + (k & 1) * 16 * TILE_N, 16 * TILE_N);
+}
+
 template <typename TA, typename TB, bool is_acc>
 struct acc_C {};
 
@@ -1053,6 +1410,28 @@ struct acc_C<block_q8_0, block_q4_0, is_acc> {
     static void apply(float * RESTRICT C, int ldc, const int32_t * RESTRICT tile, const block_q8_0 * A, int lda, const void * packed_B, int nr) {
         const int offset = TILE_N * TILE_K / 2;
         const __m512 vd0 = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)((const char *)packed_B + offset)));
+
+        for (int m = 0; m < nr; ++m) {
+            const __m512 vd1 = _mm512_set1_ps(GGML_CPU_FP16_TO_FP32(A[m * lda].d));
+            const __m512 vtile = _mm512_cvtepi32_ps(_mm512_loadu_si512(tile + m * TILE_N));
+
+            __m512 vsum;
+            if (is_acc) {
+                vsum = _mm512_loadu_ps(C + m * ldc);
+            } else {
+                vsum = _mm512_set1_ps(0.f);
+            }
+            vsum = _mm512_fmadd_ps(vtile, _mm512_mul_ps(vd0, vd1), vsum);
+            _mm512_storeu_ps(C + m * ldc, vsum);
+        }
+    }
+};
+
+template <bool is_acc>
+struct acc_C<block_q8_0, block_mxfp4, is_acc> {
+    static void apply(float * RESTRICT C, int ldc, const int32_t * RESTRICT tile, const block_q8_0 * A, int lda, const void * packed_B, int nr) {
+        const int offset = TILE_N * TILE_K / 2;
+        const __m512 vd0 = e8m0_half_to_fp32_16((const uint8_t *)packed_B + offset);
 
         for (int m = 0; m < nr; ++m) {
             const __m512 vd1 = _mm512_set1_ps(GGML_CPU_FP16_TO_FP32(A[m * lda].d));
@@ -1253,11 +1632,138 @@ struct acc_C<block_q8_K, block_iq4_xs, is_acc> {
     }
 };
 
+// IQ2_XXS / IQ2_XS / IQ3_XXS: tile already contains scale-weighted integer sums
+// (scale_C applied the decoded int8 group scales); here we only multiply by the
+// super-block scales and the type's global factor (0.125f / 0.125f / 0.25f,
+// matching the generic dot products).
+template <bool is_acc>
+struct acc_C<block_q8_K, block_iq2_xxs, is_acc> {
+    static void apply(float * RESTRICT C, int ldc, const int32_t * RESTRICT tile, const block_q8_K * A, int lda, const void * packed_B, int nr) {
+        const ggml_half * d0 = reinterpret_cast<const ggml_half *>((const char *)packed_B + QK_K * TILE_N + 8 * TILE_N);
+
+        const __m512 vd0 = _mm512_mul_ps(_mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)d0)), _mm512_set1_ps(0.125f));
+
+        for (int m = 0; m < nr; ++m) {
+            const float d1 = A[m * lda].d;
+            const __m512 vd = _mm512_mul_ps(_mm512_set1_ps(d1), vd0);
+            const __m512 vtile = _mm512_cvtepi32_ps(_mm512_loadu_si512(tile + m * TILE_N));
+
+            __m512 vsum;
+            if (is_acc) {
+                vsum = _mm512_loadu_ps(C + m * ldc);
+            } else {
+                vsum = _mm512_set1_ps(0.f);
+            }
+
+            vsum = _mm512_fmadd_ps(vtile, vd, vsum);
+            _mm512_storeu_ps(C + m * ldc, vsum);
+        }
+    }
+};
+
+template <bool is_acc>
+struct acc_C<block_q8_K, block_iq3_xxs, is_acc> {
+    static void apply(float * RESTRICT C, int ldc, const int32_t * RESTRICT tile, const block_q8_K * A, int lda, const void * packed_B, int nr) {
+        const ggml_half * d0 = reinterpret_cast<const ggml_half *>((const char *)packed_B + QK_K * TILE_N + 8 * TILE_N);
+
+        const __m512 vd0 = _mm512_mul_ps(_mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)d0)), _mm512_set1_ps(0.25f));
+
+        for (int m = 0; m < nr; ++m) {
+            const float d1 = A[m * lda].d;
+            const __m512 vd = _mm512_mul_ps(_mm512_set1_ps(d1), vd0);
+            const __m512 vtile = _mm512_cvtepi32_ps(_mm512_loadu_si512(tile + m * TILE_N));
+
+            __m512 vsum;
+            if (is_acc) {
+                vsum = _mm512_loadu_ps(C + m * ldc);
+            } else {
+                vsum = _mm512_set1_ps(0.f);
+            }
+
+            vsum = _mm512_fmadd_ps(vtile, vd, vsum);
+            _mm512_storeu_ps(C + m * ldc, vsum);
+        }
+    }
+};
+
+template <bool is_acc>
+struct acc_C<block_q8_K, block_iq2_xs, is_acc> {
+    static void apply(float * RESTRICT C, int ldc, const int32_t * RESTRICT tile, const block_q8_K * A, int lda, const void * packed_B, int nr) {
+        const ggml_half * d0 = reinterpret_cast<const ggml_half *>((const char *)packed_B + QK_K * TILE_N + 16 * TILE_N);
+
+        const __m512 vd0 = _mm512_mul_ps(_mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)d0)), _mm512_set1_ps(0.125f));
+
+        for (int m = 0; m < nr; ++m) {
+            const float d1 = A[m * lda].d;
+            const __m512 vd = _mm512_mul_ps(_mm512_set1_ps(d1), vd0);
+            const __m512 vtile = _mm512_cvtepi32_ps(_mm512_loadu_si512(tile + m * TILE_N));
+
+            __m512 vsum;
+            if (is_acc) {
+                vsum = _mm512_loadu_ps(C + m * ldc);
+            } else {
+                vsum = _mm512_set1_ps(0.f);
+            }
+
+            vsum = _mm512_fmadd_ps(vtile, vd, vsum);
+            _mm512_storeu_ps(C + m * ldc, vsum);
+        }
+    }
+};
+
+// Q2_K: same structure as Q4_K (scales already applied by scale_C; here the mins
+// term is accumulated against the per-16-group bsums), but with 16 groups of 16
+// instead of 8 groups of 32, so the mins loop runs 8 iterations over the raw
+// bsums dwords (no hadd pairing needed).
+template <bool is_acc>
+struct acc_C<block_q8_K, block_q2_K, is_acc> {
+    static void apply(float * RESTRICT C, int ldc, const int32_t * RESTRICT tile, const block_q8_K * A, int lda, const void * packed_B, int nr) {
+        const int8_t * mins = reinterpret_cast<const int8_t *>((const char *)packed_B + QK_K * TILE_N + 16 * TILE_N);
+        const ggml_half * d0 = reinterpret_cast<const ggml_half *>(mins + 16 * TILE_N);
+        const ggml_half * dmin = d0 + TILE_N;
+
+        const __m512 vd0 = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)d0));
+        const __m512 vdmin = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)dmin));
+
+        for (int m = 0; m < nr; ++m) {
+            const float d1 = A[m * lda].d;
+            const __m512 vd = _mm512_mul_ps(_mm512_set1_ps(d1), vd0);
+            const __m512 vdm = _mm512_mul_ps(_mm512_set1_ps(-d1), vdmin);
+            const __m512 vtile = _mm512_cvtepi32_ps(_mm512_loadu_si512(tile + m * TILE_N));
+
+            __m512 vsum;
+            if (is_acc) {
+                vsum = _mm512_loadu_ps(C + m * ldc);
+            } else {
+                vsum = _mm512_set1_ps(0.f);
+            }
+
+            // 16 int16 bsums; dword j holds the (bsums[2j], bsums[2j+1]) pair
+            const __m512i q8sums = _mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *)A[m * lda].bsums));
+
+            __m512i acc_m = _mm512_setzero_si512();
+            for (int k = 0; k < 8; ++k) {
+                __m512i va = _mm512_permutexvar_epi32(_mm512_set1_epi32(k), q8sums);
+                __m512i vb = _mm512_cvtepi8_epi16(_mm256_loadu_si256((const __m256i *)(mins + k * 32)));
+                acc_m = _mm512_dpwssds_epi32(acc_m, va, vb);
+            }
+
+            vsum = _mm512_fmadd_ps(vtile, vd, vsum);
+            vsum = _mm512_fmadd_ps(_mm512_cvtepi32_ps(acc_m), vdm, vsum);
+            _mm512_storeu_ps(C + m * ldc, vsum);
+        }
+    }
+};
+
 template <typename TB> constexpr int get_quants_size();
 template <> constexpr int get_quants_size<block_q4_K>() { return (QK_K / 2) * TILE_N; }
 template <> constexpr int get_quants_size<block_q5_K>() { return (QK_K / 2) * TILE_N + (QK_K / 8) * TILE_N; }
 template <> constexpr int get_quants_size<block_q6_K>() { return (QK_K / 2) * TILE_N + (QK_K / 4) * TILE_N; }
 template <> constexpr int get_quants_size<block_iq4_xs>() { return (QK_K / 2) * TILE_N; }
+template <> constexpr int get_quants_size<block_q2_K>() { return QK_K * TILE_N; }
+template <> constexpr int get_quants_size<block_iq2_xxs>() { return QK_K * TILE_N; }
+template <> constexpr int get_quants_size<block_iq2_xs>() { return QK_K * TILE_N; }
+template <> constexpr int get_quants_size<block_iq3_xxs>() { return QK_K * TILE_N; }
 
 // used for QKK format
 template <typename TB, bool is_acc,
@@ -1417,6 +1923,79 @@ struct tinygemm_kernel_vnni<block_q8_0, block_q4_0, float, BLOCK_M, BLOCK_N, BLO
             }
             const int offset = TILE_N * TILE_K / 2;
             const __m512 vd0 = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)(b_ptr + offset)));
+            vsum = _mm512_sub_epi32(vsum, vcomp);
+
+            vc[col] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(vsum), _mm512_mul_ps(vd0, vd1), vc[col]);
+        };
+
+        for (int i = 0; i < KB; ++i) {
+            Unroll<COLS>{}(compute, i);
+        }
+
+        //store to C
+        auto storec = [&](auto col) {
+            _mm512_storeu_ps((__m512i*)(C + 0 * ldc + col * 16), vc[col]);
+        };
+        Unroll<COLS>{}(storec);
+    }
+};
+
+template <int BLOCK_M, int BLOCK_N, int BLOCK_K>
+struct tinygemm_kernel_vnni<block_q8_0, block_mxfp4, float, BLOCK_M, BLOCK_N, BLOCK_K> {
+    static void apply(int KB, const void * RESTRICT _A, const void * RESTRICT _B, float * RESTRICT C, int ldc) {
+
+        constexpr int COLS = BLOCK_N / 16;
+        const int TILE_SIZE = TILE_N * sizeof(block_mxfp4);
+
+        const block_q8_0 * RESTRICT A = static_cast<const block_q8_0 *>(_A);
+        const char * RESTRICT B = static_cast<const char *>(_B);
+
+        __m512i va[8];
+        __m512 vc[COLS];
+        __m512 vd1;
+
+        // sum of offsets, shared across COLS
+        //
+        // kvalues_fp4 are signed and avx512-vnni does not have `_mm512_dpbssd_epi32`,
+        // need to transform ss to us:
+        //   a * b is equivalent to a * (b + 128) - 128 * a
+        //   s   s                   s    u          u    s
+        //
+        __m512i vcomp;
+
+        const __m512i off = _mm512_set1_epi8(static_cast<char>(0x80));
+        const __m512i lowMask = _mm512_set1_epi8(0xF);
+        const __m512i values256 = _mm512_add_epi8(kvalues_fp4_128(), off);
+
+        auto loadc = [&](auto col) {
+            vc[col] = _mm512_setzero_ps();
+        };
+        Unroll<COLS>{}(loadc);
+
+        auto compute = [&](auto col, auto i) {
+            // load a and compute compensation
+            if constexpr (col == 0) {
+                const int32_t * a_ptr = reinterpret_cast<const int32_t *>(A[0 * KB + i].qs);
+                vcomp = _mm512_setzero_si512();
+                for (int k = 0; k < 8; ++k) {
+                    va[k] = _mm512_set1_epi32(a_ptr[k]);
+                    vcomp = _mm512_dpbusd_epi32(vcomp, off, va[k]);
+                }
+                vd1 = _mm512_set1_ps(GGML_CPU_FP16_TO_FP32(A[0 * KB + i].d));
+            }
+
+            // load b, decode nibbles to (kvalues_fp4 + 128) via LUT
+            __m512i vsum = _mm512_setzero_si512();
+            const char * b_ptr = B + PACKED_INDEX(col, i, KB, TILE_SIZE);
+            for (int k = 0; k < 8; k += 2) {
+                __m512i bytes = _mm512_loadu_si512((const __m512i *)(b_ptr + k * 32));
+                __m512i vb0 = _mm512_shuffle_epi8(values256, _mm512_and_si512(bytes, lowMask));
+                vsum = _mm512_dpbusd_epi32(vsum, vb0, va[k + 0]);
+                __m512i vb1 = _mm512_shuffle_epi8(values256, _mm512_and_si512(_mm512_srli_epi16(bytes, 4), lowMask));
+                vsum = _mm512_dpbusd_epi32(vsum, vb1, va[k + 1]);
+            }
+            const int offset = TILE_N * TILE_K / 2;
+            const __m512 vd0 = e8m0_half_to_fp32_16((const uint8_t *)(b_ptr + offset));
             vsum = _mm512_sub_epi32(vsum, vcomp);
 
             vc[col] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(vsum), _mm512_mul_ps(vd0, vd1), vc[col]);
@@ -1983,6 +2562,344 @@ struct tinygemm_kernel_vnni<block_q8_K, block_iq4_xs, float, BLOCK_M, BLOCK_N, B
     }
 };
 
+// IQ2_XXS / IQ3_XXS M==1: quants are decoded 8-bit in vnni layout (512B per
+// 32-value group). Same compensation trick as IQ4_XS: bias the signed B values
+// by +128 to make them the unsigned operand of dpbusd, then subtract
+// 128 * (per-group bsum of A).
+template <int BLOCK_M, int BLOCK_N, int BLOCK_K>
+struct tinygemm_kernel_vnni<block_q8_K, block_iq2_xxs, float, BLOCK_M, BLOCK_N, BLOCK_K> {
+    static void apply(int KB, const void * RESTRICT _A, const void * RESTRICT _B, float * RESTRICT C, int ldc) {
+
+        constexpr int COLS = BLOCK_N / 16;
+        const int TILE_SIZE = TILE_N * (QK_K + 8 + 2);
+
+        const block_q8_K * RESTRICT A = static_cast<const block_q8_K *>(_A);
+        const char * RESTRICT B = static_cast<const char *>(_B);
+
+        __m512i va[4];
+        __m512 vc[COLS];
+        __m512 vd1;
+
+        // packed_B:
+        const int offset_scales = QK_K * TILE_N;
+        const int offset_d0     = QK_K * TILE_N + 8 * TILE_N;
+
+        // compensation
+        __m512i vcomp;
+
+        const __m256i m128s = _mm256_set1_epi16(128);
+        const __m512i off = _mm512_set1_epi8(static_cast<char>(0x80));
+
+        auto loadc = [&](auto col) {
+            vc[col] = _mm512_setzero_ps();
+        };
+        Unroll<COLS>{}(loadc);
+
+        auto compute = [&](auto col, auto i) {
+            if constexpr (col == 0) {
+                // load a
+                va[0] = _mm512_loadu_si512((const __m512i *)(A[0 * KB + i].qs +   0));
+                va[1] = _mm512_loadu_si512((const __m512i *)(A[0 * KB + i].qs +  64));
+                va[2] = _mm512_loadu_si512((const __m512i *)(A[0 * KB + i].qs + 128));
+                va[3] = _mm512_loadu_si512((const __m512i *)(A[0 * KB + i].qs + 192));
+
+                // compensation: 128 * A (one int32 per 32-value group)
+                const __m256i q8sums = _mm256_loadu_si256((const __m256i *)A[0 * KB + i].bsums);
+                vcomp = _mm512_castsi256_si512(_mm256_madd_epi16(q8sums, m128s));
+                vd1 = _mm512_set1_ps(A[0 * KB + i].d);
+            }
+
+            // accumulate the quants
+            __m512i acc = _mm512_setzero_si512();
+            const char * b_ptr = B + PACKED_INDEX(col, i, KB, TILE_SIZE);
+            const char * b_qs = b_ptr;
+            int mask = 0;
+            for (int k_group = 0; k_group < QK_K / 32; ++k_group) {
+                int r = k_group >> 1;
+                __m512i vmask = _mm512_set1_epi32(k_group);
+                __m512i vsum = _mm512_setzero_si512();
+                for (int k = 0; k < 8; ++k) {
+                    __m512i va0 = _mm512_permutexvar_epi32(_mm512_set1_epi32(mask++), va[r]);
+                    __m512i vb = _mm512_add_epi8(_mm512_loadu_si512(b_qs), off);
+                    vsum = _mm512_dpbusd_epi32(vsum, vb, va0);
+                    b_qs += 64;
+                }
+                // (B + 128) * A - 128 * A
+                vsum = _mm512_sub_epi32(vsum, _mm512_permutexvar_epi32(vmask, vcomp));
+
+                // vacc += scale * (q8 @ q2)
+                const __m512i vscale = _mm512_cvtepi8_epi32(_mm_loadu_si128((const __m128i *)(b_ptr + offset_scales + k_group * TILE_N)));
+                acc = _mm512_add_epi32(acc, _mm512_mullo_epi32(vsum, vscale));
+            }
+            const __m512 vd0 = _mm512_mul_ps(
+                _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)(b_ptr + offset_d0))), _mm512_set1_ps(0.125f));
+            vc[col] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(acc), _mm512_mul_ps(vd0, vd1), vc[col]);
+        };
+
+        for (int i = 0; i < KB; ++i) {
+            Unroll<COLS>{}(compute, i);
+        }
+
+        //store to C
+        auto storec = [&](auto col) {
+            _mm512_storeu_ps((__m512i*)(C + 0 * ldc + col * 16), vc[col]);
+        };
+        Unroll<COLS>{}(storec);
+    }
+};
+
+// IQ3_XXS M==1: identical to IQ2_XXS except the global factor is 0.25f
+template <int BLOCK_M, int BLOCK_N, int BLOCK_K>
+struct tinygemm_kernel_vnni<block_q8_K, block_iq3_xxs, float, BLOCK_M, BLOCK_N, BLOCK_K> {
+    static void apply(int KB, const void * RESTRICT _A, const void * RESTRICT _B, float * RESTRICT C, int ldc) {
+
+        constexpr int COLS = BLOCK_N / 16;
+        const int TILE_SIZE = TILE_N * (QK_K + 8 + 2);
+
+        const block_q8_K * RESTRICT A = static_cast<const block_q8_K *>(_A);
+        const char * RESTRICT B = static_cast<const char *>(_B);
+
+        __m512i va[4];
+        __m512 vc[COLS];
+        __m512 vd1;
+
+        // packed_B:
+        const int offset_scales = QK_K * TILE_N;
+        const int offset_d0     = QK_K * TILE_N + 8 * TILE_N;
+
+        // compensation
+        __m512i vcomp;
+
+        const __m256i m128s = _mm256_set1_epi16(128);
+        const __m512i off = _mm512_set1_epi8(static_cast<char>(0x80));
+
+        auto loadc = [&](auto col) {
+            vc[col] = _mm512_setzero_ps();
+        };
+        Unroll<COLS>{}(loadc);
+
+        auto compute = [&](auto col, auto i) {
+            if constexpr (col == 0) {
+                // load a
+                va[0] = _mm512_loadu_si512((const __m512i *)(A[0 * KB + i].qs +   0));
+                va[1] = _mm512_loadu_si512((const __m512i *)(A[0 * KB + i].qs +  64));
+                va[2] = _mm512_loadu_si512((const __m512i *)(A[0 * KB + i].qs + 128));
+                va[3] = _mm512_loadu_si512((const __m512i *)(A[0 * KB + i].qs + 192));
+
+                // compensation: 128 * A (one int32 per 32-value group)
+                const __m256i q8sums = _mm256_loadu_si256((const __m256i *)A[0 * KB + i].bsums);
+                vcomp = _mm512_castsi256_si512(_mm256_madd_epi16(q8sums, m128s));
+                vd1 = _mm512_set1_ps(A[0 * KB + i].d);
+            }
+
+            // accumulate the quants
+            __m512i acc = _mm512_setzero_si512();
+            const char * b_ptr = B + PACKED_INDEX(col, i, KB, TILE_SIZE);
+            const char * b_qs = b_ptr;
+            int mask = 0;
+            for (int k_group = 0; k_group < QK_K / 32; ++k_group) {
+                int r = k_group >> 1;
+                __m512i vmask = _mm512_set1_epi32(k_group);
+                __m512i vsum = _mm512_setzero_si512();
+                for (int k = 0; k < 8; ++k) {
+                    __m512i va0 = _mm512_permutexvar_epi32(_mm512_set1_epi32(mask++), va[r]);
+                    __m512i vb = _mm512_add_epi8(_mm512_loadu_si512(b_qs), off);
+                    vsum = _mm512_dpbusd_epi32(vsum, vb, va0);
+                    b_qs += 64;
+                }
+                // (B + 128) * A - 128 * A
+                vsum = _mm512_sub_epi32(vsum, _mm512_permutexvar_epi32(vmask, vcomp));
+
+                // vacc += scale * (q8 @ q3)
+                const __m512i vscale = _mm512_cvtepi8_epi32(_mm_loadu_si128((const __m128i *)(b_ptr + offset_scales + k_group * TILE_N)));
+                acc = _mm512_add_epi32(acc, _mm512_mullo_epi32(vsum, vscale));
+            }
+            const __m512 vd0 = _mm512_mul_ps(
+                _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)(b_ptr + offset_d0))), _mm512_set1_ps(0.25f));
+            vc[col] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(acc), _mm512_mul_ps(vd0, vd1), vc[col]);
+        };
+
+        for (int i = 0; i < KB; ++i) {
+            Unroll<COLS>{}(compute, i);
+        }
+
+        //store to C
+        auto storec = [&](auto col) {
+            _mm512_storeu_ps((__m512i*)(C + 0 * ldc + col * 16), vc[col]);
+        };
+        Unroll<COLS>{}(storec);
+    }
+};
+
+// IQ2_XS M==1: 16-value group granularity (like Q6_K), decoded signed quants,
+// +128 bias compensation per 16-value group.
+template <int BLOCK_M, int BLOCK_N, int BLOCK_K>
+struct tinygemm_kernel_vnni<block_q8_K, block_iq2_xs, float, BLOCK_M, BLOCK_N, BLOCK_K> {
+    static void apply(int KB, const void * RESTRICT _A, const void * RESTRICT _B, float * RESTRICT C, int ldc) {
+
+        constexpr int COLS = BLOCK_N / 16;
+        const int TILE_SIZE = TILE_N * (QK_K + 16 + 2);
+
+        const block_q8_K * RESTRICT A = static_cast<const block_q8_K *>(_A);
+        const char * RESTRICT B = static_cast<const char *>(_B);
+
+        __m512i va[4];
+        __m512 vc[COLS];
+        __m512 vd1;
+
+        // packed_B:
+        const int offset_scales = QK_K * TILE_N;
+        const int offset_d0     = QK_K * TILE_N + 16 * TILE_N;
+
+        // compensation
+        __m512i vcomp;
+
+        const __m512i m128 = _mm512_set1_epi32(128);
+        const __m512i off = _mm512_set1_epi8(static_cast<char>(0x80));
+
+        auto loadc = [&](auto col) {
+            vc[col] = _mm512_setzero_ps();
+        };
+        Unroll<COLS>{}(loadc);
+
+        auto compute = [&](auto col, auto i) {
+            if constexpr (col == 0) {
+                // load a
+                va[0] = _mm512_loadu_si512((const __m512i *)(A[0 * KB + i].qs +   0));
+                va[1] = _mm512_loadu_si512((const __m512i *)(A[0 * KB + i].qs +  64));
+                va[2] = _mm512_loadu_si512((const __m512i *)(A[0 * KB + i].qs + 128));
+                va[3] = _mm512_loadu_si512((const __m512i *)(A[0 * KB + i].qs + 192));
+
+                // compensation: 128 * A (one int32 per 16-value group)
+                const __m256i q8sums = _mm256_loadu_si256((const __m256i *)A[0 * KB + i].bsums);
+                vcomp = _mm512_mullo_epi32(_mm512_cvtepi16_epi32(q8sums), m128);
+                vd1 = _mm512_set1_ps(A[0 * KB + i].d);
+            }
+
+            // accumulate the quants
+            __m512i acc = _mm512_setzero_si512();
+            const char * b_ptr = B + PACKED_INDEX(col, i, KB, TILE_SIZE);
+            int mask = 0;
+            for (int k_group = 0; k_group < QK_K / 16; ++k_group) {
+                int r = k_group >> 2;
+                const char * b_qs = b_ptr + k_group * (16 * TILE_N);
+                __m512i vsum = _mm512_setzero_si512();
+                for (int k = 0; k < 4; ++k) {
+                    __m512i va0 = _mm512_permutexvar_epi32(_mm512_set1_epi32(mask++), va[r]);
+                    __m512i vb = _mm512_add_epi8(_mm512_loadu_si512(b_qs), off);
+                    vsum = _mm512_dpbusd_epi32(vsum, vb, va0);
+                    b_qs += 64;
+                }
+                // (B + 128) * A - 128 * A
+                vsum = _mm512_sub_epi32(vsum, _mm512_permutexvar_epi32(_mm512_set1_epi32(k_group), vcomp));
+
+                // vacc += scale * (q8 @ q2)
+                const __m512i vscale = _mm512_cvtepi8_epi32(_mm_loadu_si128((const __m128i *)(b_ptr + offset_scales + k_group * TILE_N)));
+                acc = _mm512_add_epi32(acc, _mm512_mullo_epi32(vsum, vscale));
+            }
+            const __m512 vd0 = _mm512_mul_ps(
+                _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)(b_ptr + offset_d0))), _mm512_set1_ps(0.125f));
+            vc[col] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(acc), _mm512_mul_ps(vd0, vd1), vc[col]);
+        };
+
+        for (int i = 0; i < KB; ++i) {
+            Unroll<COLS>{}(compute, i);
+        }
+
+        //store to C
+        auto storec = [&](auto col) {
+            _mm512_storeu_ps((__m512i*)(C + 0 * ldc + col * 16), vc[col]);
+        };
+        Unroll<COLS>{}(storec);
+    }
+};
+
+// Q2_K M==1: 16-value groups, decoded quants are unsigned (0..3) so dpbusd
+// needs no compensation; mins term mirrors the Q4_K kernel but runs over 16
+// groups (8 dpwssds iterations over the raw bsums dwords).
+template <int BLOCK_M, int BLOCK_N, int BLOCK_K>
+struct tinygemm_kernel_vnni<block_q8_K, block_q2_K, float, BLOCK_M, BLOCK_N, BLOCK_K> {
+    static void apply(int KB, const void * RESTRICT _A, const void * RESTRICT _B, float * RESTRICT C, int ldc) {
+
+        constexpr int COLS = BLOCK_N / 16;
+        const int TILE_SIZE = TILE_N * (QK_K + 16 + 16 + 2 + 2);
+
+        const block_q8_K * RESTRICT A = static_cast<const block_q8_K *>(_A);
+        const char * RESTRICT B = static_cast<const char *>(_B);
+
+        __m512i va[4];
+        // a.bsum: 16 groups, 2 bytes each group (m256i)
+        __m512i va_bsum;
+        __m512 vc[COLS];
+        __m512 vd1;
+
+        // packed_B:
+        const int offset_scales = QK_K * TILE_N;
+        const int offset_mins   = QK_K * TILE_N + 16 * TILE_N;
+        const int offset_d0     = QK_K * TILE_N + 32 * TILE_N;
+        const int offset_dmin   = QK_K * TILE_N + 32 * TILE_N + TILE_N * sizeof(ggml_half);
+
+        auto loadc = [&](auto col) {
+            vc[col] = _mm512_setzero_ps();
+        };
+        Unroll<COLS>{}(loadc);
+
+        auto compute = [&](auto col, auto i) {
+            if constexpr (col == 0) {
+                // load a
+                va[0] = _mm512_loadu_si512((const __m512i *)(A[0 * KB + i].qs +   0));
+                va[1] = _mm512_loadu_si512((const __m512i *)(A[0 * KB + i].qs +  64));
+                va[2] = _mm512_loadu_si512((const __m512i *)(A[0 * KB + i].qs + 128));
+                va[3] = _mm512_loadu_si512((const __m512i *)(A[0 * KB + i].qs + 192));
+
+                va_bsum = _mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *)A[0 * KB + i].bsums));
+                vd1 = _mm512_set1_ps(A[0 * KB + i].d);
+            }
+
+            // step 1: accumulate the quants
+            __m512i acc = _mm512_setzero_si512();
+            const char * b_ptr = B + PACKED_INDEX(col, i, KB, TILE_SIZE);
+            int mask = 0;
+            for (int k_group = 0; k_group < QK_K / 16; ++k_group) {
+                int r = k_group >> 2;
+                const char * b_qs = b_ptr + k_group * (16 * TILE_N);
+                __m512i vsum = _mm512_setzero_si512();
+                for (int k = 0; k < 4; ++k) {
+                    __m512i va0 = _mm512_permutexvar_epi32(_mm512_set1_epi32(mask++), va[r]);
+                    __m512i vb = _mm512_loadu_si512(b_qs);
+                    vsum = _mm512_dpbusd_epi32(vsum, vb, va0);
+                    b_qs += 64;
+                }
+                // vacc += scale * (q8 @ q2)
+                const __m512i vscale = _mm512_cvtepi8_epi32(_mm_loadu_si128((const __m128i *)(b_ptr + offset_scales + k_group * TILE_N)));
+                acc = _mm512_add_epi32(acc, _mm512_mullo_epi32(vsum, vscale));
+            }
+            const __m512 vd0 = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)(b_ptr + offset_d0)));
+            vc[col] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(acc), _mm512_mul_ps(vd0, vd1), vc[col]);
+
+            // step 2: accumulate the mins
+            __m512i acc_m = _mm512_setzero_si512();
+            for (int k = 0; k < 8; ++k) {
+                __m512i va = _mm512_permutexvar_epi32(_mm512_set1_epi32(k), va_bsum);
+                __m512i vb = _mm512_cvtepi8_epi16(_mm256_loadu_si256((const __m256i *)(b_ptr + offset_mins + k * 32)));
+                acc_m = _mm512_dpwssds_epi32(acc_m, va, vb);
+            }
+            const __m512 vdmin = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)(b_ptr + offset_dmin)));
+            vc[col] = _mm512_fnmadd_ps(_mm512_cvtepi32_ps(acc_m), _mm512_mul_ps(vdmin, vd1), vc[col]);
+        };
+
+        for (int i = 0; i < KB; ++i) {
+            Unroll<COLS>{}(compute, i);
+        }
+
+        //store to C
+        auto storec = [&](auto col) {
+            _mm512_storeu_ps((__m512i*)(C + 0 * ldc + col * 16), vc[col]);
+        };
+        Unroll<COLS>{}(storec);
+    }
+};
+
 #define LAUNCH_TINYGEMM_KERNEL_VNNI(NB_SIZE)                                                   \
     tinygemm_kernel_vnni<vec_dot_type, type, float, 1, NB_SIZE, blck_size>::apply(             \
         KB, wdata_batch,                                                                       \
@@ -2203,7 +3120,7 @@ void tinygemm_kernel_amx(int M, int N, int KB, const void * RESTRICT _A, const v
     alignas(64) static thread_local int32_t Sumi6[TILE_M * TILE_N];
     alignas(64) static thread_local int32_t Sumi7[TILE_M * TILE_N];
 
-    const int k_group_size = std::is_same<TB, block_q6_K>::value ? 16 : 32;
+    const int k_group_size = qkk_group_16<TB>::value ? 16 : 32;
     for (int i = 0; i < KB; ++i) {
         // step 1: accumulate the quants across 8 groups, each group with 32
         for (int k = 0; k < QK_K / k_group_size; ++k) {
@@ -2270,12 +3187,15 @@ size_t ggml_backend_amx_get_alloc_size(const struct ggml_tensor * tensor) {
     const int K = tensor->ne[0]; // ne0: in_features
     const int N = tensor->ne[1]; // ne1: out_features
 
+    // > 1 only for MUL_MAT_ID expert stacks: [K, N, n_expert]
+    const int64_t n_matrices = (int64_t) tensor->ne[2] * tensor->ne[3];
+
     auto get_tensor_size = [&] {
         size_t row_size_B{0};
         GGML_DISPATCH_QTYPES(TYPE, [&] {
             row_size_B = get_row_size<type, blck_size>(K);
         });
-        return N * row_size_B;
+        return (size_t) n_matrices * N * row_size_B;
     };
 
     if (qtype_has_amx_kernels(TYPE)) {
@@ -2295,8 +3215,18 @@ void ggml_backend_amx_convert_weight(struct ggml_tensor * tensor, const void * d
     const int K = tensor->ne[0]; // ne0: in_features
     const int N = tensor->ne[1]; // ne1: out_features
 
+    // > 1 only for MUL_MAT_ID expert stacks: [K, N, n_expert]; each expert matrix is
+    // packed independently into its own contiguous {NB, KB, TILE_SIZE} run so that
+    // expert e's tile (n, k) stays at e * (N/TILE_N) * KB * TILE_SIZE + PACKED_INDEX(n, k).
+    const int64_t n_matrices = (int64_t) tensor->ne[2] * tensor->ne[3];
+
     GGML_DISPATCH_QTYPES(TYPE, [&] {
-        convert_B_packed_format<type, blck_size>((void *)((char *)tensor->data + offset), (const type *)data, N, K);
+        const size_t src_stride = ggml_row_size(TYPE, K) * N;            // one unpacked expert
+        const size_t dst_stride = (size_t) get_row_size<type, blck_size>(K) * N; // one packed expert
+        for (int64_t e = 0; e < n_matrices; ++e) {
+            convert_B_packed_format<type, blck_size>((char *)tensor->data + offset + e * dst_stride,
+                                                     (const type *)((const char *)data + e * src_stride), N, K);
+        }
     });
 }
 
@@ -2503,6 +3433,216 @@ void ggml_backend_amx_mul_mat(const ggml_compute_params * params, struct ggml_te
                     wdata_batch + mb_start * row_size_A,
                     (const char *)src0->data + src0_offset + PACKED_INDEX(nb * 2, 0, KB, TILE_SIZE),
                     (float *) dst->data + dst_offset + mb_start * N + nb_start, ldc);
+            }
+        });
+    });
+}
+
+// NB: MoE expert-routed matmul (MUL_MAT_ID) with Advanced Matrix Extensions (Intel AMX)
+//
+// src0: weights in shape of {K, N, n_expert}, quantized, AMX packed (one {NB, KB, TILE_SIZE}
+//       run per expert, see ggml_backend_amx_convert_weight)
+// src1: input  in shape of {K, ne11, n_tokens}, float32
+// ids:  expert ids in shape of {n_expert_used, n_tokens}, int32
+// dst:  output in shape of {N, n_expert_used, n_tokens}, float32
+//
+// the function performs: dst[:, e, t] = src0[:, :, ids[e, t]].T @ src1[:, e % ne11, t]
+//
+// The row mapping (expert -> compact list of (slot, token) pairs) mirrors the repack
+// forward_mul_mat_id construction, but the AMX A operand is a plain per-row
+// vec_dot_type array, so the gather degenerates to a per-row memcpy into a
+// contiguous per-thread scratch (no 4-row interleave) and partial M blocks are
+// handled inside the tinygemm kernel (unpack_A path), same as MUL_MAT.
+//
+// TODO(EP): the NUMA EP row-window claim loop (GGML_NUMA_EP) is only wired into the
+// repack forward_mul_mat_id; when the AMX buft is integrated with the EPD worker,
+// this is where the per-node window / row_claim claiming should hook in.
+
+#define AMX_MMID_BLOCK_M (2 * TILE_M)
+
+struct amx_mmid_row_mapping {
+    int32_t i1; // selected expert slot (dst dim 1)
+    int32_t i2; // token (src1/dst dim 2)
+};
+
+// workspace layout (must match ggml_backend_amx_mul_mat_id):
+//   [0]                        quantized src1 rows, n_src1_rows * row_size_A
+//   [qact_size]                expert row counts/offsets/cursors, (3*n_as + 1) int64
+//   [qact_size + counts_size]  compact (slot, token) mapping, n_selected entries
+//   [...]                      per-thread scratch: AMX_MMID_BLOCK_M gathered activation
+//                              rows + AMX_MMID_BLOCK_M x 2*TILE_N f32 tile
+static void ggml_backend_amx_mmid_wsize_layout(const struct ggml_tensor * dst, int n_threads,
+                                               size_t & row_size_A_out, size_t & qact_size,
+                                               size_t & counts_size, size_t & map_size,
+                                               size_t & scratch_stride, size_t & total) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const ggml_tensor * ids  = dst->src[2];
+
+    const enum ggml_type TYPE = src0->type;
+
+    const int K    = src0->ne[0];
+    const int n_as = src0->ne[2];
+
+    const int64_t n_src1_rows = (int64_t) src1->ne[1] * src1->ne[2];
+    const int64_t n_selected  = (int64_t) ids->ne[0] * ids->ne[1];
+
+    total = 0;
+    GGML_DISPATCH_QTYPES(TYPE, [&] {
+        const size_t row_size_A = (size_t) K / blck_size * sizeof(vec_dot_type);
+        row_size_A_out = row_size_A;
+        qact_size      = GGML_PAD(n_src1_rows * row_size_A, 64);
+        counts_size    = GGML_PAD((3 * (size_t) n_as + 1) * sizeof(int64_t), 64);
+        map_size       = GGML_PAD((size_t) n_selected * sizeof(amx_mmid_row_mapping), 64);
+        scratch_stride = GGML_PAD(AMX_MMID_BLOCK_M * row_size_A +
+                                  AMX_MMID_BLOCK_M * 2 * TILE_N * sizeof(float), 64);
+        total = qact_size + counts_size + map_size + (size_t) n_threads * scratch_stride;
+    });
+}
+
+size_t ggml_backend_amx_mmid_desired_wsize(int n_threads, const struct ggml_tensor * dst) {
+    size_t row_size_A, qact_size, counts_size, map_size, scratch_stride, total;
+    ggml_backend_amx_mmid_wsize_layout(dst, n_threads, row_size_A, qact_size, counts_size,
+                                       map_size, scratch_stride, total);
+    return total;
+}
+
+void ggml_backend_amx_mul_mat_id(const ggml_compute_params * params, struct ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const ggml_tensor * ids  = dst->src[2];
+
+    const enum ggml_type TYPE = src0->type;
+
+    const int K     = src0->ne[0];
+    const int N     = src0->ne[1];
+    const int n_as  = src0->ne[2]; // n_expert
+    const int n_ids = ids->ne[0];  // n_expert_used
+
+    const int64_t n_tokens    = ids->ne[1];
+    const int64_t ne11        = src1->ne[1]; // src1 slots (broadcast: n_ids % ne11 == 0)
+    const int64_t n_src1_rows = ne11 * src1->ne[2];
+    const int64_t n_selected  = (int64_t) n_ids * n_tokens;
+
+    // we don't support permuted inputs; dst row stride must be dense floats
+    GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(src1));
+    GGML_ASSERT(src1->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->nb[0] == sizeof(float));
+    GGML_ASSERT(dst->ne[0] == N && dst->ne[1] == n_ids && dst->ne[2] == n_tokens);
+    GGML_ASSERT(N % (2 * TILE_N) == 0); // gated by supports_op
+
+    size_t row_size_A, qact_size, counts_size, map_size, scratch_stride, wsize_needed;
+    ggml_backend_amx_mmid_wsize_layout(dst, params->nth, row_size_A, qact_size, counts_size,
+                                       map_size, scratch_stride, wsize_needed);
+    if (params->wsize < wsize_needed) {
+        GGML_ABORT("insufficient work space size");
+    }
+
+    char * wdata = (char *) params->wdata;
+
+    char * qact = wdata; // quantized src1 rows, row r = i11 + i12 * ne11
+    int64_t * matrix_row_counts  = (int64_t *) (wdata + qact_size);      // [n_as]
+    int64_t * matrix_row_offsets = matrix_row_counts + n_as;             // [n_as + 1]
+    int64_t * matrix_row_cursors = matrix_row_offsets + n_as + 1;        // [n_as]
+    amx_mmid_row_mapping * matrix_rows =
+        (amx_mmid_row_mapping *) (wdata + qact_size + counts_size);      // [n_selected]
+    char * scratch_base = wdata + qact_size + counts_size + map_size;    // per-thread
+
+    GGML_DISPATCH_QTYPES(TYPE, [&] {
+        const int KB = K / blck_size;
+        const int TILE_SIZE = get_tile_size<type>();
+        const size_t expert_stride = (size_t) (N / TILE_N) * KB * TILE_SIZE; // one packed expert
+
+        GGML_ASSERT(TILE_K == blck_size || TILE_K * 8 == blck_size);
+
+        // quantize all src1 rows once (row-major: slot-fastest, then token)
+        parallel_for_ggml(params, (int) n_src1_rows, [&](int begin, int end) {
+            for (int r = begin; r < end; ++r) {
+                const int64_t i12 = r / ne11;
+                const int64_t i11 = r % ne11;
+                from_float<vec_dot_type>(
+                    (const float *) ((const char *) src1->data + i12 * src1->nb[2] + i11 * src1->nb[1]),
+                    qact + (size_t) r * row_size_A, K);
+            }
+        });
+
+        // build the compact expert -> (slot, token) row mapping (same construction as
+        // repack.cpp forward_mul_mat_id: count, prefix-sum, fill)
+        if (params->ith == 0) {
+            memset(matrix_row_counts, 0, n_as * sizeof(int64_t));
+
+            for (int32_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
+                for (int32_t id = 0; id < n_ids; ++id) {
+                    const int32_t i02 =
+                        *(const int32_t *) ((const char *) ids->data + iid1 * ids->nb[1] + id * ids->nb[0]);
+                    GGML_ASSERT(i02 >= 0 && i02 < n_as);
+                    matrix_row_counts[i02] += 1;
+                }
+            }
+
+            matrix_row_offsets[0] = 0;
+            for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+                matrix_row_offsets[cur_a + 1] = matrix_row_offsets[cur_a] + matrix_row_counts[cur_a];
+                matrix_row_cursors[cur_a] = 0;
+            }
+            GGML_ASSERT(matrix_row_offsets[n_as] == n_selected);
+
+            for (int32_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
+                for (int32_t id = 0; id < n_ids; ++id) {
+                    const int32_t i02 =
+                        *(const int32_t *) ((const char *) ids->data + iid1 * ids->nb[1] + id * ids->nb[0]);
+                    matrix_rows[matrix_row_offsets[i02] + matrix_row_cursors[i02]++] = { id, iid1 };
+                }
+            }
+        }
+
+        ggml_barrier(params->threadpool);
+
+        // compute: work items are (expert, 32-column block) pairs; each thread gathers
+        // the expert's selected activation rows in chunks of AMX_MMID_BLOCK_M, runs the
+        // tinygemm kernel on the chunk and scatters the rows back to (slot, token).
+        // Every dst element has exactly one writer, so the result is run-to-run
+        // bit-exact for a fixed thread count.
+        const int NB32 = N / (2 * TILE_N);
+
+        parallel_for_ggml(params, n_as * NB32, [&](int begin, int end) {
+            ggml_tile_config_init();
+
+            char * gather = scratch_base + (size_t) params->ith * scratch_stride;
+            float * tile  = (float *) (gather + AMX_MMID_BLOCK_M * row_size_A);
+
+            for (int i = begin; i < end; ++i) {
+                const int cur_a = i / NB32;
+                const int nb    = i % NB32;
+
+                const int64_t cne1 = matrix_row_counts[cur_a];
+                if (cne1 == 0) {
+                    continue;
+                }
+
+                const amx_mmid_row_mapping * rows = matrix_rows + matrix_row_offsets[cur_a];
+                const char * B = (const char *) src0->data + (size_t) cur_a * expert_stride +
+                                 PACKED_INDEX(nb * 2, 0, KB, TILE_SIZE);
+
+                for (int64_t base = 0; base < cne1; base += AMX_MMID_BLOCK_M) {
+                    const int m = (int) std::min<int64_t>(AMX_MMID_BLOCK_M, cne1 - base);
+
+                    // gather: plain per-row copy of the quantized activations
+                    for (int r = 0; r < m; ++r) {
+                        const int64_t src1_row = (rows[base + r].i1 % ne11) + (int64_t) rows[base + r].i2 * ne11;
+                        memcpy(gather + (size_t) r * row_size_A, qact + (size_t) src1_row * row_size_A, row_size_A);
+                    }
+
+                    tinygemm_kernel_amx<vec_dot_type, type, float, blck_size>(
+                        m, 2 * TILE_N, KB, gather, B, tile, 2 * TILE_N);
+
+                    // scatter rows back to their original (slot, token) positions
+                    for (int r = 0; r < m; ++r) {
+                        memcpy((char *) dst->data + rows[base + r].i1 * dst->nb[1] +
+                               rows[base + r].i2 * dst->nb[2] + (size_t) nb * 2 * TILE_N * sizeof(float),
+                               tile + (size_t) r * 2 * TILE_N, 2 * TILE_N * sizeof(float));
+                    }
+                }
             }
         });
     });

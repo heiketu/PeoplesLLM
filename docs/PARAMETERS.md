@@ -314,3 +314,15 @@ llama-epd -m model.gguf --selftest [--selftest-layer N] [--selftest-tokens N]
 | `GGML_EP_RDMA_SPIN` | 硬件相关 | 仅 master 开有 +2.7%；占核，必须逐机 A/B |
 | `GGML_NUMA_FAKE_NODES` | 测试 only | 单节点机伪造 NUMA 拓扑 |
 | `LLAMA_DSV4_2KV=old` | 调试 only | 旧 2kv 对比路径，CUDA 上已坏 |
+
+## 8. AMX 加速路径（Sapphire Rapids+，Ice Lake 不可用）
+
+构建（默认 OFF）：`-DGGML_AMX_TILE=ON -DGGML_AMX_INT8=ON -DGGML_AMX_BF16=ON`，需同时显式开 AVX512 家族（非 NATIVE 构建时）：`-DGGML_NATIVE=OFF -DGGML_AVX512=ON -DGGML_AVX512_VNNI=ON -DGGML_AVX512_VBMI=ON -DGGML_AVX512_BF16=ON -DCMAKE_CXX_FLAGS="-mavx512vpopcntdq -mgfni" -DCMAKE_C_FLAGS="-mavx512vpopcntdq -mgfni"`。
+
+- 运行时门控：`arch_prctl(ARCH_REQ_XCOMP_PERM, XFEATURE_XTILEDATA)`——非 AMX 硬件上内核直接拒绝，AMX buft 自动缺席，权重落回 CPU_REPACK，行为与未编译 AMX 完全一致。
+- 类型覆盖：F16/BF16/Q4_0/Q4_1/Q8_0/Q4_K/Q5_K/Q6_K/IQ4_XS（上游）+ **MXFP4、IQ2_XXS、IQ2_XS、IQ3_XXS、Q2_K**（本分支补全，含 MUL_MAT/MUL_MAT_ID 双算子）。
+- 算子覆盖：MUL_MAT（上游）+ **MUL_MAT_ID MoE 专家路由**（本分支，per-expert tile 打包 + (slot,token) 路由映射）。
+- 布局策略：MXFP4 保持 4bit packed（tile 加载时 LUT 解码，带宽敏感场景体积不涨）；IQ 系列/Q2_K 为 pack 时解码到 int8（体积约 4x 原格式，换内核零改动）。
+- gemv/gemm 分流：M==1 自动走 AVX512-VNNI 内核（decode 带宽受限，AMX 无收益），M>1 走 tile gemm；无需手工阈值。
+- 验证手段（无 AMX 硬件）：Intel SDE `sde64 -spr` 下 bit-exact/tol 对比，harness 参考 `test-amx-smoke.cpp` 模式。
+- 未接：NUMA EP 行窗（GGML_NUMA_EP）对接 AMX buft（代码内有 TODO 对接点；128 行窗与 AMX 32 行块对齐已确认兼容）。
