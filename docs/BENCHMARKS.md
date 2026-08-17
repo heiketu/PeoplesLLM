@@ -31,69 +31,69 @@
 
 DeepSeek-V4 284B（Q3_K），GPU 卸载 14 层专家，72 线程：
 
-![DSV4 vs upstream](docs/benchmarks/dsv4_vs_upstream.png)
+![DSV4 vs upstream](benchmarks/dsv4_vs_upstream.png)
 
 行窗 EP 与 mirror 双双反超主线：**PP 2.1-2.2×、TG +9%**；行窗 EP 额外省一半专家内存。PP 优先或单路场景 isolate 配置 pp512 可达 370 tok/s。
 
 ### vs 主线全档复测（2026-08-07，DSV4-Flash 284B mxfp4 生产形态）
 
-![vs mainline 2026-08-07](docs/benchmarks/vs_mainline_20260807.png)
+![vs mainline 2026-08-07](benchmarks/vs_mainline_20260807.png)
 
 主线 `e9fa0781f` vs 本分支（含 Q2_K/mxfp4 VNNI dpbusd 化），同机同口径 llama-bench A/B。**GPU 卸载（-ngl 99 -ncmoe 99 EP，生产形态）：PP 全档 +40~59%（pp2048 265.1 vs 166.5、pp8192 257.7 vs 164.5、pp16384 227.5 vs 163.1）、TG +20%（23.3 vs 19.5）**；纯 CPU（-ngl 0）：PP +48%（135.1 vs 91.3），TG 已知回归（3.7 vs 8.1，−54%，EP 无关系，隔离定位中——GPU 卸载为生产场景，不受影响）。Q2_K repack 经 dpbusd 化后 PP 164→218（+33% 端到端），仍略落后 no-repack（244），Q2_K 建议维持 `--no-repack`。
 
 ### GLM-5.2 745B：IQ traits + gemm 分流
 
-![GLM traits](docs/benchmarks/glm_traits.png)
+![GLM traits](benchmarks/glm_traits.png)
 
 ### CPU 内核：8×8 repack vs 主线 legacy vec_dot
 
-![CPU kernel speedup](docs/benchmarks/cpu_kernel_speedup.png)
+![CPU kernel speedup](benchmarks/cpu_kernel_speedup.png)
 
 gemv（decode）≈1× 是内存带宽物理上限；prefill gemm 提升来自 8×8 重排摊销权重读带宽。完整 300 格数据可用 `tests/test-repack-kernels --perf` 复现。
 
 ### NUMA 局部性：为什么 EP/mirror 必然赢过主线 distribute
 
-![NUMA locality](docs/benchmarks/numa_locality.png)
+![NUMA locality](benchmarks/numa_locality.png)
 
-主线 `--numa distribute` 把权重页 interleave 摊到两路，每次权重读约 50% 跨 UPI；实测跨路读带宽只有本地的 ~38%（53.7-54.6 vs 136-143 GB/s，membw2 76 线程/路）。行窗 EP 与 mirror 结构性做到 ~100% 本地读，双路合计有效带宽 279.2 GB/s，比主线 interleave 模式（177.6 GB/s）高 **57%**。带宽矩阵全表见 `docs/CHANGES.md`。
+主线 `--numa distribute` 把权重页 interleave 摊到两路，每次权重读约 50% 跨 UPI；实测跨路读带宽只有本地的 ~38%（53.7-54.6 vs 136-143 GB/s，membw2 76 线程/路）。行窗 EP 与 mirror 结构性做到 ~100% 本地读，双路合计有效带宽 279.2 GB/s，比主线 interleave 模式（177.6 GB/s）高 **57%**。带宽矩阵全表见 `CHANGES.md`。
 
 ### 纯 CPU 推理（-ngl 0，同机 A/B）
 
-![Pure CPU vs upstream](docs/benchmarks/pure_cpu_vs_upstream.png)
+![Pure CPU vs upstream](benchmarks/pure_cpu_vs_upstream.png)
 
 DSV4 284B Q3_K 纯 CPU（72 线程 interleave）：**PP +38%、TG +17-18%**。2026-08-05 负载环境复测，安静窗口定稿后更新。
 
 ### 多 slot 并发与混合配置复测（2026-08-05）
 
-![Multi-slot concurrency](docs/benchmarks/multislot_concurrency.png)
+![Multi-slot concurrency](benchmarks/multislot_concurrency.png)
 
 llama-server 8 槽并发压测（每槽 512 tok）：**EP（行窗）配置全并发档领先主线——1 槽 +22%、8 槽 +18%（74.5 vs 63.2 tok/s）**；mirror 作为兼容性选项在 8 槽被主线反超 7%（高并发下其每令牌权重流量摊薄、结构性带宽优势贬值），生产多并发请用 `GGML_NUMA_EP=1` 配置。混合配置（14 层专家上双卡）同口径 llama-bench：EP pp512 **227.8 vs 主线 158.4（+44%）**、tg512 31.3 vs 29.1（+7.5%）；mirror pp512 200.2（+26%）。
 
 ### 超长上下文：layer-major prefill（DSV4-Flash，16K）
 
-![16K PP 演进](docs/benchmarks/longctx_pp_progression.png)
+![16K PP 演进](benchmarks/longctx_pp_progression.png)
 
-![MXFP4 Hybrid CPU 审计与双卡 EP](docs/benchmarks/mxfp4_hybrid_cpu_audit.png)
+![MXFP4 Hybrid CPU 审计与双卡 EP](benchmarks/mxfp4_hybrid_cpu_audit.png)
 
 原生 MXFP4 版（155GB，137GiB 专家单份 CPU_REPACK + 双路 NUMA EP）经 CPU 审计三连修后 4K PP +144%。
 
 ### 长上下文 decode（16K，固定负载 A/B）
 
-![16K TG 改进](docs/benchmarks/longctx_tg_improvements.png)
+![16K TG 改进](benchmarks/longctx_tg_improvements.png)
 
 长上下文 TG 衰减根因已定位为 GPU attention/KV 的物理 dense 扫描，逐项修复（raw-SWA ring 已于 08-06 默认化，见下节）。16K GPU 侧时间分解（Nsight）：
 
-![16K 热点分解](docs/benchmarks/longctx_hotspots.png)
+![16K 热点分解](benchmarks/longctx_hotspots.png)
 
 ### FA decode 结构性修复：TG64 累积演进（2026-08-06/07）
 
-![FA decode TG64 累积演进 / progression](docs/benchmarks/fa_decode_tg64_progression.png)
+![FA decode TG64 累积演进 / progression](benchmarks/fa_decode_tg64_progression.png)
 
 左：f16 KV，raw-SWA decode ring 默认化把 fixed TG64 从 8.894 推到 12.085 tok/s（+36%），多 slot 自动回退。右：q8_0 KV，compact 稀疏 FA 只物化 top-k 选中行，9.75→10.69（+9.6%），超越 f16 dense（9.66）成为最快 q1 decode 路径。多流稀疏 FA（opt-in）≤16K 持平，收益主场在 256K+ 长上下文。
 
 ### 双机 expert-parallel（GLM-5.2，100G RoCEv2 直连）
 
-![双机 EP](docs/benchmarks/dual_machine_ep.png)
+![双机 EP](benchmarks/dual_machine_ep.png)
 
 最新单 slot 真 EP 口径（2026-08-10，GLM-5.2 UD-Q2_K_MXFP4，MoE 层 3–77，dense/attention 在双 3090，CPU 只跑 routed experts）：
 
@@ -106,7 +106,7 @@ PP 映射来自该 workload 的 `layer,expert,count` 画像：四路各保留 64
 
 ### 生产 server：DSV4-Flash 每槽 1M 上下文
 
-![Flash PP/TG 曲线](docs/benchmarks/flash_pp_tg_curve.png)
+![Flash PP/TG 曲线](benchmarks/flash_pp_tg_curve.png)
 
 当前后台是 **F16 KV、单槽完整 1M、UB256**。连续布局让 target 43 层与 target KV 留在
 CUDA0，DSpark、draft KV 及共用 embedding/output 位于 CUDA1。16K PP 三轮均值
@@ -126,7 +126,7 @@ PP 极限档把 `-b/-ub` 提到 2048 时，热态约 318.08 tok/s，相对同组
 2.73GiB PP compute buffer 时 OOM。因此三槽是双 3090 的 Q8 容量上限，不是当前质量优先
 默认。历史 F16 `1M×2` 的 35.526 tok/s、并发总计 42.998 tok/s继续作为对照。
 
-> 所有数字均为实测，口径与复现方式见 `docs/CHANGES.md` 与 `docs/benchmarks/`（绘图脚本同目录）。已实测否决的路线（full tensor split -44%、meta-backend TP -20%、跨 tile 双 scheduler）也记录在案。
+> 所有数字均为实测，口径与复现方式见 `CHANGES.md` 与 `benchmarks/`（绘图脚本同目录）。已实测否决的路线（full tensor split -44%、meta-backend TP -20%、跨 tile 双 scheduler）也记录在案。
 
 ## 上游合并回归（2026-08-17，merge 4df29be4f / 96 提交）
 
