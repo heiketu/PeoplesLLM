@@ -41,7 +41,7 @@
 
 | 变量 | 默认 | 作用 | 何时开 / 关 |
 |---|---|---|---|
-| `GGML_NUMA_HIER_BARRIER` | 关 | 纯自旋两级 NUMA 分级 barrier（先节点内、再跨节点），替代全局 flat barrier。仅在 `--numa mirror`，或 `--numa distribute` + `GGML_NUMA_EP=1` 的块划分下生效。`ggml-cpu.c:1117` | 双路机上配合 EP/mirror 开启（实测浅层 TG +8.6%、深提示 +6.2%）；其他拓扑自行 A/B |
+| `GGML_NUMA_HIER_BARRIER` | **开**（2026-08 起默认开，设 `0` 回退 flat barrier） | 纯自旋两级 NUMA 分级 barrier（先节点内、再跨节点），替代全局 flat barrier。仅在 `--numa mirror`，或 `--numa distribute` + `GGML_NUMA_EP=1` 的块划分下生效。`ggml-cpu.c:1117` | 双路机上配合 EP/mirror 开启（实测浅层 TG +8.6%、深提示 +6.2%）；其他拓扑自行 A/B |
 | `GGML_NUMA_THP` | 关 | `=collapse` 时对 NUMA EP/mirror 放置的权重大区间做 `MADV_COLLAPSE` 同步折叠成 2 MiB 大页。`src/llama-model.cpp:1305,1571` | **实测零收益**（碎片导致全部 EAGAIN），保留但别用 |
 | `GGML_KV_THP` | 关 | `=collapse` 时对 ≥2 MiB 的 host KV buffer 做 THP 折叠；`=1` 只在分配时 `MADV_HUGEPAGE`。`src/llama-kv-cache.cpp:311`、`ggml/src/ggml-backend.cpp:3001` | **实测负收益**（TG -6%/PP -55%），别用 |
 | `GGML_NUMA_MIRROR_THREADS` | `hardware_concurrency()`（上限 32） | `--numa mirror` 加载期节点间权重复制的线程数。`src/llama-model.cpp:1264` | 加载太慢时调大；一般默认即可 |
@@ -54,7 +54,7 @@
 
 | 变量 | 默认 | 作用 | 何时开 / 关 |
 |---|---|---|---|
-| `GGML_REPACK_GEMV_PREFETCH` | 关 | repack MXFP4 GEMV 内核的权重流软件预取（约 2 KB 提前量，8 个 block 迭代）。非空且非 `0` 即开。`ggml/src/ggml-cpu/arch/x86/repack.cpp:1915` | AVX-512 机器上 decode 提速（生产配置开启）；AVX2 机器无此内核、无效 |
+| `GGML_REPACK_GEMV_PREFETCH` | **开**（2026-08 起默认开，设 `0` 关闭） | repack MXFP4 GEMV 内核的权重流软件预取（约 2 KB 提前量，8 个 block 迭代）。非空且非 `0` 即开。`ggml/src/ggml-cpu/arch/x86/repack.cpp:1915` | AVX-512 机器上 decode 提速（生产配置开启）；AVX2 机器无此内核、无效 |
 | `GGML_REPACK_MXFP4_AVX512_GEMV` | 开 | MXFP4 GEMV 使用 AVX-512 内核；`=0` 回退 AVX2 实现。`arch/x86/repack.cpp:2018` | 仅 A/B 诊断用，生产保持默认 |
 | `GGML_CPU_DISABLE_FUSION` | 关（上游已有） | `=1` 禁用 CPU op fusion 框架。`ggml-cpu.c:5448` | 调试用 |
 
@@ -181,8 +181,8 @@ worker CLI 参数见 §7.3。
 
 | 变量 | 默认 | 作用 | 何时开 / 关 |
 |---|---|---|---|
-| `GGML_CUDA_BATCHED_TOPK` | `0`（关） | `k=512, nrows>=32` 时用每行一个 block 的 stable batched radix top-k（边界 ties 按较低索引稳定选择）。`ggml/src/ggml-cuda/top-k.cu:190` | DSV4 Lightning Indexer launch storm 场景：16K PP +8%；生产配置开启 |
-| `GGML_CUDA_DSV4_KV_REUSE` | `0`（关） | 对 DSV4 `K=V` alias、512 维、64 列 FA specialization 保留完整 K shared tile 供 V 相位复用（约 100 KB dynamic shared memory）。`ggml/src/ggml-cuda/fattn-mma-f16.cuh:2186` | 16K prefill +3.9%，logits 逐位一致；生产配置开启 |
+| `GGML_CUDA_BATCHED_TOPK` | **开**（2026-08 起默认开，设 `0` 关闭；`k==512` 门限仍在） | `k=512, nrows>=32` 时用每行一个 block 的 stable batched radix top-k（边界 ties 按较低索引稳定选择）。`ggml/src/ggml-cuda/top-k.cu:190` | DSV4 Lightning Indexer launch storm 场景：16K PP +8%；生产配置开启 |
+| `GGML_CUDA_DSV4_KV_REUSE` | **开**（2026-08 起默认开，设 `0` 关闭；仅命中 DSV4 形状门） | 对 DSV4 `K=V` alias、512 维、64 列 FA specialization 保留完整 K shared tile 供 V 相位复用（约 100 KB dynamic shared memory）。`ggml/src/ggml-cuda/fattn-mma-f16.cuh:2186` | 16K prefill +3.9%，logits 逐位一致；生产配置开启 |
 | `GGML_CUDA_DSV4_SPARSE_RAW_COMPACT` | `0`（关） | sparse FA 内仅保留每组有效 raw span（≤512 行）再追加 compressed union；要求同时开 sparse FA 且 query batch ≥256。`ggml/src/ggml-cuda/fattn-common.cuh:1492` | 16K sparse 596→754 tok/s；`=2` 仅强制小形状单测，生产勿用 |
 | `GGML_CUDA_DSV4_Q1_HEADS` | 见源码 | q1 FA 的 head 分组覆盖。`ggml/src/ggml-cuda/fattn.cu:201` | 仅实验 |
 | `LLAMA_DSV4_SPARSE_FA` | `0`（关） | 8-query union 组装 sparse physical rows + 逐 query mask；只在 query batch ≥256 建图，q1 自动 dense。**改变浮点归约分组，非 bit-exact**。`src/models/deepseek4.cpp:1050` | 长上下文 PP 实验 |

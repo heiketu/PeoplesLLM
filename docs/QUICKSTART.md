@@ -70,6 +70,18 @@ AMX buft 只在运行时 `arch_prctl` 授权成功（真 AMX 硬件或 SDE 模�
 
 ---
 
+## 1.5 一键 profile（推荐入口）
+
+```bash
+tools/peoplesllm-run.sh dsv4-prod        # 单机混合生产:双GPU+NUMA EP+dspark,4 slot x 1M Q8 KV
+tools/peoplesllm-run.sh dsv4-prod-f16    # F16 KV 单槽质量优先档
+tools/peoplesllm-run.sh bench-hybrid     # 混合推理基准
+```
+
+profile 展开后就是下面各节的完整参数。自 2026-08 起 `GGML_REPACK_GEMV_PREFETCH`、
+`GGML_NUMA_HIER_BARRIER`、`GGML_CUDA_BATCHED_TOPK`、`GGML_CUDA_DSV4_KV_REUSE` 已在代码里
+默认开启，手工启动也不必再写（显式设 `=0` 可关闭）。
+
 ## 2. 推荐配置一：单机混合推理（2 × GPU + 双路 CPU）
 
 当前生产实测最优（DeepSeek-V4-Flash mxfp4，attention/router 在双 GPU、全部 MoE 专家在 CPU）：

@@ -1910,10 +1910,10 @@ static void ggml_gemv_mxfp4_8x8_q8_0_avx512(
     int64_t x = 0;
     const int64_t nx8 = nc / 8;
     // [GGML_REPACK_GEMV_PREFETCH] optional SW prefetch of the weight stream
-    // (default off; A/B via env). ~2KB ahead = 8 block iterations.
+    // (default ON since 2026-08: measured +2.6% TG, no downside; GGML_REPACK_GEMV_PREFETCH=0 to disable).
     static const bool pf_enable = []() {
         const char * e = getenv("GGML_REPACK_GEMV_PREFETCH");
-        return e && e[0] != '\0' && strcmp(e, "0") != 0;
+        return !(e && (e[0] == '\0' || strcmp(e, "0") == 0));
     }();
     for (; x + 1 < nx8; x += 2) {
         const block_mxfp4x8 * b_ptr_0 = b_ptr_start + x * b_nb;

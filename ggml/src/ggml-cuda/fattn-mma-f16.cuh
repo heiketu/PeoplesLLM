@@ -2185,7 +2185,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
         (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs)));
     static const bool dsv4_reuse_KV = [] {
         const char * value = getenv("GGML_CUDA_DSV4_KV_REUSE");
-        return value && std::atoi(value) != 0;
+        return value == nullptr || std::atoi(value) != 0; // default ON; only activates for the exact DSV4 shape gate below
     }();
     const bool reuse_KV = DKQ == 576 ||
         (DKQ == 512 && DV == 512 && ncols1 == 8 && ncols2 == 8 && V_is_K_view && dsv4_reuse_KV);

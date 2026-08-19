@@ -1114,8 +1114,9 @@ void ggml_numa_bind_policy(void * ptr, size_t size, int node) {
 static void ggml_numa_barrier_setup(int n_threads) {
     static int hier_enabled = -1;
     if (hier_enabled < 0) {
+        // default ON since 2026-08 (zero-cost, ~+1%); GGML_NUMA_HIER_BARRIER=0 forces the flat barrier
         const char * env = getenv("GGML_NUMA_HIER_BARRIER");
-        hier_enabled = (env && atoi(env)) ? 1 : 0;
+        hier_enabled = (env && !atoi(env)) ? 0 : 1;
     }
     const bool block_split = g_state.numa.numa_strategy == GGML_NUMA_STRATEGY_MIRROR ||
         (g_state.numa.numa_strategy == GGML_NUMA_STRATEGY_DISTRIBUTE && ggml_cpu_numa_ep_active());

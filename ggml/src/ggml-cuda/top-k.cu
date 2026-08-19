@@ -190,7 +190,7 @@ static __launch_bounds__(256) __global__ void top_k_batched_radix_f32_i32(
 static bool top_k_use_batched_radix(const int64_t ncols, const int64_t nrows, const int64_t k) {
     static const bool enabled = []() {
         const char * value = getenv("GGML_CUDA_BATCHED_TOPK");
-        return value != nullptr && std::atoi(value) != 0;
+        return value == nullptr || std::atoi(value) != 0; // default ON (k==512 gate below still applies)
     }();
 
     return enabled && k == 512 && nrows >= 32 && ncols >= k && ncols <= INT_MAX && nrows <= INT_MAX;
