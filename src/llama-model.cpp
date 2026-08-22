@@ -1573,12 +1573,26 @@ void llama_model::numa_ep_place_experts(bool used_mmap) {
     // already populated by the weight read + mbind migration), synchronously collapse it
     // into 2 MiB pages (MADV_COLLAPSE, best-effort). This is where the bulk of CPU-side
     // weight bytes live under GGML_NUMA_EP, so it is the main TLB-miss lever for TG.
+    // NOTE: with the default row-window placement the per-(expert, node) windows are
+    // ~1.7 MiB and not PMD-aligned, so MADV_COLLAPSE fails with EINVAL on every window
+    // (and mbind fragments the VMA into alternating-policy pieces that can never merge).
+    // Use GGML_NUMA_EP_PLACE=block to make collapse actually take effect.
     static const bool thp_collapse = []() {
         const char * e = getenv("GGML_NUMA_THP");
         return e && strcmp(e, "collapse") == 0;
     }();
     size_t collapsed_bytes = 0;
 #endif
+    // env GGML_NUMA_EP_PLACE=block: instead of splitting each expert plane into
+    // per-node 128-row windows, bind the tensor in 2 MiB PMD blocks alternating
+    // across nodes (block index counted from the first PMD boundary; head bytes
+    // count as block -1). Every fragment is then a full PMD-aligned VMA, which is
+    // what MADV_COLLAPSE requires. The compute side (repack.cpp UDNL mmid claim
+    // path) derives node-local row ranges from the same byte grid.
+    static const bool place_block = []() {
+        const char * e = getenv("GGML_NUMA_EP_PLACE");
+        return e && strcmp(e, "block") == 0;
+    }();
     for (auto & [ctx, bufs] : pimpl->ctxs_bufs) {
         GGML_UNUSED(bufs);
         for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
@@ -1622,6 +1636,50 @@ void llama_model::numa_ep_place_experts(bool used_mmap) {
                 continue;
             }
             if (!cpu_ep) {
+                continue;
+            }
+            if (place_block) {
+                // 2 MiB PMD-block placement: block k covers [g0 + k*2MiB, g0 + (k+1)*2MiB)
+                // (k = -1 is the head before the first PMD boundary) and is bound to node
+                // k mod n_nodes. The UDNL mmid claim path in repack.cpp
+                // (mmid_ep_block_ranges) reconstructs node-local row ranges from the
+                // same grid. Only full PMD blocks are collapse candidates.
+                constexpr uintptr_t PMD = 2u << 20;
+                const uintptr_t tbase = (uintptr_t) t->data;
+                const uintptr_t tend  = tbase + ggml_nbytes(t);
+                const uintptr_t g0    = (tbase + PMD - 1) & ~(PMD - 1);
+                for (int64_t k = -1;; ++k) {
+                    const uintptr_t b0 = k < 0 ? tbase : g0 + (uintptr_t) k*PMD;
+                    if (b0 >= tend) {
+                        break;
+                    }
+                    const uintptr_t b1 = std::min(tend, g0 + (uintptr_t) (k + 1)*PMD);
+                    const int     node = (int) (((k % n_nodes) + n_nodes) % n_nodes);
+                    // keep boundary pages on the earlier block's node: bind whole pages only
+                    const uintptr_t a0 = k < 0 ? (b0 + pg - 1) & ~(uintptr_t) (pg - 1) : b0;
+                    const uintptr_t a1 = b1 == tend ? b1 & ~(uintptr_t) (pg - 1) : b1;
+                    if (a1 <= a0) {
+                        continue;
+                    }
+                    if (used_mmap) {
+                        llama_numa_bind_policy((void *) a0, a1 - a0, node);
+                    } else {
+                        llama_numa_bind((void *) a0, a1 - a0, node);
+                    }
+#if defined(__gnu_linux__)
+                    if (thp_collapse && a1 - a0 == PMD) {
+                        madvise((void *) a0, PMD, MADV_HUGEPAGE);
+                        if (madvise((void *) a0, PMD, MADV_COLLAPSE) == 0) {
+                            collapsed_bytes += PMD;
+                        } else {
+                            LLAMA_LOG_WARN("%s: MADV_COLLAPSE failed on 2 MiB block (errno=%d); continuing\n",
+                                    __func__, errno);
+                        }
+                    }
+#endif
+                }
+                ++n_placed;
+                placed_bytes += ggml_nbytes(t);
                 continue;
             }
             const int64_t n_expert = t->ne[2];

@@ -14,6 +14,7 @@
 #include <cassert>
 #include <cstdlib> // for qsort
 #include <cstdio>  // for GGML_ASSERT
+#include <vector>
 
 #define GGML_CPU_CLANG_WORKAROUND
 #include "../../repack.h"
@@ -2043,6 +2044,469 @@ void ggml_gemv_mxfp4_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const v
 #endif
 
     ggml_gemv_mxfp4_8x8_q8_0_generic(n, s, bs, vx, vy, nr, nc);
+}
+
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__) && defined(__AVX512VNNI__) && defined(__AVX512VBMI__)
+// Q3_R unpack tables: code v occupies bits [3v, 3v+2] of the 192-bit group stream
+// (24 bytes = 2 sub-blocks of 32 codes). The window+multishift scheme below decodes
+// one group with a single vpermb + vpmultishiftqb + vpand (2 p5 uops) instead of the
+// old 2 vpermb + 2 punpck + 2 vpsrlvw + 2 vpand + vpackuswb chain (5 p5 uops):
+// qword lane L of the vpermb output holds payload bytes [3L, 3L+8) — an 8-byte
+// window that fully covers codes 8L..8L+7 — and vpmultishiftqb then extracts the
+// 3-bit code at bit offset 3m of each window byte position m. The masked load
+// zero-fills beyond byte 23, so the windows of lanes 6/7 read zeros where the
+// group ends; those bits are discarded by the & 7. Output is in natural code order.
+static const uint8_t q3_r_win_idx[64] = {
+     0,  1,  2,  3,  4,  5,  6,  7,
+     3,  4,  5,  6,  7,  8,  9, 10,
+     6,  7,  8,  9, 10, 11, 12, 13,
+     9, 10, 11, 12, 13, 14, 15, 16,
+    12, 13, 14, 15, 16, 17, 18, 19,
+    15, 16, 17, 18, 19, 20, 21, 22,
+    18, 19, 20, 21, 22, 23, 24, 25,
+    21, 22, 23, 24, 25, 26, 27, 28,
+};
+static const uint8_t q3_r_ms_ctrl[64] = {
+    0, 3, 6, 9, 12, 15, 18, 21,
+    0, 3, 6, 9, 12, 15, 18, 21,
+    0, 3, 6, 9, 12, 15, 18, 21,
+    0, 3, 6, 9, 12, 15, 18, 21,
+    0, 3, 6, 9, 12, 15, 18, 21,
+    0, 3, 6, 9, 12, 15, 18, 21,
+    0, 3, 6, 9, 12, 15, 18, 21,
+    0, 3, 6, 9, 12, 15, 18, 21,
+};
+static const int q3_r_sv_idx[4][16] = {
+    { 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1 },
+    { 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3 },
+    { 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5 },
+    { 6, 6, 6, 6, 6, 6, 6, 6, 7, 7, 7, 7, 7, 7, 7, 7 },
+};
+// per-group broadcast of the two sub-block scales into [s0 x16 | s1 x16] epi16
+// lanes (for the vpmaddwd integer-scale GEMM below)
+static const uint16_t q3_r_sv16_idx[4][32] = {
+    { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 },
+    { 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,  3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3 },
+    { 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,  5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5 },
+    { 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,  7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7 },
+};
+// per-group broadcast of the two sub-block entries of the compact activation
+// record [c_0..c_7 | dy_0..dy_7]: c part uses q3_r_sv_idx, dy part is +8
+static const int q3_r_dy_idx[4][16] = {
+    {  8,  8,  8,  8,  8,  8,  8,  8,  9,  9,  9,  9,  9,  9,  9,  9 },
+    { 10, 10, 10, 10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 11, 11, 11 },
+    { 12, 12, 12, 12, 12, 12, 12, 12, 13, 13, 13, 13, 13, 13, 13, 13 },
+    { 14, 14, 14, 14, 14, 14, 14, 14, 15, 15, 15, 15, 15, 15, 15, 15 },
+};
+
+static inline __m512i q3_r_unpack_64(const uint8_t * qs, __m512i win_idx, __m512i ms_ctrl, __m512i m7) {
+    // masked 24-byte load: the group payload; never over-reads the block
+    const __m512i pk  = _mm512_maskz_loadu_epi8(0x00FFFFFF, qs);
+    const __m512i win = _mm512_permutexvar_epi8(win_idx, pk);
+    return _mm512_and_si512(_mm512_multishift_epi64_epi8(ms_ctrl, win), m7); // 64 x u8 codes, natural order
+}
+
+template <int NR>
+static void ggml_gemv_q3_r_1x1_q8_0_avx512(
+        int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy,
+        int nc) {
+    GGML_ASSERT(n % QK3_R == 0);
+    static_assert(NR >= 1 && NR <= 8, "invalid Q3_R GEMV row count");
+
+    const int nb  = n / QK3_R;  // q3_r blocks per weight column
+    const int anb = 8*nb;       // q8_0 blocks per activation row
+
+    const block_q3_r * GGML_RESTRICT w = (const block_q3_r *) vx;
+    const block_q8_0 * GGML_RESTRICT a = (const block_q8_0 *) vy;
+
+    const __m512i win_idx = _mm512_loadu_si512(q3_r_win_idx);
+    const __m512i ms_ctrl = _mm512_loadu_si512(q3_r_ms_ctrl);
+    const __m512i m7      = _mm512_set1_epi8(7);
+    const __m512i ones    = _mm512_set1_epi8(1);
+    const __m512i sv_idx[4] = {
+        _mm512_loadu_si512(q3_r_sv_idx[0]), _mm512_loadu_si512(q3_r_sv_idx[1]),
+        _mm512_loadu_si512(q3_r_sv_idx[2]), _mm512_loadu_si512(q3_r_sv_idx[3]),
+    };
+
+    // Hoisted activation terms, one 192 B record per (ib, g, y), y fastest:
+    //   [  0.. 63] av   : the 64 q8_0 codes of the group's two sub-blocks
+    //   [ 64..127] asumf: f32 cvt of the per-i32-lane sums of 4 activation bytes
+    //                     (dpbusd vs ones; the sums are small exact ints, so the
+    //                     hoisted cvt is bit-identical to doing it in the loop)
+    //   [128..191] dyv  : [dy_0 x8 | dy_1 x8] f32
+    // Rebuilt once per call (O(NR*n)) instead of once per weight column
+    // (O(NR*n*nc)). The values are exactly what the old loop recomputed per
+    // column and the per-row fp op order below is unchanged, so results stay
+    // bit-identical to the previous version of this kernel.
+    const int64_t nrec = (int64_t) nb*4*NR;
+    static thread_local std::vector<uint8_t> recs;
+    if ((int64_t) recs.size() < nrec*192) {
+        recs.resize((size_t) nrec*192);
+    }
+    uint8_t * GGML_RESTRICT rec = recs.data();
+    for (int ib = 0; ib < nb; ++ib) {
+        for (int g = 0; g < 4; ++g) {
+            for (int y = 0; y < NR; ++y) {
+                const block_q8_0 * GGML_RESTRICT ay = a + y*anb + 8*ib + 2*g;
+                const __m512i av = _mm512_inserti32x8(_mm512_castsi256_si512(
+                        _mm256_loadu_si256((const __m256i *) ay[0].qs)),
+                        _mm256_loadu_si256((const __m256i *) ay[1].qs), 1);
+                uint8_t * GGML_RESTRICT r = rec + ((int64_t) (ib*4 + g)*NR + y)*192;
+                _mm512_storeu_si512(r, av);
+                _mm512_storeu_ps((float *) (r + 64), _mm512_cvtepi32_ps(
+                        _mm512_dpbusd_epi32(_mm512_setzero_si512(), ones, av)));
+                const __m512 dyv = _mm512_insertf32x8(_mm512_castps256_ps512(
+                        _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(ay[0].d))),
+                        _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(ay[1].d)), 1);
+                _mm512_storeu_ps((float *) (r + 128), dyv);
+            }
+        }
+    }
+
+    // [GGML_REPACK_GEMV_PREFETCH] same SW-prefetch policy as the mxfp4 gemv
+    static const bool pf_enable = []() {
+        const char * e = getenv("GGML_REPACK_GEMV_PREFETCH");
+        return !(e && (e[0] == '\0' || strcmp(e, "0") == 0));
+    }();
+
+    for (int c = 0; c < nc; ++c) {
+        const block_q3_r * GGML_RESTRICT bw = w + (int64_t) c * nb;
+        __m512 acc[NR];
+        for (int y = 0; y < NR; ++y) {
+            acc[y] = _mm512_setzero_ps();
+        }
+
+        for (int ib = 0; ib < nb; ++ib) {
+            if (pf_enable && ib + 8 < nb) {
+                _mm_prefetch((const char *) &bw[ib + 8],       _MM_HINT_T0);
+                _mm_prefetch((const char *) &bw[ib + 8] + 64,  _MM_HINT_T0);
+            }
+            const __m512  dv  = _mm512_set1_ps(GGML_CPU_FP16_TO_FP32(bw[ib].d));
+            const __m512i s32 = _mm512_cvtepi8_epi32(_mm_loadl_epi64((const __m128i *) bw[ib].scales));
+            for (int g = 0; g < 4; ++g) {
+                const __m512i q   = q3_r_unpack_64(bw[ib].qs + 24*g, win_idx, ms_ctrl, m7);
+                const __m512  svf = _mm512_cvtepi32_ps(_mm512_permutexvar_epi32(sv_idx[g], s32)); // [s_2g x8 | s_2g+1 x8]
+                const uint8_t * GGML_RESTRICT rg = rec + (int64_t) (ib*4 + g)*NR*192;
+                for (int y = 0; y < NR; ++y) {
+                    const uint8_t * GGML_RESTRICT r = rg + (int64_t) y*192;
+                    const __m512i av   = _mm512_loadu_si512(r);
+                    const __m512i iacc = _mm512_dpbusd_epi32(_mm512_setzero_si512(), q, av);
+                    const __m512  asumf = _mm512_loadu_ps((const float *) (r + 64));
+                    // sum (q_i - 4)*a_i per sub-block = sum q_i*a_i - 4*sum a_i, applied in
+                    // fp32 (iacc/asum are small exact ints); avoids the 10c-latency vpmulld chain
+                    const __m512  part = _mm512_mul_ps(_mm512_fnmadd_ps(_mm512_set1_ps(4.f), asumf,
+                                                                        _mm512_cvtepi32_ps(iacc)), svf);
+                    const __m512  dyv = _mm512_loadu_ps((const float *) (r + 128));
+                    acc[y] = _mm512_fmadd_ps(part, _mm512_mul_ps(dv, dyv), acc[y]);
+                }
+            }
+        }
+
+        for (int y = 0; y < NR; ++y) {
+            s[y*bs + c] = _mm512_reduce_add_ps(acc[y]);
+        }
+    }
+}
+
+// Q3_R gemv, integer-scale variant: same maddubs+madd scheme as the batched
+// GEMM tile below, restructured for the column-major gemv walk, plus two
+// gemv-specific changes that the relaxed numerics (rounding-level, well within
+// the 1e-3 test tolerance) make possible:
+//   1. The -4 offset correction is exact-separated per block: it carries no q
+//      dependence, so sum_j s_j*(4*asum_j*dy_j) is a weight-scale x record dot
+//      applied once per (block, row) with a single fnmadd against
+//      svdv = [s_0*dv .. s_7*dv], instead of per group.
+//   2. NACC independent fp accumulators (4 for NR <= 4, else 2) break the
+//      serial fmadd-into-acc chain (4c x 32 groups per column) that floors
+//      the bit-exact variant.
+// Per (group, row) the exec-port work is maddubs + madd (p0) + cvt + mul +
+// fmadd, with the 576 B activation records (w8 per (ib,y); av | dyv per
+// (ib,g,y)) rebuilt once per call. Default path; GGML_REPACK_Q3_R_GEMV_INT=0
+// falls back to the bit-exact variant above.
+template <int NR>
+static void ggml_gemv_q3_r_1x1_q8_0_avx512_int(
+        int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy,
+        int nc) {
+    GGML_ASSERT(n % QK3_R == 0);
+    static_assert(NR >= 1 && NR <= 8, "invalid Q3_R GEMV row count");
+    constexpr int NACC = NR <= 4 ? 4 : 2;  // independent acc chains per row
+
+    const int nb  = n / QK3_R;  // q3_r blocks per weight column
+    const int anb = 8*nb;       // q8_0 blocks per activation row
+
+    const block_q3_r * GGML_RESTRICT w = (const block_q3_r *) vx;
+    const block_q8_0 * GGML_RESTRICT a = (const block_q8_0 *) vy;
+
+    const __m512i win_idx = _mm512_loadu_si512(q3_r_win_idx);
+    const __m512i ms_ctrl = _mm512_loadu_si512(q3_r_ms_ctrl);
+    const __m512i m7      = _mm512_set1_epi8(7);
+    const __m512i sv16_idx[4] = {
+        _mm512_loadu_si512(q3_r_sv16_idx[0]), _mm512_loadu_si512(q3_r_sv16_idx[1]),
+        _mm512_loadu_si512(q3_r_sv16_idx[2]), _mm512_loadu_si512(q3_r_sv16_idx[3]),
+    };
+
+    // Hoisted activation terms, one 576 B record per (ib, y), y fastest:
+    //   [  0.. 63] w8  : 16 x f32, lanes 0..7 = 4*asum_j*dy_j (the -4-offset
+    //                    correction weights), lanes 8..15 zero
+    //   [ 64 + 128*g .. ] per group g: [av 64B | dyv 64B], dyv = [dy_2g x8 |
+    //                    dy_2g+1 x8] f32
+    // Rebuilt once per call (O(NR*n)) instead of once per weight column.
+    const int64_t nrec = (int64_t) nb*NR;
+    static thread_local std::vector<uint8_t> recs;
+    if ((int64_t) recs.size() < nrec*576) {
+        recs.resize((size_t) nrec*576);
+    }
+    uint8_t * GGML_RESTRICT rec = recs.data();
+    for (int ib = 0; ib < nb; ++ib) {
+        for (int y = 0; y < NR; ++y) {
+            const block_q8_0 * GGML_RESTRICT ay = a + y*anb + 8*ib;
+            uint8_t * GGML_RESTRICT r = rec + ((int64_t) ib*NR + y)*576;
+            float w8[16] = {};
+            for (int j = 0; j < 8; ++j) {
+                int asum = 0;
+                for (int v = 0; v < QK8_0; ++v) {
+                    asum += ay[j].qs[v];
+                }
+                const float dy = GGML_CPU_FP16_TO_FP32(ay[j].d);
+                w8[j] = 4.f * (float) asum * dy;
+            }
+            _mm512_storeu_ps((float *) r, _mm512_loadu_ps(w8));
+            for (int g = 0; g < 4; ++g) {
+                const __m512i av = _mm512_inserti32x8(_mm512_castsi256_si512(
+                        _mm256_loadu_si256((const __m256i *) ay[2*g + 0].qs)),
+                        _mm256_loadu_si256((const __m256i *) ay[2*g + 1].qs), 1);
+                _mm512_storeu_si512(r + 64 + 128*g, av);
+                const __m512 dyv = _mm512_insertf32x8(_mm512_castps256_ps512(
+                        _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(ay[2*g + 0].d))),
+                        _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(ay[2*g + 1].d)), 1);
+                _mm512_storeu_ps((float *) (r + 64 + 128*g + 64), dyv);
+            }
+        }
+    }
+
+    // [GGML_REPACK_GEMV_PREFETCH] same SW-prefetch policy as the mxfp4 gemv
+    static const bool pf_enable = []() {
+        const char * e = getenv("GGML_REPACK_GEMV_PREFETCH");
+        return !(e && (e[0] == '\0' || strcmp(e, "0") == 0));
+    }();
+
+    for (int c = 0; c < nc; ++c) {
+        const block_q3_r * GGML_RESTRICT bw = w + (int64_t) c * nb;
+        __m512 acc[NACC][NR];
+        for (int v = 0; v < NACC; ++v) {
+            for (int y = 0; y < NR; ++y) {
+                acc[v][y] = _mm512_setzero_ps();
+            }
+        }
+
+        for (int ib = 0; ib < nb; ++ib) {
+            if (pf_enable && ib + 8 < nb) {
+                _mm_prefetch((const char *) &bw[ib + 8],       _MM_HINT_T0);
+                _mm_prefetch((const char *) &bw[ib + 8] + 64,  _MM_HINT_T0);
+            }
+            const __m512  dv   = _mm512_set1_ps(GGML_CPU_FP16_TO_FP32(bw[ib].d));
+            const __m128i sc8  = _mm_loadl_epi64((const __m128i *) bw[ib].scales);
+            const __m512i s16z = _mm512_castsi128_si512(_mm_cvtepi8_epi16(sc8));
+            // [s_0*dv .. s_7*dv | 0 .. 0] f32, for the block-level correction
+            const __m512  svdv = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(sc8)), dv);
+            for (int g = 0; g < 4; ++g) {
+                const __m512i q    = q3_r_unpack_64(bw[ib].qs + 24*g, win_idx, ms_ctrl, m7);
+                const __m512i sv16 = _mm512_permutexvar_epi16(sv16_idx[g], s16z); // [s_2g x16 | s_2g+1 x16] i16
+                for (int y = 0; y < NR; ++y) {
+                    const uint8_t * GGML_RESTRICT r = rec + ((int64_t) ib*NR + y)*576 + 64 + 128*g;
+                    const __m512i av = _mm512_loadu_si512(r);
+                    // exact s_j * sum(q*a) per 4-element i32 lane (see the gemm
+                    // tile for the bound: |lane| <= 458752 < 2^24, cvt is exact)
+                    const __m512i iacc = _mm512_madd_epi16(_mm512_maddubs_epi16(q, av), sv16);
+                    const __m512  dyv  = _mm512_loadu_ps((const float *) (r + 64));
+                    acc[g % NACC][y] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(iacc),
+                                                       _mm512_mul_ps(dv, dyv), acc[g % NACC][y]);
+                }
+            }
+            // block-level -4 offset correction: sum_j s_j*dv*w8_j, no q dependence
+            for (int y = 0; y < NR; ++y) {
+                const __m512 w8 = _mm512_loadu_ps((const float *) (rec + ((int64_t) ib*NR + y)*576));
+                acc[0][y] = _mm512_fnmadd_ps(svdv, w8, acc[0][y]);
+            }
+        }
+
+        for (int y = 0; y < NR; ++y) {
+            __m512 t = _mm512_add_ps(acc[0][y], acc[1][y]);
+            if (NACC == 4) {
+                t = _mm512_add_ps(t, _mm512_add_ps(acc[2][y], acc[3][y]));
+            }
+            s[y*bs + c] = _mm512_reduce_add_ps(t);
+        }
+    }
+}
+
+// Q3_R batched GEMM tile: integer-domain sub-block scales + hoisted activation
+// terms. Differences vs the gemv-style tile above:
+//   1. The sub-block scale s_j is applied in integers: vpmaddubsw(q, a) with
+//      u8 codes 0..7 and i8 activations (|pair sum| <= 1792, no saturation),
+//      then vpmaddwd against per-sub-block i16 scale broadcasts gives exact
+//      s_j*(sum of 4 q*a) per i32 lane (|lane| <= 458752: fits i32, and < 2^24
+//      so the cvtepi32_ps below is exact).
+//   2. The -4 offset correction (4*s_j*sum(a)*dy_j per sub-block) and the q8_0
+//      activation scales depend only on the activations, so they are
+//      precomputed once per call into a compact thread-local buffer: 16 floats
+//      per (block, row) — [c_0..c_7 | dy_0..dy_7] with c_j = asum_j*dy_j/2
+//      (the /2 is exact; each of the 8 lanes of a sub-block half carries
+//      s_j*c_j, summing to the wanted 4*s_j*asum_j*dy_j). The buffer is
+//      nb*NR*64B (a few KB), stays L1-resident, and per group each row needs
+//      one 64B load + 2 vpermps instead of rebuilding asum/dyv in registers.
+// Per group the fp-pipe work per row drops from ~9 uops (2 cvt + fnmadd + dyv
+// build + 2 mul + fmadd) to 4 (cvt + mul + fnmadd + fmadd). The math is
+// identical; only the fp rounding order changes, so results differ from the
+// gemv-style tile at the float-rounding level.
+template <int NR>
+static void ggml_gemm_q3_r_1x1_q8_0_avx512(
+        int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy,
+        int nc) {
+    GGML_ASSERT(n % QK3_R == 0);
+    static_assert(NR == 4 || NR == 8, "invalid Q3_R GEMM row count");
+
+    const int nb  = n / QK3_R;  // q3_r blocks per weight column
+    const int anb = 8*nb;       // q8_0 blocks per activation row
+
+    const block_q3_r * GGML_RESTRICT w = (const block_q3_r *) vx;
+    const block_q8_0 * GGML_RESTRICT a = (const block_q8_0 *) vy;
+
+    const __m512i win_idx = _mm512_loadu_si512(q3_r_win_idx);
+    const __m512i ms_ctrl = _mm512_loadu_si512(q3_r_ms_ctrl);
+    const __m512i m7      = _mm512_set1_epi8(7);
+    const __m512i sv_idx[4] = {
+        _mm512_loadu_si512(q3_r_sv_idx[0]), _mm512_loadu_si512(q3_r_sv_idx[1]),
+        _mm512_loadu_si512(q3_r_sv_idx[2]), _mm512_loadu_si512(q3_r_sv_idx[3]),
+    };
+    const __m512i sv16_idx[4] = {
+        _mm512_loadu_si512(q3_r_sv16_idx[0]), _mm512_loadu_si512(q3_r_sv16_idx[1]),
+        _mm512_loadu_si512(q3_r_sv16_idx[2]), _mm512_loadu_si512(q3_r_sv16_idx[3]),
+    };
+    const __m512i dy_idx[4] = {
+        _mm512_loadu_si512(q3_r_dy_idx[0]), _mm512_loadu_si512(q3_r_dy_idx[1]),
+        _mm512_loadu_si512(q3_r_dy_idx[2]), _mm512_loadu_si512(q3_r_dy_idx[3]),
+    };
+
+    // Hoisted per-row activation terms: one 16-float record [c_0..c_7 |
+    // dy_0..dy_7] per (block, row), laid out block-major with the row fastest
+    // ([(ib*NR + y)*16]) so the NR row loads in the hot loop hit consecutive
+    // cache lines. The whole buffer is nb*NR*64B (a few KB) and stays
+    // L1-resident — expanding these terms to full 64B vectors per group would
+    // blow L1 and cost more bandwidth than the recompute it saves.
+    static thread_local std::vector<float> act_terms;
+    act_terms.resize((size_t) nb * NR * 16);
+    float * GGML_RESTRICT actc = act_terms.data();
+
+    for (int y = 0; y < NR; ++y) {
+        const block_q8_0 * GGML_RESTRICT ay = a + (int64_t) y * anb;
+        for (int ib = 0; ib < nb; ++ib) {
+            float tmp[16];
+            for (int j = 0; j < 8; ++j) {
+                const block_q8_0 * GGML_RESTRICT ab = ay + 8*ib + j;
+                int asum = 0;
+                for (int v = 0; v < QK8_0; ++v) {
+                    asum += ab->qs[v];
+                }
+                const float dy = GGML_CPU_FP16_TO_FP32(ab->d);
+                tmp[j]     = 0.5f * (float) asum * dy; // -4-offset correction / 8 lanes
+                tmp[8 + j] = dy;
+            }
+            _mm512_storeu_ps(actc + ((size_t) ib*NR + y)*16, _mm512_loadu_ps(tmp));
+        }
+    }
+
+    // same SW-prefetch policy as the gemv tile
+    static const bool pf_enable = []() {
+        const char * e = getenv("GGML_REPACK_GEMV_PREFETCH");
+        return !(e && (e[0] == '\0' || strcmp(e, "0") == 0));
+    }();
+
+    for (int c = 0; c < nc; ++c) {
+        const block_q3_r * GGML_RESTRICT bw = w + (int64_t) c * nb;
+        __m512 acc[NR];
+        for (int y = 0; y < NR; ++y) {
+            acc[y] = _mm512_setzero_ps();
+        }
+
+        for (int ib = 0; ib < nb; ++ib) {
+            if (pf_enable && ib + 8 < nb) {
+                _mm_prefetch((const char *) &bw[ib + 8],       _MM_HINT_T0);
+                _mm_prefetch((const char *) &bw[ib + 8] + 64,  _MM_HINT_T0);
+            }
+            const __m512  dv   = _mm512_set1_ps(GGML_CPU_FP16_TO_FP32(bw[ib].d));
+            const __m128i sc8  = _mm_loadl_epi64((const __m128i *) bw[ib].scales);
+            const __m512i s32  = _mm512_cvtepi8_epi32(sc8);
+            const __m512i s16z = _mm512_castsi128_si512(_mm_cvtepi8_epi16(sc8));
+            const float * GGML_RESTRICT ac = actc + (size_t) ib*NR*16;
+            for (int g = 0; g < 4; ++g) {
+                const __m512i q    = q3_r_unpack_64(bw[ib].qs + 24*g, win_idx, ms_ctrl, m7);
+                const __m512i sv16 = _mm512_permutexvar_epi16(sv16_idx[g], s16z); // [s_2g x16 | s_2g+1 x16] i16
+                const __m512  svf  = _mm512_cvtepi32_ps(_mm512_permutexvar_epi32(sv_idx[g], s32));
+                for (int y = 0; y < NR; ++y) {
+                    const block_q8_0 * GGML_RESTRICT ay = a + y*anb + 8*ib + 2*g;
+                    const __m512i av = _mm512_inserti32x8(_mm512_castsi256_si512(
+                            _mm256_loadu_si256((const __m256i *) ay[0].qs)),
+                            _mm256_loadu_si256((const __m256i *) ay[1].qs), 1);
+                    // exact s_j * sum(q*a) per 4-element i32 lane
+                    const __m512i p16  = _mm512_maddubs_epi16(q, av);
+                    const __m512i iacc = _mm512_madd_epi16(p16, sv16);
+                    const __m512  cv   = _mm512_loadu_ps(ac + (size_t) y*16); // [c_0..c_7 | dy_0..dy_7]
+                    // main term with dy applied; subtract the -4 offset via the
+                    // precomputed correction (s_j*c_j per lane sums to
+                    // 4*s_j*asum_j*dy_j per sub-block)
+                    const __m512 main = _mm512_mul_ps(_mm512_cvtepi32_ps(iacc),
+                                                      _mm512_permutexvar_ps(dy_idx[g], cv));
+                    const __m512 part = _mm512_fnmadd_ps(svf, _mm512_permutexvar_ps(sv_idx[g], cv), main);
+                    acc[y] = _mm512_fmadd_ps(part, dv, acc[y]);
+                }
+            }
+        }
+
+        for (int y = 0; y < NR; ++y) {
+            s[y*bs + c] = _mm512_reduce_add_ps(acc[y]);
+        }
+    }
+}
+#endif
+
+void ggml_gemv_q3_r_1x1_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__) && defined(__AVX512VNNI__) && defined(__AVX512VBMI__)
+    // Integer-scale variant is the default; GGML_REPACK_Q3_R_GEMV_INT=0 (or
+    // empty) falls back to the bit-exact variant. Read per call — not a
+    // static — so tests can toggle it; one getenv is negligible against even
+    // a single-column gemv.
+    const char * ie = getenv("GGML_REPACK_Q3_R_GEMV_INT");
+    const bool use_int = !(ie && (ie[0] == '\0' || strcmp(ie, "0") == 0));
+    if (use_int) {
+        switch (nr) {
+            case 1: ggml_gemv_q3_r_1x1_q8_0_avx512_int<1>(n, s, bs, vx, vy, nc); return;
+            case 2: ggml_gemv_q3_r_1x1_q8_0_avx512_int<2>(n, s, bs, vx, vy, nc); return;
+            case 3: ggml_gemv_q3_r_1x1_q8_0_avx512_int<3>(n, s, bs, vx, vy, nc); return;
+            case 4: ggml_gemv_q3_r_1x1_q8_0_avx512_int<4>(n, s, bs, vx, vy, nc); return;
+            case 5: ggml_gemv_q3_r_1x1_q8_0_avx512_int<5>(n, s, bs, vx, vy, nc); return;
+            case 6: ggml_gemv_q3_r_1x1_q8_0_avx512_int<6>(n, s, bs, vx, vy, nc); return;
+            case 7: ggml_gemv_q3_r_1x1_q8_0_avx512_int<7>(n, s, bs, vx, vy, nc); return;
+            case 8: ggml_gemv_q3_r_1x1_q8_0_avx512_int<8>(n, s, bs, vx, vy, nc); return;
+            default: break;
+        }
+    }
+    switch (nr) {
+        case 1: ggml_gemv_q3_r_1x1_q8_0_avx512<1>(n, s, bs, vx, vy, nc); return;
+        case 2: ggml_gemv_q3_r_1x1_q8_0_avx512<2>(n, s, bs, vx, vy, nc); return;
+        case 3: ggml_gemv_q3_r_1x1_q8_0_avx512<3>(n, s, bs, vx, vy, nc); return;
+        case 4: ggml_gemv_q3_r_1x1_q8_0_avx512<4>(n, s, bs, vx, vy, nc); return;
+        case 5: ggml_gemv_q3_r_1x1_q8_0_avx512<5>(n, s, bs, vx, vy, nc); return;
+        case 6: ggml_gemv_q3_r_1x1_q8_0_avx512<6>(n, s, bs, vx, vy, nc); return;
+        case 7: ggml_gemv_q3_r_1x1_q8_0_avx512<7>(n, s, bs, vx, vy, nc); return;
+        case 8: ggml_gemv_q3_r_1x1_q8_0_avx512<8>(n, s, bs, vx, vy, nc); return;
+        default: break;
+    }
+#endif
+    ggml_gemv_q3_r_1x1_q8_0_generic(n, s, bs, vx, vy, nr, nc);
 }
 
 void ggml_gemv_q2_K_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
@@ -5514,6 +5978,606 @@ void ggml_gemm_mxfp4_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const v
 #endif // defined(__AVX2__) || defined(__AVX512F__)
 
     ggml_gemm_mxfp4_8x8_q8_0_generic(n, s, bs, vx, vy, nr, nc);
+}
+
+void ggml_gemm_q3_r_1x1_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__) && defined(__AVX512VNNI__) && defined(__AVX512VBMI__)
+    GGML_ASSERT(nr % 4 == 0);
+    const size_t a_row = (size_t)(n/QK8_0)*sizeof(block_q8_0);
+    // MR8 row blocking: each weight block is decoded once and applied to 8
+    // activation rows instead of 4, halving the number of weight-stream passes
+    // over the matrix and giving 8 independent fp32 accumulator chains (the
+    // MR4 tile is FMA-latency-bound: 4 chains x 4 fmadds per block). A 4-row
+    // remainder (nr % 8 == 4) uses the MR4 instantiation.
+    // GGML_REPACK_Q3_R_GEMM_MR=4 restores the previous blocking (A/B knob).
+    static const int mr = []() {
+        const char * e = getenv("GGML_REPACK_Q3_R_GEMM_MR");
+        return e && atoi(e) == 4 ? 4 : 8;
+    }();
+    // Integer-scale tile (maddubs+madd, hoisted activation terms); the
+    // activation precompute only pays off when several weight columns share
+    // it, so very narrow calls keep the gemv-style tile.
+    // GGML_REPACK_Q3_R_GEMM_MADD=0 forces the fp32-finalize tile (A/B knob).
+    static const bool use_madd = []() {
+        const char * e = getenv("GGML_REPACK_Q3_R_GEMM_MADD");
+        return !e || atoi(e) != 0;
+    }();
+    const bool madd = use_madd && nc >= 8;
+    int y0 = 0;
+    if (mr == 8) {
+        for (; y0 + 8 <= nr; y0 += 8) {
+            const char * ay = (const char *) vy + (int64_t)y0*a_row;
+            if (madd) ggml_gemm_q3_r_1x1_q8_0_avx512<8>(n, s + (int64_t)y0*bs, bs, vx, ay, nc);
+            else      ggml_gemv_q3_r_1x1_q8_0_avx512<8>(n, s + (int64_t)y0*bs, bs, vx, ay, nc);
+        }
+    }
+    for (; y0 < nr; y0 += 4) {
+        const char * ay = (const char *) vy + (int64_t)y0*a_row;
+        if (madd) ggml_gemm_q3_r_1x1_q8_0_avx512<4>(n, s + (int64_t)y0*bs, bs, vx, ay, nc);
+        else      ggml_gemv_q3_r_1x1_q8_0_avx512<4>(n, s + (int64_t)y0*bs, bs, vx, ay, nc);
+    }
+    return;
+#endif
+    ggml_gemm_q3_r_1x1_q8_0_generic(n, s, bs, vx, vy, nr, nc);
+}
+
+// ---------------------------------------------------------------------------
+// UDNL_W4 NR16xK4 panel kernels (AVX512F+BW+VNNI; no VBMI).
+//
+// Weight layout (repacked, see ggml-common.h UDNL_W4_PB): panels of 16 output
+// channels; per (panel, 256-K block) 8 x [payload 256B | srel 16B] + d[16] fp16
+// = 2208 B. Within KQ group g's payload, chunk s (64 B) covers k = 32g+8s..+7;
+// 16-byte lane l covers rows 4l..4l+3, so a 64B chunk decodes with
+// and/shift + unpacklo/hi + 2 x vpshufb into wA (k=8s+0..3) / wB (k=8s+4..7),
+// and the activations enter as vpbroadcastd of the two q8_0 dwords at
+// qs[8s] / qs[8s+4] (no p5 shuffle pressure on the activation side).
+// The codebook is IQ4_NL's grid biased by +128 into u8 (1..241), so vpdpbusd
+// applies directly; the bias is corrected per KQ group as
+// raw = accA + accB - 128*asum (asum hoisted per activation block).
+// raw is bounded by ~1.1M < 2^24, so the int->fp cvt is exact.
+// Per (group, row) exec-port work: 8 dpbusd + int add/sub + cvt + mul + fmadd.
+
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
+
+// per (q8_0 block, activation row) hoisted terms
+static inline __m512i udnl_w4_lut_biased(void) {
+    uint8_t lut8[16];
+    for (int i = 0; i < 16; ++i) {
+        lut8[i] = (uint8_t) (kvalues_iq4nl[i] + 128);
+    }
+    return _mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i *) lut8));
+}
+
+static inline int32_t udnl_w4_load_i32(const int8_t * p) {
+    int32_t v;
+    memcpy(&v, p, sizeof(v));
+    return v;
+}
+
+// Dot NR activation rows against one 16-column weight panel (nb super-blocks
+// of K). rec holds the precomputed per-(row, q8_0 block) activation terms,
+// row-major NR x anb. s_p points at the panel's first output column.
+template <int NR>
+static void udnl_w4_panel_avx512(
+        int nb,
+        const uint8_t * GGML_RESTRICT pw,
+        const block_q8_0 * GGML_RESTRICT a, int64_t anb,
+        const udnl_w4_arec * GGML_RESTRICT rec,
+        float * GGML_RESTRICT s_p, size_t bs) {
+    static_assert(NR >= 1 && NR <= 8, "invalid UDNL_W4 GEMV row count");
+
+    const __m512i LUT = udnl_w4_lut_biased();
+    const __m512i m0F = _mm512_set1_epi8(0x0F);
+
+    // [GGML_REPACK_GEMV_PREFETCH] same SW-prefetch policy as the mxfp4 gemv
+    static const bool pf_enable = []() {
+        const char * e = getenv("GGML_REPACK_GEMV_PREFETCH");
+        return !(e && (e[0] == '\0' || strcmp(e, "0") == 0));
+    }();
+
+    __m512 accf[NR];
+    for (int y = 0; y < NR; ++y) {
+        accf[y] = _mm512_setzero_ps();
+    }
+
+    for (int b = 0; b < nb; ++b) {
+        const uint8_t * GGML_RESTRICT pb = pw + (int64_t) b*UDNL_W4_PB;
+        if (pf_enable && b + 2 < nb) {
+            _mm_prefetch((const char *) (pb + 2*UDNL_W4_PB),      _MM_HINT_T0);
+            _mm_prefetch((const char *) (pb + 2*UDNL_W4_PB) + 64, _MM_HINT_T0);
+        }
+        const __m512 dv = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *) (pb + 8*(256 + 16))));
+        __m512 accq[NR];
+        for (int y = 0; y < NR; ++y) {
+            accq[y] = _mm512_setzero_ps();
+        }
+
+        for (int g = 0; g < 8; ++g) {
+            const uint8_t * GGML_RESTRICT pl = pb + (256 + 16)*g;
+            // decode the 4 chunks once, apply to all NR rows
+            __m512i wA[4], wB[4];
+            for (int s4 = 0; s4 < 4; ++s4) {
+                const __m512i c  = _mm512_loadu_si512(pl + 64*s4);
+                const __m512i lo = _mm512_and_si512(c, m0F);
+                const __m512i hi = _mm512_and_si512(_mm512_srli_epi16(c, 4), m0F);
+                wA[s4] = _mm512_shuffle_epi8(LUT, _mm512_unpacklo_epi8(lo, hi));
+                wB[s4] = _mm512_shuffle_epi8(LUT, _mm512_unpackhi_epi8(lo, hi));
+            }
+            const __m512 svf = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(
+                    _mm_loadu_si128((const __m128i *) (pl + 256))));
+            for (int y = 0; y < NR; ++y) {
+                const block_q8_0 * GGML_RESTRICT ab = a + (int64_t) y*anb + 8*b + g;
+                const udnl_w4_arec * GGML_RESTRICT rg = rec + (int64_t) y*anb + 8*b + g;
+                __m512i accA = _mm512_setzero_si512();
+                __m512i accB = _mm512_setzero_si512();
+                for (int s4 = 0; s4 < 4; ++s4) {
+                    accA = _mm512_dpbusd_epi32(accA, wA[s4], _mm512_set1_epi32(udnl_w4_load_i32(ab->qs + 8*s4)));
+                    accB = _mm512_dpbusd_epi32(accB, wB[s4], _mm512_set1_epi32(udnl_w4_load_i32(ab->qs + 8*s4 + 4)));
+                }
+                const __m512i raw = _mm512_sub_epi32(_mm512_add_epi32(accA, accB),
+                                                     _mm512_set1_epi32(rg->asum128));
+                const __m512 part = _mm512_mul_ps(_mm512_cvtepi32_ps(raw), svf);
+                accq[y] = _mm512_fmadd_ps(part, _mm512_set1_ps(rg->dy), accq[y]);
+            }
+        }
+
+        for (int y = 0; y < NR; ++y) {
+            accf[y] = _mm512_fmadd_ps(accq[y], dv, accf[y]);
+        }
+    }
+
+    for (int y = 0; y < NR; ++y) {
+        _mm512_storeu_ps(s_p + y*bs, accf[y]);
+    }
+}
+
+template <int NR>
+static void ggml_gemv_udnl_w4_1x16_q8_0_avx512(
+        int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy,
+        int nc) {
+    GGML_ASSERT(n % QK_UDNL_W4 == 0);
+    GGML_ASSERT(nc % 16 == 0);
+    static_assert(NR >= 1 && NR <= 8, "invalid UDNL_W4 GEMV row count");
+
+    const int nb  = n / QK_UDNL_W4;  // udnl_w4 blocks per weight column
+    const int anb = 8*nb;            // q8_0 blocks per activation row
+
+    const uint8_t * GGML_RESTRICT w = (const uint8_t *) vx;
+    const block_q8_0 * GGML_RESTRICT a = (const block_q8_0 *) vy;
+
+    // Hoisted activation terms, one 8 B record per (row y, q8_0 block j),
+    // row-major. Rebuilt once per call (O(NR*n)) instead of once per panel.
+    const int64_t nrec = (int64_t) anb*NR;
+    static thread_local std::vector<udnl_w4_arec> recs;
+    if ((int64_t) recs.size() < nrec) {
+        recs.resize((size_t) nrec);
+    }
+    udnl_w4_arec * GGML_RESTRICT rec = recs.data();
+    for (int y = 0; y < NR; ++y) {
+        const block_q8_0 * GGML_RESTRICT ay = a + (int64_t) y*anb;
+        for (int j = 0; j < anb; ++j) {
+            int asum = 0;
+            for (int v = 0; v < QK8_0; ++v) {
+                asum += ay[j].qs[v];
+            }
+            rec[(int64_t) y*anb + j].asum128 = 128*asum;
+            rec[(int64_t) y*anb + j].dy      = GGML_CPU_FP16_TO_FP32(ay[j].d);
+        }
+    }
+
+    for (int p = 0; p < nc/16; ++p) {
+        udnl_w4_panel_avx512<NR>(nb, w + (int64_t) p*nb*UDNL_W4_PB, a, anb, rec, s + 16*p, bs);
+    }
+}
+#endif // __AVX512F__ && __AVX512BW__ && __AVX512VNNI__
+
+void ggml_gemv_udnl_w4_1x16_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
+    switch (nr) {
+        case 1: ggml_gemv_udnl_w4_1x16_q8_0_avx512<1>(n, s, bs, vx, vy, nc); return;
+        case 2: ggml_gemv_udnl_w4_1x16_q8_0_avx512<2>(n, s, bs, vx, vy, nc); return;
+        case 3: ggml_gemv_udnl_w4_1x16_q8_0_avx512<3>(n, s, bs, vx, vy, nc); return;
+        case 4: ggml_gemv_udnl_w4_1x16_q8_0_avx512<4>(n, s, bs, vx, vy, nc); return;
+        case 5: ggml_gemv_udnl_w4_1x16_q8_0_avx512<5>(n, s, bs, vx, vy, nc); return;
+        case 6: ggml_gemv_udnl_w4_1x16_q8_0_avx512<6>(n, s, bs, vx, vy, nc); return;
+        case 7: ggml_gemv_udnl_w4_1x16_q8_0_avx512<7>(n, s, bs, vx, vy, nc); return;
+        case 8: ggml_gemv_udnl_w4_1x16_q8_0_avx512<8>(n, s, bs, vx, vy, nc); return;
+        default: break;
+    }
+#endif
+    ggml_gemv_udnl_w4_1x16_q8_0_generic(n, s, bs, vx, vy, nr, nc);
+}
+
+// arec variants skip the per-call O(NR*n) activation-record rebuild: the
+// records arrive precomputed (row-major nr x anb), aligned with the q8_0 rows
+// at vy. Used by the mul_mat_id claim loops where one call covers only a
+// 16-column claim and the rebuild was a large fraction of the work.
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
+template <int NR>
+static void ggml_gemv_udnl_w4_1x16_q8_0_arec_avx512(
+        int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy,
+        const udnl_w4_arec * GGML_RESTRICT rec, int nc) {
+    GGML_ASSERT(n % QK_UDNL_W4 == 0);
+    GGML_ASSERT(nc % 16 == 0);
+    static_assert(NR >= 1 && NR <= 8, "invalid UDNL_W4 GEMV row count");
+    const int nb  = n / QK_UDNL_W4;
+    const int anb = 8*nb;
+    const uint8_t * GGML_RESTRICT w = (const uint8_t *) vx;
+    const block_q8_0 * GGML_RESTRICT a = (const block_q8_0 *) vy;
+    for (int p = 0; p < nc/16; ++p) {
+        udnl_w4_panel_avx512<NR>(nb, w + (int64_t) p*nb*UDNL_W4_PB, a, anb, rec, s + 16*p, bs);
+    }
+}
+#endif
+
+void ggml_gemv_udnl_w4_1x16_q8_0_arec(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, const udnl_w4_arec * GGML_RESTRICT arec, int nr, int nc) {
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
+    switch (nr) {
+        case 1: ggml_gemv_udnl_w4_1x16_q8_0_arec_avx512<1>(n, s, bs, vx, vy, arec, nc); return;
+        case 2: ggml_gemv_udnl_w4_1x16_q8_0_arec_avx512<2>(n, s, bs, vx, vy, arec, nc); return;
+        case 3: ggml_gemv_udnl_w4_1x16_q8_0_arec_avx512<3>(n, s, bs, vx, vy, arec, nc); return;
+        case 4: ggml_gemv_udnl_w4_1x16_q8_0_arec_avx512<4>(n, s, bs, vx, vy, arec, nc); return;
+        case 5: ggml_gemv_udnl_w4_1x16_q8_0_arec_avx512<5>(n, s, bs, vx, vy, arec, nc); return;
+        case 6: ggml_gemv_udnl_w4_1x16_q8_0_arec_avx512<6>(n, s, bs, vx, vy, arec, nc); return;
+        case 7: ggml_gemv_udnl_w4_1x16_q8_0_arec_avx512<7>(n, s, bs, vx, vy, arec, nc); return;
+        case 8: ggml_gemv_udnl_w4_1x16_q8_0_arec_avx512<8>(n, s, bs, vx, vy, arec, nc); return;
+        default: break;
+    }
+#endif
+    GGML_UNUSED(arec);
+    ggml_gemv_udnl_w4_1x16_q8_0_generic(n, s, bs, vx, vy, nr, nc);
+}
+
+void ggml_gemm_udnl_w4_1x16_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
+    GGML_ASSERT(nr % 4 == 0);
+    const size_t a_row = (size_t)(n/QK8_0)*sizeof(block_q8_0);
+    // MR8 row blocking (same rationale as the Q3_R gemm): each decoded weight
+    // chunk is applied to 8 activation rows. A 4-row remainder (nr % 8 == 4)
+    // uses the MR4 instantiation.
+    int y0 = 0;
+    for (; y0 + 8 <= nr; y0 += 8) {
+        const char * ay = (const char *) vy + (int64_t) y0*a_row;
+        ggml_gemv_udnl_w4_1x16_q8_0_avx512<8>(n, s + (int64_t) y0*bs, bs, vx, ay, nc);
+    }
+    if (y0 < nr) {
+        const char * ay = (const char *) vy + (int64_t) y0*a_row;
+        ggml_gemv_udnl_w4_1x16_q8_0_avx512<4>(n, s + (int64_t) y0*bs, bs, vx, ay, nc);
+    }
+    return;
+#endif
+    ggml_gemm_udnl_w4_1x16_q8_0_generic(n, s, bs, vx, vy, nr, nc);
+}
+
+void ggml_gemm_udnl_w4_1x16_q8_0_arec(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, const udnl_w4_arec * GGML_RESTRICT arec, int nr, int nc) {
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
+    GGML_ASSERT(nr % 4 == 0);
+    GGML_ASSERT(n % QK_UDNL_W4 == 0);
+    GGML_ASSERT(nc % 16 == 0);
+    const int nb  = n/QK_UDNL_W4;  // udnl_w4 blocks per weight column
+    const int anb = 8*nb;          // q8_0 blocks per activation row
+    const uint8_t * GGML_RESTRICT w = (const uint8_t *) vx;
+    const size_t a_row = (size_t)(n/QK8_0)*sizeof(block_q8_0);
+    // Panel-outermost variant of the gemm above: each weight panel (~35 KB at
+    // nb=16) is decoded while resident in L1/L2 and applied to every 8-row
+    // activation tile before moving to the next panel. The activation records
+    // (asum128/dy per q8_0 block, row-major nr x anb) arrive precomputed, so
+    // the per-call O(NR*n) rebuild of the plain gemm disappears entirely.
+    // Numerics are identical: per output element the fp32 accumulation order
+    // over (panel, b, g) is unchanged.
+    for (int p = 0; p < nc/16; ++p) {
+        const uint8_t * GGML_RESTRICT pw = w + (int64_t) p*nb*UDNL_W4_PB;
+        int y0 = 0;
+        for (; y0 + 8 <= nr; y0 += 8) {
+            udnl_w4_panel_avx512<8>(nb, pw, (const block_q8_0 *) ((const char *) vy + (int64_t) y0*a_row), anb,
+                                    arec + (int64_t) y0*anb, s + (int64_t) y0*bs + 16*p, bs);
+        }
+        if (y0 < nr) {
+            udnl_w4_panel_avx512<4>(nb, pw, (const block_q8_0 *) ((const char *) vy + (int64_t) y0*a_row), anb,
+                                    arec + (int64_t) y0*anb, s + (int64_t) y0*bs + 16*p, bs);
+        }
+    }
+    return;
+#endif
+    GGML_UNUSED(arec);
+    ggml_gemm_udnl_w4_1x16_q8_0_generic(n, s, bs, vx, vy, nr, nc);
+}
+
+// UDNL_MX NR16 panel kernels (AVX512F+BW+VNNI+VBMI).
+//
+// Weight layout (repacked, see ggml-common.h UDNL_MX_PB): panels of 16 output
+// channels; per (panel, 256-K block) 8 x [payload_g | srel 16B] + d[16] fp16
+// at offset 1664 + the panel-shared mode word (u16) at 1696 = 1728 B. The 2
+// mode bits of KQ group g select the payload size (W2: 128B, W3: 192B, W4:
+// 256B per group) and the codebook (4/8/16 entries, all IQ4_NL subsets).
+// Chunk decode (chunk s covers k = 32g+8s..32g+8s+7, 16 rows):
+//   W4: identical to UDNL_W4 (and/shift + unpacklo/hi + 2 x vpshufb)
+//   W2: 32B chunk -> cvtepu16_epi32 (dword r = row r's 2 bytes) ->
+//       2 x vpmultishiftqb (windows at bit offsets 0,2,4,6 / 8,10,12,14 of
+//       each row's u16) + vpand 0x03 -> 2 x vpshufb (4-entry biased LUT)
+//   W3: low2 32B decoded like W2; high1 16B -> cvtepu8_epi32 (dword r = row
+//       r's high byte) -> 2 x vpmultishiftqb (bit v to byte v) + vpand 0x01 +
+//       shift into bit 2 + vpor -> 2 x vpshufb (8-entry biased LUT)
+// The dot-product side is identical to UDNL_W4: biased (+128) u8 codebook
+// values, vpbroadcastd activation dwords, per-KQ bias correction via hoisted
+// activation sums, raw <= ~1.1M < 2^24 so the int->fp cvt is exact.
+
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__) && defined(__AVX512VBMI__)
+
+static inline __m512i udnl_mx_lut_biased(const int8_t * cb, int ncb) {
+    uint8_t lut8[16] = {};
+    for (int i = 0; i < ncb; ++i) {
+        lut8[i] = (uint8_t) (cb[i] + 128);
+    }
+    return _mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i *) lut8));
+}
+
+// Dot NR activation rows against one 16-column weight panel (nb super-blocks
+// of K). rec holds the precomputed per-(row, q8_0 block) activation terms,
+// row-major NR x anb. s_p points at the panel's first output column.
+template <int NR>
+static void udnl_mx_panel_avx512(
+        int nb,
+        const uint8_t * GGML_RESTRICT pw,
+        const block_q8_0 * GGML_RESTRICT a, int64_t anb,
+        const udnl_w4_arec * GGML_RESTRICT rec,
+        float * GGML_RESTRICT s_p, size_t bs) {
+    static_assert(NR >= 1 && NR <= 8, "invalid UDNL_MX GEMV row count");
+
+    const __m512i LUT4 = udnl_w4_lut_biased();
+    const __m512i LUT3 = udnl_mx_lut_biased(kvalues_udnl3, 8);
+    const __m512i LUT2 = udnl_mx_lut_biased(kvalues_udnl2, 4);
+    const __m512i m0F  = _mm512_set1_epi8(0x0F);
+    const __m512i m03  = _mm512_set1_epi8(0x03);
+    const __m512i m01  = _mm512_set1_epi8(0x01);
+    // vpmultishiftqb controls (per qword, byte b = shift for output byte b).
+    // After cvtepu16_epi32, qword q = [row 2q u16 | 16 zero bits | row 2q+1
+    // u16 | 16 zero bits]; cvtepu8_epi32 puts row r's byte at bit 32*(r%2).
+    const __m512i msA2 = _mm512_set1_epi64(0x2624222006040200ULL); // low2, idx 0..3
+    const __m512i msB2 = _mm512_set1_epi64(0x2E2C2A280E0C0A08ULL); // low2, idx 4..7
+    const __m512i msAH = _mm512_set1_epi64(0x2322212003020100ULL); // high1, idx 0..3
+    const __m512i msBH = _mm512_set1_epi64(0x2726252407060504ULL); // high1, idx 4..7
+
+    // [GGML_REPACK_GEMV_PREFETCH] same SW-prefetch policy as the mxfp4 gemv
+    static const bool pf_enable = []() {
+        const char * e = getenv("GGML_REPACK_GEMV_PREFETCH");
+        return !(e && (e[0] == '\0' || strcmp(e, "0") == 0));
+    }();
+
+    __m512 accf[NR];
+    for (int y = 0; y < NR; ++y) {
+        accf[y] = _mm512_setzero_ps();
+    }
+
+    for (int b = 0; b < nb; ++b) {
+        const uint8_t * GGML_RESTRICT pb = pw + (int64_t) b*UDNL_MX_PB;
+        if (pf_enable && b + 2 < nb) {
+            _mm_prefetch((const char *) (pb + 2*UDNL_MX_PB),      _MM_HINT_T0);
+            _mm_prefetch((const char *) (pb + 2*UDNL_MX_PB) + 64, _MM_HINT_T0);
+        }
+        const uint16_t mw = ((const uint16_t *) (pb + 1696))[0];
+        const __m512 dv = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *) (pb + 1664)));
+        __m512 accq[NR];
+        for (int y = 0; y < NR; ++y) {
+            accq[y] = _mm512_setzero_ps();
+        }
+
+        const uint8_t * GGML_RESTRICT pl = pb;
+        for (int g = 0; g < 8; ++g) {
+            const int mode = (mw >> 2*g) & 3;
+            // decode the 4 chunks once, apply to all NR rows
+            __m512i wA[4], wB[4];
+            if (mode == 3) {
+                for (int s4 = 0; s4 < 4; ++s4) {
+                    const __m512i c  = _mm512_loadu_si512(pl + 64*s4);
+                    const __m512i lo = _mm512_and_si512(c, m0F);
+                    const __m512i hi = _mm512_and_si512(_mm512_srli_epi16(c, 4), m0F);
+                    wA[s4] = _mm512_shuffle_epi8(LUT4, _mm512_unpacklo_epi8(lo, hi));
+                    wB[s4] = _mm512_shuffle_epi8(LUT4, _mm512_unpackhi_epi8(lo, hi));
+                }
+                pl += 256;
+            } else if (mode == 2) {
+                for (int s4 = 0; s4 < 4; ++s4) {
+                    const __m512i cl = _mm512_cvtepu16_epi32(_mm256_loadu_si256((const __m256i *) (pl + 48*s4)));
+                    const __m512i ch = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *) (pl + 48*s4 + 32)));
+                    const __m512i uA = _mm512_and_si512(_mm512_multishift_epi64_epi8(msA2, cl), m03);
+                    const __m512i uB = _mm512_and_si512(_mm512_multishift_epi64_epi8(msB2, cl), m03);
+                    const __m512i hA = _mm512_and_si512(_mm512_multishift_epi64_epi8(msAH, ch), m01);
+                    const __m512i hB = _mm512_and_si512(_mm512_multishift_epi64_epi8(msBH, ch), m01);
+                    wA[s4] = _mm512_shuffle_epi8(LUT3, _mm512_or_si512(uA, _mm512_slli_epi32(hA, 2)));
+                    wB[s4] = _mm512_shuffle_epi8(LUT3, _mm512_or_si512(uB, _mm512_slli_epi32(hB, 2)));
+                }
+                pl += 192;
+            } else {
+                for (int s4 = 0; s4 < 4; ++s4) {
+                    const __m512i cl = _mm512_cvtepu16_epi32(_mm256_loadu_si256((const __m256i *) (pl + 32*s4)));
+                    const __m512i uA = _mm512_and_si512(_mm512_multishift_epi64_epi8(msA2, cl), m03);
+                    const __m512i uB = _mm512_and_si512(_mm512_multishift_epi64_epi8(msB2, cl), m03);
+                    wA[s4] = _mm512_shuffle_epi8(LUT2, uA);
+                    wB[s4] = _mm512_shuffle_epi8(LUT2, uB);
+                }
+                pl += 128;
+            }
+            const __m512 svf = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(
+                    _mm_loadu_si128((const __m128i *) pl)));
+            pl += 16;
+            for (int y = 0; y < NR; ++y) {
+                const block_q8_0 * GGML_RESTRICT ab = a + (int64_t) y*anb + 8*b + g;
+                const udnl_w4_arec * GGML_RESTRICT rg = rec + (int64_t) y*anb + 8*b + g;
+                __m512i accA = _mm512_setzero_si512();
+                __m512i accB = _mm512_setzero_si512();
+                for (int s4 = 0; s4 < 4; ++s4) {
+                    accA = _mm512_dpbusd_epi32(accA, wA[s4], _mm512_set1_epi32(udnl_w4_load_i32(ab->qs + 8*s4)));
+                    accB = _mm512_dpbusd_epi32(accB, wB[s4], _mm512_set1_epi32(udnl_w4_load_i32(ab->qs + 8*s4 + 4)));
+                }
+                const __m512i raw = _mm512_sub_epi32(_mm512_add_epi32(accA, accB),
+                                                     _mm512_set1_epi32(rg->asum128));
+                const __m512 part = _mm512_mul_ps(_mm512_cvtepi32_ps(raw), svf);
+                accq[y] = _mm512_fmadd_ps(part, _mm512_set1_ps(rg->dy), accq[y]);
+            }
+        }
+
+        for (int y = 0; y < NR; ++y) {
+            accf[y] = _mm512_fmadd_ps(accq[y], dv, accf[y]);
+        }
+    }
+
+    for (int y = 0; y < NR; ++y) {
+        _mm512_storeu_ps(s_p + y*bs, accf[y]);
+    }
+}
+
+template <int NR>
+static void ggml_gemv_udnl_mx_1x16_q8_0_avx512(
+        int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy,
+        int nc) {
+    GGML_ASSERT(n % QK_UDNL_MX == 0);
+    GGML_ASSERT(nc % 16 == 0);
+    static_assert(NR >= 1 && NR <= 8, "invalid UDNL_MX GEMV row count");
+
+    const int nb  = n / QK_UDNL_MX;  // udnl_mx blocks per weight column
+    const int anb = 8*nb;            // q8_0 blocks per activation row
+
+    const uint8_t * GGML_RESTRICT w = (const uint8_t *) vx;
+    const block_q8_0 * GGML_RESTRICT a = (const block_q8_0 *) vy;
+
+    // Hoisted activation terms, one 8 B record per (row y, q8_0 block j),
+    // row-major. Rebuilt once per call (O(NR*n)) instead of once per panel.
+    const int64_t nrec = (int64_t) anb*NR;
+    static thread_local std::vector<udnl_w4_arec> recs;
+    if ((int64_t) recs.size() < nrec) {
+        recs.resize((size_t) nrec);
+    }
+    udnl_w4_arec * GGML_RESTRICT rec = recs.data();
+    for (int y = 0; y < NR; ++y) {
+        const block_q8_0 * GGML_RESTRICT ay = a + (int64_t) y*anb;
+        for (int j = 0; j < anb; ++j) {
+            int asum = 0;
+            for (int v = 0; v < QK8_0; ++v) {
+                asum += ay[j].qs[v];
+            }
+            rec[(int64_t) y*anb + j].asum128 = 128*asum;
+            rec[(int64_t) y*anb + j].dy      = GGML_CPU_FP16_TO_FP32(ay[j].d);
+        }
+    }
+
+    for (int p = 0; p < nc/16; ++p) {
+        udnl_mx_panel_avx512<NR>(nb, w + (int64_t) p*nb*UDNL_MX_PB, a, anb, rec, s + 16*p, bs);
+    }
+}
+#endif // __AVX512F__ && __AVX512BW__ && __AVX512VNNI__ && __AVX512VBMI__
+
+void ggml_gemv_udnl_mx_1x16_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__) && defined(__AVX512VBMI__)
+    switch (nr) {
+        case 1: ggml_gemv_udnl_mx_1x16_q8_0_avx512<1>(n, s, bs, vx, vy, nc); return;
+        case 2: ggml_gemv_udnl_mx_1x16_q8_0_avx512<2>(n, s, bs, vx, vy, nc); return;
+        case 3: ggml_gemv_udnl_mx_1x16_q8_0_avx512<3>(n, s, bs, vx, vy, nc); return;
+        case 4: ggml_gemv_udnl_mx_1x16_q8_0_avx512<4>(n, s, bs, vx, vy, nc); return;
+        case 5: ggml_gemv_udnl_mx_1x16_q8_0_avx512<5>(n, s, bs, vx, vy, nc); return;
+        case 6: ggml_gemv_udnl_mx_1x16_q8_0_avx512<6>(n, s, bs, vx, vy, nc); return;
+        case 7: ggml_gemv_udnl_mx_1x16_q8_0_avx512<7>(n, s, bs, vx, vy, nc); return;
+        case 8: ggml_gemv_udnl_mx_1x16_q8_0_avx512<8>(n, s, bs, vx, vy, nc); return;
+        default: break;
+    }
+#endif
+    ggml_gemv_udnl_mx_1x16_q8_0_generic(n, s, bs, vx, vy, nr, nc);
+}
+
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__) && defined(__AVX512VBMI__)
+template <int NR>
+static void ggml_gemv_udnl_mx_1x16_q8_0_arec_avx512(
+        int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy,
+        const udnl_w4_arec * GGML_RESTRICT rec, int nc) {
+    GGML_ASSERT(n % QK_UDNL_MX == 0);
+    GGML_ASSERT(nc % 16 == 0);
+    static_assert(NR >= 1 && NR <= 8, "invalid UDNL_MX GEMV row count");
+    const int nb  = n / QK_UDNL_MX;
+    const int anb = 8*nb;
+    const uint8_t * GGML_RESTRICT w = (const uint8_t *) vx;
+    const block_q8_0 * GGML_RESTRICT a = (const block_q8_0 *) vy;
+    for (int p = 0; p < nc/16; ++p) {
+        udnl_mx_panel_avx512<NR>(nb, w + (int64_t) p*nb*UDNL_MX_PB, a, anb, rec, s + 16*p, bs);
+    }
+}
+#endif
+
+void ggml_gemv_udnl_mx_1x16_q8_0_arec(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, const udnl_w4_arec * GGML_RESTRICT arec, int nr, int nc) {
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__) && defined(__AVX512VBMI__)
+    switch (nr) {
+        case 1: ggml_gemv_udnl_mx_1x16_q8_0_arec_avx512<1>(n, s, bs, vx, vy, arec, nc); return;
+        case 2: ggml_gemv_udnl_mx_1x16_q8_0_arec_avx512<2>(n, s, bs, vx, vy, arec, nc); return;
+        case 3: ggml_gemv_udnl_mx_1x16_q8_0_arec_avx512<3>(n, s, bs, vx, vy, arec, nc); return;
+        case 4: ggml_gemv_udnl_mx_1x16_q8_0_arec_avx512<4>(n, s, bs, vx, vy, arec, nc); return;
+        case 5: ggml_gemv_udnl_mx_1x16_q8_0_arec_avx512<5>(n, s, bs, vx, vy, arec, nc); return;
+        case 6: ggml_gemv_udnl_mx_1x16_q8_0_arec_avx512<6>(n, s, bs, vx, vy, arec, nc); return;
+        case 7: ggml_gemv_udnl_mx_1x16_q8_0_arec_avx512<7>(n, s, bs, vx, vy, arec, nc); return;
+        case 8: ggml_gemv_udnl_mx_1x16_q8_0_arec_avx512<8>(n, s, bs, vx, vy, arec, nc); return;
+        default: break;
+    }
+#endif
+    GGML_UNUSED(arec);
+    ggml_gemv_udnl_mx_1x16_q8_0_generic(n, s, bs, vx, vy, nr, nc);
+}
+
+void ggml_gemm_udnl_mx_1x16_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__) && defined(__AVX512VBMI__)
+    GGML_ASSERT(nr % 4 == 0);
+    const size_t a_row = (size_t)(n/QK8_0)*sizeof(block_q8_0);
+    // MR8 row blocking (same rationale as the Q3_R gemm): each decoded weight
+    // chunk is applied to 8 activation rows. A 4-row remainder (nr % 8 == 4)
+    // uses the MR4 instantiation.
+    int y0 = 0;
+    for (; y0 + 8 <= nr; y0 += 8) {
+        const char * ay = (const char *) vy + (int64_t) y0*a_row;
+        ggml_gemv_udnl_mx_1x16_q8_0_avx512<8>(n, s + (int64_t) y0*bs, bs, vx, ay, nc);
+    }
+    if (y0 < nr) {
+        const char * ay = (const char *) vy + (int64_t) y0*a_row;
+        ggml_gemv_udnl_mx_1x16_q8_0_avx512<4>(n, s + (int64_t) y0*bs, bs, vx, ay, nc);
+    }
+    return;
+#endif
+    ggml_gemm_udnl_mx_1x16_q8_0_generic(n, s, bs, vx, vy, nr, nc);
+}
+
+void ggml_gemm_udnl_mx_1x16_q8_0_arec(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, const udnl_w4_arec * GGML_RESTRICT arec, int nr, int nc) {
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__) && defined(__AVX512VBMI__)
+    GGML_ASSERT(nr % 4 == 0);
+    GGML_ASSERT(n % QK_UDNL_MX == 0);
+    GGML_ASSERT(nc % 16 == 0);
+    const int nb  = n/QK_UDNL_MX;  // udnl_mx blocks per weight column
+    const int anb = 8*nb;          // q8_0 blocks per activation row
+    const uint8_t * GGML_RESTRICT w = (const uint8_t *) vx;
+    const size_t a_row = (size_t)(n/QK8_0)*sizeof(block_q8_0);
+    // Panel-outermost variant of the gemm above (same shape as the UDNL_W4
+    // arec gemm): each weight panel (~28 KB at nb=16) is decoded while resident
+    // in L1/L2 and applied to every 8-row activation tile before moving on.
+    // The per-group mode decode branch is untouched — it is part of the panel
+    // stream either way — but the activation records arrive precomputed
+    // (row-major nr x anb), so the per-call O(NR*n) rebuild disappears.
+    // Numerics are identical: per output element the fp32 accumulation order
+    // over (panel, b, g) is unchanged.
+    for (int p = 0; p < nc/16; ++p) {
+        const uint8_t * GGML_RESTRICT pw = w + (int64_t) p*nb*UDNL_MX_PB;
+        int y0 = 0;
+        for (; y0 + 8 <= nr; y0 += 8) {
+            udnl_mx_panel_avx512<8>(nb, pw, (const block_q8_0 *) ((const char *) vy + (int64_t) y0*a_row), anb,
+                                    arec + (int64_t) y0*anb, s + (int64_t) y0*bs + 16*p, bs);
+        }
+        if (y0 < nr) {
+            udnl_mx_panel_avx512<4>(nb, pw, (const block_q8_0 *) ((const char *) vy + (int64_t) y0*a_row), anb,
+                                    arec + (int64_t) y0*anb, s + (int64_t) y0*bs + 16*p, bs);
+        }
+    }
+    return;
+#endif
+    GGML_UNUSED(arec);
+    ggml_gemm_udnl_mx_1x16_q8_0_generic(n, s, bs, vx, vy, nr, nc);
 }
 
 void ggml_gemm_q2_K_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {

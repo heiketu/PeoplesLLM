@@ -660,6 +660,12 @@ void ggml_compute_forward_add(
 
     const ggml_tensor * src0 = dst->src[0];
 
+    if (src0->type == GGML_TYPE_Q8_0 && dst->src[1]->type == GGML_TYPE_Q8_0 && dst->type == GGML_TYPE_Q8_0) {
+        // q8_0 intermediate-activation aggregation (GGML_CPU_INT8_INTERMEDIATE path)
+        ggml_compute_forward_add_q8_0_q8_0(params, dst);
+        return;
+    }
+
     switch (src0->type) {
         case GGML_TYPE_F32:
         case GGML_TYPE_F16:
@@ -5147,6 +5153,9 @@ void ggml_compute_forward_get_rows(
         case GGML_TYPE_NVFP4:
         case GGML_TYPE_Q2_K:
         case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q3_R:
+        case GGML_TYPE_UDNL_W4:
+        case GGML_TYPE_UDNL_MX:
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
         case GGML_TYPE_Q6_K:
@@ -5922,6 +5931,9 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_Q3_R:
+        case GGML_TYPE_UDNL_W4:
+        case GGML_TYPE_UDNL_MX:
         case GGML_TYPE_Q8_K:
         case GGML_TYPE_I8:
         case GGML_TYPE_I16:

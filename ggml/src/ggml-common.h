@@ -320,6 +320,92 @@ typedef struct {
 } block_q3_K;
 static_assert(sizeof(block_q3_K) == sizeof(ggml_half) + QK_K / 4 + QK_K / 8 + 12, "wrong q3_K block size/padding");
 
+// 3-bit quantization
+// weight is represented as x = d * scales[j] * (q - 4)
+// 256-element super-block: 8 sub-blocks of 32 elements each (aligned with q8_0 blocks)
+// Effectively 3.3125 bits per weight
+// qs: sub-block j occupies bytes [12j, 12j+12); value v sits at bits [3v, 3v+2] of the
+// sub-block's 96-bit stream (LSB first). The AVX512 unpack decodes one 64-code group
+// (24 bytes) with a single vpermb (8-byte window per qword lane) + vpmultishiftqb +
+// vpand, so repack is a plain memcpy.
+#define QK3_R 256
+typedef struct {
+    ggml_half d;         // super-block scale
+    int8_t    scales[8]; // signed sub-block scales (Q6_K scheme; negative flips a sub-block)
+    uint8_t   qs[3*QK3_R/8]; // 3-bit quants
+} block_q3_r;
+static_assert(sizeof(block_q3_r) == sizeof(ggml_half) + QK3_R/32 + 3*QK3_R/8, "wrong q3_r block size/padding");
+
+// UDNL W4 single mode (4+4): 256-element super-block of 8 KQ groups (32 weights
+// each, aligned with q8_0 blocks). Weights are codebook indices into the 16-entry
+// non-linear grid (kvalues_iq4nl); the effective KQ scale is d*srel (fp16 super
+// scale x u8 relative scale 0..255, srel == 0 marks an all-zero KQ):
+//   w = d * srel * kvalues_iq4nl[idx]
+// qs: KQ g occupies bytes [16g, 16g+16); byte j = idx(32g+2j) | idx(32g+2j+1)<<4.
+// The CPU repack path transforms rows into the NR16xK4 panel layout (16 rows x
+// 32 K per panel chunk) for the VPDPBUSD kernels; the on-disk row layout stays
+// plain nibble pairs so repack is a pure shuffle.
+// Effectively 4.3125 bits per weight.
+#define QK_UDNL_W4 256
+typedef struct {
+    ggml_half d;                     // super-block scale base
+    uint8_t   srel[QK_UDNL_W4/32];   // per-KQ relative scales (effective = d*srel)
+    uint8_t   qs[QK_UDNL_W4/2];      // 4-bit codebook indices
+} block_udnl_w4;
+static_assert(sizeof(block_udnl_w4) == sizeof(ggml_half) + QK_UDNL_W4/32 + QK_UDNL_W4/2, "wrong udnl_w4 block size/padding");
+
+// NR16xK4 panel layout used by the CPU repack path: panels of 16 output
+// channels; per (panel, 256-K block) the bytes are
+//   8 x [payload 256B | srel 16B] + d[16] fp16 = 2208 B = 16 x sizeof(block_udnl_w4)
+// (repack is a pure byte rearrangement). Within KQ g's payload, chunk s (64 B)
+// covers k = 32g+8s..32g+8s+7; 16-byte lane l covers rows 4l..4l+3; with
+// i = row%4: byte 16l+2i+q = idx(8s+2q) | idx(8s+2q+1)<<4 (row byte 4s+q of the
+// row block), byte 16l+8+2i+q = idx(8s+4+2q) | idx(8s+4+2q+1)<<4 (row byte 4s+2+q).
+#define UDNL_W4_PB (QK_UDNL_W4/32*(16*32/2 + 16) + 16*(int)sizeof(ggml_half))
+
+// UDNL_MX mixed precision (W2/W3/W4 per KQ group): 256-element super-block of
+// 8 KQ groups (32 weights each, aligned with q8_0 blocks). Each KQ group uses
+// one of three codebooks (subsets of the IQ4_NL grid):
+//   W2 (mode 1):  4-entry grid kvalues_udnl2,  8 payload bytes per group
+//   W3 (mode 2):  8-entry grid kvalues_udnl3, 12 payload bytes per group
+//   W4 (mode 3): 16-entry grid kvalues_iq4nl, 16 payload bytes per group
+// The 2-bit per-group modes are packed into a u16 (group g at bits 2g..2g+1;
+// mode 0 never written by the quantizer). The mode word is shared by the 16
+// rows of a repack panel (the quantizer picks it by a panel-level DP over the
+// summed imatrix-weighted error; quantize_row_udnl_mx_ref quantizes rows
+// independently). Payload budget is exactly 96 bytes per block, i.e. the modes
+// satisfy x3 + 2*x4 == 8. Group payloads are packed back-to-back in group
+// order inside qs (variable offset = prefix sum of the group sizes).
+//   w = d * srel * codebook_mode[idx]
+// Row payload packing per group (32 weights):
+//   W4: byte j = idx(2j) | idx(2j+1)<<4                        (16 B)
+//   W2: byte j = idx(4j) | idx(4j+1)<<2 | idx(4j+2)<<4 | idx(4j+3)<<6  (8 B)
+//   W3: low2 plane 8 B (packed like W2 with idx&3) + high1 plane 4 B
+//       (byte j bit v = idx(8j+v)>>2)                          (12 B)
+// srel == 0 marks an all-zero KQ group. 3.375 bits per weight.
+#define QK_UDNL_MX 256
+typedef struct {
+    ggml_half d;                    // super-block scale base
+    uint8_t   srel[QK_UDNL_MX/32];  // per-KQ relative scales (effective = d*srel)
+    uint16_t  modes;                // 2 bits per KQ group: 1=W2, 2=W3, 3=W4
+    uint8_t   qs[3*QK_UDNL_MX/8];   // per-group payloads, mode-dependent packing
+} block_udnl_mx;
+static_assert(sizeof(block_udnl_mx) == sizeof(ggml_half) + QK_UDNL_MX/32 + 2 + 3*QK_UDNL_MX/8, "wrong udnl_mx block size/padding");
+
+// NR16 panel layout used by the CPU repack path: per (panel of 16 rows,
+// 256-K block) the bytes are
+//   8 x [payload_g (128/192/256B by mode) | srel_g 16B] + d[16] fp16 (32B)
+//   + modes u16 (2B) + 30B pad = 1728 B = 16 x sizeof(block_udnl_mx)
+// (byte-count preserving; the 16 duplicate row mode words collapse to one).
+// Within a group's payload, chunk s covers k = 32g+8s..32g+8s+7:
+//   W4: chunk 64B, identical to the UDNL_W4 mapping (byte 16l+2i+q etc.)
+//   W2: chunk 32B, byte 2r+q = row byte 2s+q (q = 0,1)
+//   W3: chunk 48B: low2 32B (byte 2r+q = row byte 2s+q) then high1 16B
+//       (byte r = row high1 byte s)
+// Group g's payload starts at the prefix sum over g' < g of
+// (16*size(mode_g') + 16); d[] at offset 1664, modes at 1696.
+#define UDNL_MX_PB (16*(int)sizeof(block_udnl_mx))
+
 // 4-bit quantization
 // 8 blocks of 32 elements each
 // weight is represented as x = a * q + b
@@ -1119,6 +1205,17 @@ GGML_TABLE_END()
 // TODO: fix name to kvalues_iq4_nl
 GGML_TABLE_BEGIN(int8_t, kvalues_iq4nl, 16)
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+GGML_TABLE_END()
+
+// UDNL_MX W3/W2 codebooks: subsets of the IQ4_NL grid (indices 0,2,..,14 and
+// 0,5,10,15 respectively), so the W3 3-bit index i and W2 2-bit index i map to
+// the same value as the W4 index 2i / the listed 4-bit indices.
+GGML_TABLE_BEGIN(int8_t, kvalues_udnl3, 8)
+    -127, -83, -49, -22, 1, 25, 53, 89,
+GGML_TABLE_END()
+
+GGML_TABLE_BEGIN(int8_t, kvalues_udnl2, 4)
+    -127, -35, 25, 113,
 GGML_TABLE_END()
 
 // e2m1 values (doubled), shared by MXFP4 and NVFP4

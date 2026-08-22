@@ -5,6 +5,7 @@
 #include "vecdotq.cuh"
 
 #include <cstdint>
+#include <cstdlib>
 
 #define FATTN_KQ_STRIDE       256
 #define HALF_MAX_HALF         __float2half(65504.0f/2) // Use neg. of this instead of -INFINITY to initialize KQ max vals to avoid NaN upon subtraction.
@@ -17,6 +18,18 @@
 // Still, the value range should be shifted as much as necessary but as little as possible.
 // The macro on the following line shifts it by a factor of 2**3=8, as was needed to fix https://github.com/ggml-org/llama.cpp/issues/18606 .
 #define FATTN_KQ_MAX_OFFSET (3.0f*0.6931f)
+
+// Flags passed to the flash-attention kernels, set via environment variables:
+// FATTN_FLAGS_PV_Q8_0: opt-in (GGML_CUDA_FA_PV_Q8=1) alternative P*V path for q8_0 V in the vec kernel.
+//     Reads the raw q8_0 data and folds the block scale into the softmax probability
+//     (VKQ += qs * (d*P) instead of VKQ += (d*qs) * P), skipping the per-element dequantization
+//     multiply. A full q8 x q8 DP4A P*V is not profitable in the vec kernel: the P*V reduction runs
+//     along the token axis while q8_0 V packs 4 consecutive bytes along head_dim, so DP4A would need
+//     a per-4-token byte transpose (3 PRMT/token), and the q8_0 block scales vary along the token
+//     axis, forcing the V scales to be folded into P and re-quantized for every 128-token tile
+//     (~11 instr/token/column) with only ncols <= 2 columns to amortize over. Instruction accounting
+//     on sm_86 comes out a wash at best for ncols=1 and clearly negative for ncols=2.
+#define FATTN_FLAGS_PV_Q8_0 1
 
 typedef void (* fattn_kernel_t)(
         const char * __restrict__ Q,
@@ -46,7 +59,8 @@ typedef void (* fattn_kernel_t)(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int32_t nb32, const int64_t nb33);
+                            const int32_t nb31, const int32_t nb32, const int64_t nb33,
+        const int32_t fattn_flags);
 
 typedef float (*vec_dot_KQ_t)(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
@@ -1673,6 +1687,12 @@ void launch_fattn(
         scale /= logit_softcap;
     }
 
+    // Opt-in kernel features via environment, read once:
+    static const int32_t fattn_flags = []() {
+        const char * env = getenv("GGML_CUDA_FA_PV_Q8");
+        return env != nullptr && atoi(env) != 0 ? FATTN_FLAGS_PV_Q8_0 : 0;
+    }();
+
     const uint32_t n_head      = Q->ne[2];
     const uint32_t n_head_log2 = 1u << uint32_t(floorf(log2f(float(n_head))));
 
@@ -1705,7 +1725,8 @@ void launch_fattn(
         K->ne[0], ne11_effective, K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
-        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
+        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
+        fattn_flags
     );
     CUDA_CHECK(cudaGetLastError());
 

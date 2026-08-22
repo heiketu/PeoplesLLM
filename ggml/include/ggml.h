@@ -430,7 +430,10 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_COUNT   = 43,
+        GGML_TYPE_Q3_R    = 43, // 3-bit, 256-element super-block, int8 sub-scales, repack-identity layout
+        GGML_TYPE_UDNL_W4 = 44, // UDNL W4 single mode (4+4): 16-entry NL codebook, u8 KQ scales, fp16 super scale
+        GGML_TYPE_UDNL_MX = 45, // UDNL mixed W2/W3/W4 per KQ group (panel-shared mode word), 3.375 bpw
+        GGML_TYPE_COUNT   = 46,
     };
 
     // precision

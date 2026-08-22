@@ -18,7 +18,17 @@
 // NCCL; targets setups without NVLink, where data is exchanged between the
 // GPUs by staging it through pinned host memory over PCIe.
 //
-// Two reduction strategies are selected per call by tensor size:
+// Three reduction strategies are selected per call:
+//
+//   * P2P path (requires peer access, e.g. NVLink): a single CUDA kernel
+//     per device reads the peer's tensor directly over peer access into a
+//     local scratch buffer and accumulates it in place.  Cross-GPU
+//     synchronization happens *inside the kernel* via a two-phase
+//     arrive/read-done handshake on device-memory flags, so an AllReduce
+//     costs exactly one kernel launch per device and no CUDA API calls.
+//     Selected whenever peer access is available and the allocations are
+//     peer-accessible (GGML_CUDA_P2P=1 or an NCCL build, which grant the
+//     VMM pools to peers); GGML_CUDA_AR_P2P=0 opts out.
 //
 //   * Chunked kernel path (small reductions): a single CUDA kernel both
 //     stages data through pinned host memory and performs the local sum.
@@ -74,6 +84,128 @@ static constexpr size_t GGML_CUDA_AR_ARRIVAL_STRIDE = 64;
 // disjoint slice of the data and synchronizes through its own arrival-token
 // slot so multiple SMs can pump PCIe stores in parallel.
 static constexpr int GGML_CUDA_AR_KERNEL_BLOCKS = 8;
+
+// ---------------------------------------------------------------------------
+// P2P direct-read AllReduce -- 2 GPUs with peer access (e.g. NVLink).
+//
+// One kernel launch per device; no host staging and no CUDA API sync calls
+// per AllReduce.  Both GPUs run this kernel simultaneously on their compute
+// streams.  Per block b (same grid on both devices):
+//
+//   Phase 1 (thread 0):  write token to arrive_mine[b]; spin until
+//                        arrive_peer[b] == token.  Kernel start on each
+//                        device implies that device's prior compute writes
+//                        are complete (same-stream ordering), so arrival
+//                        means "my buffer is final and may be read".
+//   Phase 2 (all threads): copy this block's stripe of peer_buf into the
+//                        local scratch buffer as single-instruction-width
+//                        vectors (type-agnostic copy).
+//   Phase 3 (thread 0):  write token to done_mine[b]; spin until
+//                        done_peer[b] == token.  The __syncthreads before
+//                        signalling orders this block's scratch stores (and
+//                        therefore its peer_buf loads) ahead of the flag,
+//                        so the peer only starts overwriting its own buffer
+//                        once every read of it has completed.
+//   Phase 4 (all threads): mine[stripe] += scratch[stripe], in T precision.
+//
+// The two GPUs compute a+b and b+a respectively; IEEE addition is
+// commutative so both sides produce bit-identical results, and the fixed
+// kernel schedule keeps runs deterministic.
+//
+// Flags live in device memory (cudaMalloc, peer-accessible), written only
+// by the local device and read over P2P.  Tokens increase monotonically per
+// call so flags never need resetting.  Scratch is per-device and touched
+// only by the local kernel, and successive launches on the same stream are
+// ordered, so a single scratch buffer per device suffices.
+// ---------------------------------------------------------------------------
+template <typename T>
+static __global__ void ggml_cuda_ar_p2p_kernel(
+        T * __restrict__ mine,
+        const T * __restrict__ peer_buf,
+        T * __restrict__ scratch,
+        int count,
+        int * arrive_mine, const int * arrive_peer,
+        int * done_mine,   const int * done_peer,
+        int token) {
+
+    constexpr int ELEMS_PER_VEC = ggml_cuda_get_max_cpy_bytes() / sizeof(T);
+    constexpr int ARRIVAL_INTS  = (int)(GGML_CUDA_AR_ARRIVAL_STRIDE / sizeof(int));
+
+    const int tid       = threadIdx.x;
+    const int nt        = blockDim.x;
+    const int bid       = blockIdx.x;
+    const int gtid      = bid * nt + tid;
+    const int gnt       = gridDim.x * nt;
+    const int count_vec = count / ELEMS_PER_VEC;
+    const int tail      = count_vec * ELEMS_PER_VEC;
+
+    if (tid == 0) {
+        int       * my_arr   = arrive_mine + bid * ARRIVAL_INTS;
+        const int * peer_arr = arrive_peer + bid * ARRIVAL_INTS;
+
+        ggml_cuda_ar_signal_set(my_arr, token);
+        __threadfence_system(); // make our signal visible to the peer
+
+        while (ggml_cuda_ar_signal_get(peer_arr) != token) {
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+            __nanosleep(100);
+#else
+            NO_DEVICE_CODE;
+#endif // __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+        }
+    }
+    __syncthreads();
+
+    // Pull the peer's contribution into local scratch.
+    {
+        for (int i = gtid; i < count_vec; i += gnt) {
+            const int off = i * ELEMS_PER_VEC;
+            T tmp[ELEMS_PER_VEC];
+            ggml_cuda_memcpy_1<sizeof(tmp)>(tmp, &peer_buf[off]);
+            ggml_cuda_memcpy_1<sizeof(tmp)>(&scratch[off], tmp);
+        }
+        if (bid == 0 && tid < count - tail) {
+            scratch[tail + tid] = peer_buf[tail + tid];
+        }
+    }
+
+    __syncthreads(); // our peer_buf reads are complete once scratch stores retire
+
+    if (tid == 0) {
+        int       * my_d   = done_mine + bid * ARRIVAL_INTS;
+        const int * peer_d = done_peer + bid * ARRIVAL_INTS;
+
+        ggml_cuda_ar_signal_set(my_d, token);
+        __threadfence_system();
+
+        while (ggml_cuda_ar_signal_get(peer_d) != token) {
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+            __nanosleep(100);
+#else
+            NO_DEVICE_CODE;
+#endif // __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+        }
+    }
+    __syncthreads();
+
+    // Accumulate the peer's contribution in place.
+    {
+        for (int i = gtid; i < count_vec; i += gnt) {
+            const int off = i * ELEMS_PER_VEC;
+            T tmp[ELEMS_PER_VEC];
+            ggml_cuda_memcpy_1<sizeof(tmp)>(tmp, &scratch[off]);
+            #pragma unroll
+            for (int k = 0; k < ELEMS_PER_VEC; ++k) {
+                mine[off + k] = ggml_cuda_cast<T>(
+                    ggml_cuda_cast<float>(mine[off + k]) + ggml_cuda_cast<float>(tmp[k]));
+            }
+        }
+        if (bid == 0 && tid < count - tail) {
+            mine[tail + tid] = ggml_cuda_cast<T>(
+                ggml_cuda_cast<float>(mine[tail + tid]) + ggml_cuda_cast<float>(scratch[tail + tid]));
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Chunked kernel AllReduce -- 2 GPUs, supports float, half, and bfloat16.
@@ -296,6 +428,10 @@ struct ggml_cuda_ar_host_mapping {
     }
 };
 
+// Scratch size (bytes per device) for the P2P direct-read path; larger
+// reductions are chunked over the scratch buffer.
+static constexpr size_t GGML_CUDA_AR_P2P_MAX_BYTES = 32 * 1024 * 1024; // 32 MB
+
 struct ggml_cuda_ar_pipeline {
     int      n_devices;
     int      devices[GGML_CUDA_MAX_DEVICES];
@@ -305,6 +441,13 @@ struct ggml_cuda_ar_pipeline {
     size_t   copy_chunk_bytes;
     size_t   bf16_threshold; // tensors >= this size (bytes) are reduced via FP32->BF16 round-trip; 0 disables
     uint64_t call_count;
+
+    // P2P direct-read path (peer access / NVLink).
+    bool     p2p_enabled;
+    size_t   p2p_scratch_bytes;                         // bytes per device in p2p_scratch[]
+    char *   p2p_scratch[GGML_CUDA_MAX_DEVICES];        // local landing zone for the peer's stripe
+    int *    p2p_flags[GGML_CUDA_MAX_DEVICES];          // [blocks arrive ints][blocks done ints], 64B-spaced
+    uint64_t p2p_call_count;
 
     // Per-device resources.
     ggml_cuda_ar_host_mapping host_buf[GGML_CUDA_MAX_DEVICES];   // pinned staging (chunked kernel)
@@ -339,6 +482,16 @@ static int * ggml_cuda_ar_arrival_ptr(const ggml_cuda_ar_pipeline * p, int slot,
     const size_t offset = ((size_t)slot * p->n_devices + rank) *
                           GGML_CUDA_AR_KERNEL_BLOCKS * GGML_CUDA_AR_ARRIVAL_STRIDE;
     return reinterpret_cast<int *>(p->arrival.dev + offset);
+}
+
+// Base pointers for the P2P arrive/done flag arrays of device `rank`.
+// The kernel adds blockIdx.x * (ARRIVAL_STRIDE/sizeof(int)) internally.
+static int * ggml_cuda_ar_p2p_arrive_ptr(const ggml_cuda_ar_pipeline * p, int rank) {
+    return p->p2p_flags[rank];
+}
+static int * ggml_cuda_ar_p2p_done_ptr(const ggml_cuda_ar_pipeline * p, int rank) {
+    return p->p2p_flags[rank] +
+           GGML_CUDA_AR_KERNEL_BLOCKS * (int)(GGML_CUDA_AR_ARRIVAL_STRIDE / sizeof(int));
 }
 
 static uint64_t ggml_cuda_ar_env_u64(const char * name, uint64_t default_value) {
@@ -527,6 +680,66 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
         }
     }
 
+    // P2P direct-read path: usable when the two devices have peer access in
+    // both directions and the buffers are peer-accessible.  The VMM pools are
+    // granted to peers when GGML_CUDA_P2P is set or when NCCL is compiled in
+    // (see ggml_cuda_pool_vmm::alloc); cudaMalloc buffers become accessible
+    // via cudaDeviceEnablePeerAccess alone.  GGML_CUDA_AR_P2P=0 opts out.
+    bool p2p_grants = getenv("GGML_CUDA_P2P") != nullptr;
+#if defined(GGML_USE_NCCL)
+    p2p_grants = true;
+#endif // defined(GGML_USE_NCCL)
+    const char * p2p_env = getenv("GGML_CUDA_AR_P2P");
+    if (p2p_grants && !(p2p_env != nullptr && atoi(p2p_env) == 0)) {
+        int can_access_01 = 0;
+        int can_access_10 = 0;
+        bool can_access =
+            cudaDeviceCanAccessPeer(&can_access_01, p->devices[0], p->devices[1]) == cudaSuccess &&
+            cudaDeviceCanAccessPeer(&can_access_10, p->devices[1], p->devices[0]) == cudaSuccess &&
+            can_access_01 && can_access_10;
+        if (can_access) {
+            p->p2p_enabled = true;
+            for (size_t i = 0; i < n_devices && p->p2p_enabled; ++i) {
+                ggml_cuda_set_device(p->devices[i]);
+                const cudaError_t rc = cudaDeviceEnablePeerAccess(p->devices[1 - i], 0);
+                if (rc == cudaErrorPeerAccessAlreadyEnabled) {
+                    (void) cudaGetLastError(); // already on (GGML_CUDA_P2P init), fine
+                } else if (rc != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    p->p2p_enabled = false;
+                }
+            }
+        }
+    }
+    if (p->p2p_enabled) {
+        p->p2p_scratch_bytes = GGML_CUDA_AR_P2P_MAX_BYTES;
+        const size_t p2p_flags_bytes =
+            2 * GGML_CUDA_AR_KERNEL_BLOCKS * GGML_CUDA_AR_ARRIVAL_STRIDE;
+        for (size_t i = 0; i < n_devices && p->p2p_enabled; ++i) {
+            ggml_cuda_set_device(p->devices[i]);
+            if (cudaMalloc(reinterpret_cast<void **>(&p->p2p_scratch[i]), p->p2p_scratch_bytes) != cudaSuccess ||
+                cudaMalloc(reinterpret_cast<void **>(&p->p2p_flags[i]),   p2p_flags_bytes)    != cudaSuccess ||
+                cudaMemset(p->p2p_flags[i], 0, p2p_flags_bytes) != cudaSuccess) {
+                (void) cudaGetLastError();
+                p->p2p_enabled = false;
+            }
+        }
+        if (!p->p2p_enabled) {
+            for (size_t i = 0; i < n_devices; ++i) {
+                ggml_cuda_set_device(p->devices[i]);
+                if (p->p2p_scratch[i]) { cudaFree(p->p2p_scratch[i]); p->p2p_scratch[i] = nullptr; }
+                if (p->p2p_flags[i])   { cudaFree(p->p2p_flags[i]);   p->p2p_flags[i]   = nullptr; }
+            }
+        }
+    }
+    if (p->p2p_enabled) {
+        GGML_LOG_INFO("%s: P2P direct-read AllReduce enabled (%zu MB scratch per GPU)\n",
+                      __func__, p->p2p_scratch_bytes >> 20);
+    } else {
+        GGML_LOG_INFO("%s: P2P direct-read AllReduce unavailable; using host-staged paths\n",
+                      __func__);
+    }
+
     GGML_LOG_INFO("%s: initialized AllReduce pipeline: %zu GPUs, "
                   "%zu KB chunked kernel staging + %zu MB copy-engine staging per GPU\n",
                   __func__, n_devices, p->buf_bytes >> 10, p->copy_bytes >> 20);
@@ -550,11 +763,16 @@ void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * p) {
     for (int i = 0; i < p->n_devices; ++i) {
         p->host_buf[i].free();
         p->host_large[i].free();
+        ggml_cuda_set_device(p->devices[i]);
         if (p->dev_tmp[i]) {
-            ggml_cuda_set_device(p->devices[i]);
             cudaFree(p->dev_tmp[i]);
         }
-        ggml_cuda_set_device(p->devices[i]);
+        if (p->p2p_scratch[i]) {
+            cudaFree(p->p2p_scratch[i]);
+        }
+        if (p->p2p_flags[i]) {
+            cudaFree(p->p2p_flags[i]);
+        }
         for (int s = 0; s < GGML_CUDA_AR_POOL_SIZE; ++s) {
             if (p->ev_pool[i][s].app) { cudaEventDestroy(p->ev_pool[i][s].app); }
             for (int c = 0; c < GGML_CUDA_AR_COPY_MAX_CHUNKS; ++c) {
@@ -774,6 +992,66 @@ bool ggml_cuda_ar_allreduce(
     bool compute_flag[GGML_CUDA_MAX_DEVICES] = {};
     for (int i = 0; i < n; ++i) {
         compute_flag[i] = (tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
+    }
+
+    // P2P direct-read path (peer access / NVLink): one kernel per device,
+    // device-side handshake, no host staging and no per-chunk CUDA API sync.
+    // Native precision on the wire (no BF16 round-trip); both devices compute
+    // a+b / b+a which are bit-identical since IEEE addition is commutative.
+    if (p->p2p_enabled) {
+        const size_t input_type_size = ggml_type_size(input_type);
+        const size_t max_chunk_elems = p->p2p_scratch_bytes / input_type_size;
+
+        // Match NCCL/meta-backend semantics: inactive shards contribute zeros.
+        for (int i = 0; i < n; ++i) {
+            if (!compute_flag[i]) {
+                auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
+                GGML_ASSERT(cuda_ctx->device == p->devices[i]);
+                ggml_cuda_set_device(p->devices[i]);
+                CUDA_CHECK(cudaMemsetAsync(tensors[i]->data, 0, (size_t) ne * input_type_size, cuda_ctx->stream()));
+            }
+        }
+
+        for (int64_t chunk_start = 0; chunk_start < ne; chunk_start += (int64_t) max_chunk_elems) {
+            const size_t remaining_elems = (size_t) (ne - chunk_start);
+            const size_t chunk_elems = remaining_elems < max_chunk_elems ? remaining_elems : max_chunk_elems;
+
+            const int token = (int) ++p->p2p_call_count;
+
+            for (int i = 0; i < n; ++i) {
+                const int peer = 1 - i;  // valid for n == 2 only
+                ggml_cuda_set_device(p->devices[i]);
+                auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
+                GGML_ASSERT(cuda_ctx->device == p->devices[i]);
+                cudaStream_t stream = cuda_ctx->stream();
+
+                char * data      = static_cast<char *>(tensors[i]->data)    + chunk_start * (int64_t) input_type_size;
+                char * data_peer = static_cast<char *>(tensors[peer]->data) + chunk_start * (int64_t) input_type_size;
+
+#define LAUNCH_AR_P2P_KERNEL(T) \
+                ggml_cuda_ar_p2p_kernel<T><<<dim3(GGML_CUDA_AR_KERNEL_BLOCKS), dim3(256), 0, stream>>>( \
+                    reinterpret_cast<T *>(data), \
+                    reinterpret_cast<const T *>(data_peer), \
+                    reinterpret_cast<T *>(p->p2p_scratch[i]), \
+                    static_cast<int>(chunk_elems), \
+                    ggml_cuda_ar_p2p_arrive_ptr(p, i), \
+                    ggml_cuda_ar_p2p_arrive_ptr(p, peer), \
+                    ggml_cuda_ar_p2p_done_ptr(p, i), \
+                    ggml_cuda_ar_p2p_done_ptr(p, peer), \
+                    token)
+
+                switch (input_type) {
+                    case GGML_TYPE_F32:  LAUNCH_AR_P2P_KERNEL(float);       break;
+                    case GGML_TYPE_F16:  LAUNCH_AR_P2P_KERNEL(half);        break;
+                    case GGML_TYPE_BF16: LAUNCH_AR_P2P_KERNEL(nv_bfloat16); break;
+                    default: GGML_ASSERT(false);
+                }
+
+#undef LAUNCH_AR_P2P_KERNEL
+                CUDA_CHECK(cudaGetLastError());
+            }
+        }
+        return true;
     }
 
     // Decide between copy-engine and chunked kernel paths based on the working

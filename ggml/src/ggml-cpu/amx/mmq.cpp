@@ -255,10 +255,12 @@ struct tile_config_t{
 //    advanced-matrix-extensions-intrinsics-functions.html
 //
 
-inline void ggml_tile_config_init(void) {
-    static thread_local bool done = false;
+// which tile palette is currently loaded on this thread:
+// 0 = none, 1 = int8 (B tiles are 8 rows x 64 colsb), 2 = bf16 (all tiles 16 rows x 64 colsb)
+static thread_local int g_amx_tile_mode = 0;
 
-    if (done) {
+inline void ggml_tile_config_init(void) {
+    if (g_amx_tile_mode == 1) {
         return;
     }
 
@@ -275,8 +277,29 @@ inline void ggml_tile_config_init(void) {
     tc.rows[7] = 16;  tc.colsb[7] = 64;
 
     _tile_loadconfig(&tc);
-    done = true;
+    g_amx_tile_mode = 1;
 }
+
+#if defined(__AMX_BF16__) && defined(__AVX512BF16__)
+// bf16 tiles: A {16 m, 32 k} TMM2/TMM3, B {16 k-pairs, 16 n pairs} TMM0/TMM1,
+// C {16 m, 16 n f32} TMM4-TMM7; all 16 rows x 64 colsb
+inline void ggml_tile_config_init_bf16(void) {
+    if (g_amx_tile_mode == 2) {
+        return;
+    }
+
+    alignas(64) tile_config_t tc = {};
+    tc.palette_id = 1;
+    tc.start_row = 0;
+    for (int i = 0; i < 8; ++i) {
+        tc.rows[i]  = 16;
+        tc.colsb[i] = 64;
+    }
+
+    _tile_loadconfig(&tc);
+    g_amx_tile_mode = 2;
+}
+#endif
 
 // we need an extra 16 * 4B (TILE_N * int32_t) for each NB/KB block for compensation.
 // See the notes `s8s8 igemm compensation in avx512-vnni` for detail.
@@ -3180,6 +3203,247 @@ void tinygemm_kernel_amx(int M, int N, int KB, const void * RESTRICT _A, const v
 
 } // anonymous namespace
 
+#if defined(__AMX_BF16__) && defined(__AVX512BF16__)
+inline int64_t ggml_batch_offset(const ggml_tensor * t, int64_t batch_idx, int64_t ne2);
+
+namespace {
+
+constexpr int TILE_SIZE_BF16 = TILE_N * TILE_K * sizeof(ggml_bf16_t); // 16 n x 32 k per tile, 1024 bytes
+
+// repack {N, K} row-major bf16 weights into the AMX bf16 tile layout:
+// tile (nb, kb) holds 16 n x 32 k as TILE_K/2 rows of TILE_N pairs:
+//   row r, column nl = { W[nb*16+nl][kb*32+2r], W[nb*16+nl][kb*32+2r+1] }
+// packed size equals ggml_nbytes of the unpacked tensor
+void pack_B_bf16(char * RESTRICT packed_B, const ggml_bf16_t * RESTRICT B, int N, int K) {
+    const int KB = K / TILE_K;
+    const int NB = N / TILE_N;
+    for (int nb = 0; nb < NB; ++nb) {
+        for (int kb = 0; kb < KB; ++kb) {
+            char * tile = packed_B + PACKED_INDEX(nb, kb, KB, TILE_SIZE_BF16);
+            for (int r = 0; r < TILE_K / 2; ++r) {
+                for (int nl = 0; nl < TILE_N; ++nl) {
+                    const ggml_bf16_t * w = B + (size_t)(nb * TILE_N + nl) * K + kb * TILE_K + 2 * r;
+                    ggml_bf16_t * d = (ggml_bf16_t *) (tile + (r * TILE_N + nl) * 2 * sizeof(ggml_bf16_t));
+                    d[0] = w[0];
+                    d[1] = w[1];
+                }
+            }
+        }
+    }
+}
+
+// convert one f32 row to bf16 (round to nearest even)
+void cvt_row_f32_bf16(const float * RESTRICT x, ggml_bf16_t * RESTRICT y, int64_t k) {
+    int64_t i = 0;
+    for (; i + 16 <= k; i += 16) {
+        _mm256_storeu_si256((__m256i *) (y + i), (__m256i) _mm512_cvtneps_pbh(_mm512_loadu_ps(x + i)));
+    }
+    for (; i < k; ++i) {
+        y[i] = ggml_compute_fp32_to_bf16(x[i]);
+    }
+}
+
+// M=1 fast path: 16 output columns per pass over the packed B layout.
+// one 64-byte tile row holds one k-pair for 16 n, so broadcast the A pair and
+// accumulate with avx512-bf16 dpbf16
+void gemv_kernel_bf16(int KB, const ggml_bf16_t * RESTRICT A, const char * RESTRICT B, float * RESTRICT C) {
+    __m512 acc = _mm512_setzero_ps();
+    for (int i = 0; i < KB; ++i) {
+        const char * tile = B + i * TILE_SIZE_BF16;
+        const ggml_bf16_t * a = A + i * TILE_K;
+        for (int r = 0; r < TILE_K / 2; ++r) {
+            uint32_t apair;
+            memcpy(&apair, a + 2 * r, sizeof(apair));
+            const __m512bh va = m512bh(_mm512_set1_epi32((int) apair));
+            const __m512bh vb = m512bh(_mm512_load_si512((const __m512i *) (tile + r * TILE_N * 2 * sizeof(ggml_bf16_t))));
+            acc = _mm512_dpbf16_ps(acc, va, vb);
+        }
+    }
+    _mm512_storeu_ps(C, acc);
+}
+
+// bf16 tile gemm: C(M x 32, f32) = A(M x K, bf16 row-major) * B(K x 32, AMX bf16 packed)
+// a_stride_bytes: row stride of A in bytes
+void tinygemm_kernel_amx_bf16(int M, int KB, const ggml_bf16_t * RESTRICT A, int64_t a_stride_bytes,
+                              const char * RESTRICT B, float * RESTRICT C, int ldc) {
+    GGML_ASSERT(M <= 2 * TILE_M);
+
+    const int m0 = std::min(M, TILE_M);
+    const int m1 = std::max(M - TILE_M, 0);
+    const int a1_off = TILE_M * a_stride_bytes; // offset of A rows 16..31
+
+    alignas(64) static thread_local char  TileA[TILE_M * TILE_K * sizeof(ggml_bf16_t)];
+    alignas(64) static thread_local float TileC[2 * TILE_M * 2 * TILE_N];
+
+    // partial tiles read A through a zero-padded buffer; the padding rows stay
+    // zero across the k loop, only the valid rows are refilled per iteration
+    const bool pad0 = m0 < TILE_M;
+    const bool pad1 = m1 != 0 && m1 < TILE_M;
+    if (pad0 || pad1) {
+        memset(TileA, 0, sizeof(TileA));
+    }
+
+    _tile_zero(TMM4);
+    _tile_zero(TMM6);
+    if (m1 != 0) {
+        _tile_zero(TMM5);
+        _tile_zero(TMM7);
+    }
+
+    for (int i = 0; i < KB; ++i) {
+        _tile_loadd(TMM0, B + PACKED_INDEX(0, i, KB, TILE_SIZE_BF16), TILE_N * 2 * sizeof(ggml_bf16_t));
+        _tile_loadd(TMM1, B + PACKED_INDEX(1, i, KB, TILE_SIZE_BF16), TILE_N * 2 * sizeof(ggml_bf16_t));
+
+        if (!pad0) {
+            _tile_loadd(TMM2, (const char *) A + i * TILE_K * sizeof(ggml_bf16_t), a_stride_bytes);
+        } else {
+            for (int r = 0; r < m0; ++r) {
+                memcpy(TileA + r * TILE_K * sizeof(ggml_bf16_t),
+                       (const char *) A + r * a_stride_bytes + i * TILE_K * sizeof(ggml_bf16_t),
+                       TILE_K * sizeof(ggml_bf16_t));
+            }
+            _tile_loadd(TMM2, TileA, TILE_K * sizeof(ggml_bf16_t));
+        }
+        _tile_dpbf16ps(TMM4, TMM2, TMM0);
+        _tile_dpbf16ps(TMM6, TMM2, TMM1);
+
+        if (m1 != 0) {
+            if (!pad1) {
+                _tile_loadd(TMM3, (const char *) A + a1_off + i * TILE_K * sizeof(ggml_bf16_t), a_stride_bytes);
+            } else {
+                for (int r = 0; r < m1; ++r) {
+                    memcpy(TileA + r * TILE_K * sizeof(ggml_bf16_t),
+                           (const char *) A + a1_off + r * a_stride_bytes + i * TILE_K * sizeof(ggml_bf16_t),
+                           TILE_K * sizeof(ggml_bf16_t));
+                }
+                _tile_loadd(TMM3, TileA, TILE_K * sizeof(ggml_bf16_t));
+            }
+            _tile_dpbf16ps(TMM5, TMM3, TMM0);
+            _tile_dpbf16ps(TMM7, TMM3, TMM1);
+        }
+    }
+
+    _tile_stored(TMM4, TileC + 0 * TILE_M * TILE_N, TILE_N * sizeof(float));
+    _tile_stored(TMM6, TileC + 1 * TILE_M * TILE_N, TILE_N * sizeof(float));
+    for (int r = 0; r < m0; ++r) {
+        memcpy(C + r * ldc,          TileC + 0 * TILE_M * TILE_N + r * TILE_N, TILE_N * sizeof(float));
+        memcpy(C + r * ldc + TILE_N, TileC + 1 * TILE_M * TILE_N + r * TILE_N, TILE_N * sizeof(float));
+    }
+    if (m1 != 0) {
+        _tile_stored(TMM5, TileC + 2 * TILE_M * TILE_N, TILE_N * sizeof(float));
+        _tile_stored(TMM7, TileC + 3 * TILE_M * TILE_N, TILE_N * sizeof(float));
+        for (int r = 0; r < m1; ++r) {
+            memcpy(C + (TILE_M + r) * ldc,          TileC + 2 * TILE_M * TILE_N + r * TILE_N, TILE_N * sizeof(float));
+            memcpy(C + (TILE_M + r) * ldc + TILE_N, TileC + 3 * TILE_M * TILE_N + r * TILE_N, TILE_N * sizeof(float));
+        }
+    }
+}
+
+} // anonymous namespace
+
+// NB: bf16 gemm with AMX-BF16 (tdpbf16ps); opt-in via GGML_AMX_BF16=1
+//
+// src0: weight in shape of {K, N}, bf16, AMX bf16 packed (see pack_B_bf16)
+// src1: input  in shape of {K, M}, f32 (converted to bf16 in the workspace) or bf16 (used in place)
+// dst:  output in shape of {N, M}, float32
+static void ggml_backend_amx_mul_mat_bf16(const ggml_compute_params * params, struct ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    const int M = dst->ne[1];
+    const int N = dst->ne[0];
+    const int K = src0->ne[0];
+    const int ldc = dst->nb[1] / dst->nb[0];
+
+    const int64_t ne2 = dst->ne[2];
+    const int64_t n_batch = ne2 * dst->ne[3];
+
+    GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_BF16);
+    GGML_ASSERT(K % TILE_K == 0 && N % (2 * TILE_N) == 0);
+    GGML_ASSERT(ggml_is_contiguous(src1));
+
+    const int KB = K / TILE_K;
+    const size_t row_size_A = (size_t) K * sizeof(ggml_bf16_t);
+
+    // f32 activations are converted to bf16 in the workspace; bf16 activations are used in place
+    const bool src1_is_bf16 = src1->type == GGML_TYPE_BF16;
+    const ggml_bf16_t * A_base = nullptr;
+    int64_t a_row_bytes = row_size_A;
+    if (src1_is_bf16) {
+        a_row_bytes = src1->nb[1];
+    } else {
+        const size_t desired_wsize = (size_t) n_batch * M * row_size_A;
+        if (params->wsize < desired_wsize) {
+            GGML_ABORT("insufficient work space size");
+        }
+        ggml_bf16_t * wdata = (ggml_bf16_t *) params->wdata;
+        parallel_for_ggml(params, n_batch * M, [&](int begin, int end) {
+            for (int idx = begin; idx < end; ++idx) {
+                const int batch_idx = idx / M;
+                const int m         = idx % M;
+                const int64_t src1_offset = ggml_batch_offset(src1, batch_idx, ne2);
+                const float * x = (const float *) ((const char *) src1->data + src1_offset) + (size_t) m * K;
+                cvt_row_f32_bf16(x, wdata + ((size_t) batch_idx * M + m) * K, K);
+            }
+        });
+        ggml_barrier(params->threadpool);
+        A_base = (const ggml_bf16_t *) params->wdata;
+    }
+    auto get_A = [&](int64_t batch_idx) -> const ggml_bf16_t * {
+        if (src1_is_bf16) {
+            return (const ggml_bf16_t *) ((const char *) src1->data + ggml_batch_offset(src1, batch_idx, ne2));
+        }
+        return A_base + (size_t) batch_idx * M * K;
+    };
+
+    if (M == 1) {
+        const int NB = N / TILE_N;
+        parallel_for_ggml(params, n_batch * NB, [&](int begin, int end) {
+            for (int i = begin; i < end; ++i) {
+                const int batch_idx = i / NB;
+                const int nb        = i % NB;
+
+                const int64_t src0_offset = ggml_batch_offset(src0, batch_idx, ne2);
+                const int64_t dst_offset  = ggml_batch_offset(dst,  batch_idx, ne2);
+                const ggml_bf16_t * A = get_A(batch_idx);
+
+                gemv_kernel_bf16(KB, A,
+                                 (const char *) src0->data + src0_offset + PACKED_INDEX(nb, 0, KB, TILE_SIZE_BF16),
+                                 (float *) dst->data + dst_offset + nb * TILE_N);
+            }
+        });
+        return;
+    }
+
+    constexpr int BLOCK_M = TILE_M * 2;
+    constexpr int BLOCK_N = TILE_N * 2;
+    const int MB = div_up(M, BLOCK_M);
+    const int NB = div_up(N, BLOCK_N);
+
+    parallel_for_ggml(params, n_batch * MB * NB, [&](int begin, int end) {
+        ggml_tile_config_init_bf16();
+
+        for (int i = begin; i < end; ++i) {
+            const int batch_idx = i / (MB * NB);
+            const int remaining = i % (MB * NB);
+            const int mb = remaining / NB;
+            const int nb = remaining % NB;
+
+            const int64_t src0_offset = ggml_batch_offset(src0, batch_idx, ne2);
+            const int64_t dst_offset  = ggml_batch_offset(dst,  batch_idx, ne2);
+            const ggml_bf16_t * A = get_A(batch_idx);
+
+            const int mb_start = mb * BLOCK_M;
+            const int mb_size  = std::min(BLOCK_M, M - mb_start);
+
+            tinygemm_kernel_amx_bf16(mb_size, KB, (const ggml_bf16_t *) ((const char *) A + (size_t) mb_start * a_row_bytes), a_row_bytes,
+                                     (const char *) src0->data + src0_offset + PACKED_INDEX(nb * 2, 0, KB, TILE_SIZE_BF16),
+                                     (float *) dst->data + dst_offset + (size_t) mb_start * N + nb * BLOCK_N, ldc);
+        }
+    });
+}
+#endif // defined(__AMX_BF16__) && defined(__AVX512BF16__)
+
 // get the packed tensor size for quantized weights
 size_t ggml_backend_amx_get_alloc_size(const struct ggml_tensor * tensor) {
     const enum ggml_type TYPE = tensor->type;
@@ -3220,6 +3484,16 @@ void ggml_backend_amx_convert_weight(struct ggml_tensor * tensor, const void * d
     // expert e's tile (n, k) stays at e * (N/TILE_N) * KB * TILE_SIZE + PACKED_INDEX(n, k).
     const int64_t n_matrices = (int64_t) tensor->ne[2] * tensor->ne[3];
 
+#if defined(__AMX_BF16__) && defined(__AVX512BF16__)
+    if (TYPE == GGML_TYPE_BF16) {
+        // opt-in AMX-BF16: repack into the bf16 tile layout (size is unchanged)
+        GGML_ASSERT(ggml_amx_bf16_enabled());
+        GGML_ASSERT(n_matrices == 1); // MUL_MAT_ID has no bf16 AMX kernels
+        pack_B_bf16((char *) tensor->data + offset, (const ggml_bf16_t *) data, N, K);
+        return;
+    }
+#endif
+
     GGML_DISPATCH_QTYPES(TYPE, [&] {
         const size_t src_stride = ggml_row_size(TYPE, K) * N;            // one unpacked expert
         const size_t dst_stride = (size_t) get_row_size<type, blck_size>(K) * N; // one packed expert
@@ -3246,6 +3520,16 @@ size_t ggml_backend_amx_desired_wsize(const struct ggml_tensor * dst) {
     if (is_floating_type) {
         return 0;
     }
+
+#if defined(__AMX_BF16__) && defined(__AVX512BF16__)
+    if (TYPE == GGML_TYPE_BF16 && ggml_amx_bf16_enabled()) {
+        // bf16 src1 is used in place; f32 src1 is converted to bf16 in the workspace
+        if (dst->src[1]->type == GGML_TYPE_BF16) {
+            return 0;
+        }
+        return (size_t) (dst->ne[2] * dst->ne[3]) * dst->ne[1] * src0->ne[0] * sizeof(ggml_bf16_t);
+    }
+#endif
 
     const int M = dst->ne[1];
     const int K = src0->ne[0];
@@ -3278,6 +3562,13 @@ void ggml_backend_amx_mul_mat(const ggml_compute_params * params, struct ggml_te
     // f16 only has avx512 kernels for now,
     // amx kernels will be added once 6th gen xeon is released.
     const bool is_floating_type = TYPE == GGML_TYPE_F16;
+
+#if defined(__AMX_BF16__) && defined(__AVX512BF16__)
+    if (TYPE == GGML_TYPE_BF16 && ggml_amx_bf16_enabled()) {
+        ggml_backend_amx_mul_mat_bf16(params, dst);
+        return;
+    }
+#endif
 
     const int M = dst->ne[1];
     const int N = dst->ne[0];

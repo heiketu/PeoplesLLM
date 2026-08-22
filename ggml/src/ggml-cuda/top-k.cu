@@ -193,7 +193,13 @@ static bool top_k_use_batched_radix(const int64_t ncols, const int64_t nrows, co
         return value == nullptr || std::atoi(value) != 0; // default ON (k==512 gate below still applies)
     }();
 
-    return enabled && k == 512 && nrows >= 32 && ncols >= k && ncols <= INT_MAX && nrows <= INT_MAX;
+    // small-row case (e.g. DSV4 lightning indexer at tg: nrows==1, ncols==context
+    // length, k==min(ncols, 512)): a single radix block per row beats the
+    // multi-launch CUB DeviceTopK loop as long as the per-row scan stays short.
+    const bool small_rows = nrows < 32 && k <= 1024 && ncols <= 8192;
+
+    return enabled && ncols >= k && ncols <= INT_MAX && nrows <= INT_MAX &&
+           ((k == 512 && nrows >= 32) || small_rows);
 }
 
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)

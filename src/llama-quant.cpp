@@ -397,6 +397,9 @@ static ggml_type tensor_type_fallback(quantize_state_impl & qs, const ggml_tenso
             case GGML_TYPE_Q3_K:
             case GGML_TYPE_TQ1_0:
             case GGML_TYPE_TQ2_0:   return_type = GGML_TYPE_Q4_0;   break;
+            case GGML_TYPE_Q3_R:    return_type = GGML_TYPE_Q8_0;   break;
+            case GGML_TYPE_UDNL_W4: return_type = GGML_TYPE_Q8_0;   break;
+            case GGML_TYPE_UDNL_MX: return_type = GGML_TYPE_Q8_0;   break;
             case GGML_TYPE_Q4_K:    return_type = GGML_TYPE_Q5_0;   break;
             case GGML_TYPE_Q5_K:    return_type = GGML_TYPE_Q5_1;   break;
             case GGML_TYPE_Q6_K:    return_type = GGML_TYPE_Q8_0;   break;
@@ -740,7 +743,10 @@ static size_t llama_tensor_quantize_impl(enum ggml_type new_type, const float * 
     bool valid = true;
     auto compute = [&mutex, &counter, &new_size, &valid, new_type, f32_data, new_data, chunk_size,
             nrows, n_per_row, imatrix]() {
-        const int64_t nrows_per_chunk = chunk_size / n_per_row;
+        // UDNL_MX quantizes 16-row panels jointly (shared mode word); keep the
+        // chunk boundaries panel-aligned so all chunks of a panel agree.
+        const int64_t align = new_type == GGML_TYPE_UDNL_MX ? 16 : 1;
+        const int64_t nrows_per_chunk = ((chunk_size / n_per_row) + align - 1)/align*align;
         size_t local_size = 0;
         while (true) {
             std::unique_lock<std::mutex> lock(mutex);

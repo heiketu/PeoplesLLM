@@ -2494,8 +2494,58 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         return int64_t(0);
 #endif
     }();
+    // opt-in f16 intermediate activations inside the MoE block
+    // (GGML_CPU_FP16_INTERMEDIATE=1, default off; takes precedence over the q8 boundary)
+    static const bool cpu_fp16_intermediate = []() {
+        const char * value = getenv("GGML_CPU_FP16_INTERMEDIATE");
+        return value && atoi(value) != 0;
+    }();
+    // opt-in q8_0 intermediate activations inside the MoE block
+    // (GGML_CPU_INT8_INTERMEDIATE=1, default off; mutually exclusive with the f16
+    // variant above — when both are set, INT8 wins)
+    static const bool cpu_int8_intermediate = []() {
+        const char * value = getenv("GGML_CPU_INT8_INTERMEDIATE");
+        return value && atoi(value) != 0;
+    }();
+    auto on_cpu_repack_q8_act = [](const ggml_tensor * w) {
+        if (w == nullptr) {
+            return false;
+        }
+        // only types whose repack kernels quantize activations to q8_0 (they can
+        // quantize f16 rows directly; see repack.cpp forward_mul_mat_id)
+        switch (w->type) {
+            case GGML_TYPE_MXFP4:
+            case GGML_TYPE_Q4_0:
+            case GGML_TYPE_Q8_0:
+            case GGML_TYPE_IQ4_NL:
+            case GGML_TYPE_IQ4_XS:
+                break;
+            default:
+                return false;
+        }
+        ggml_backend_buffer_t buf = w->view_src ? w->view_src->buffer : w->buffer;
+        return buf && strcmp(ggml_backend_buffer_name(buf), "CPU_REPACK") == 0;
+    };
+    const bool fp16_island = cpu_fp16_intermediate && !cpu_int8_intermediate && loras->empty() &&
+        on_cpu_repack_q8_act(down_exps) &&
+        (on_cpu_repack_q8_act(gate_up_exps) || (on_cpu_repack_q8_act(gate_exps) && on_cpu_repack_q8_act(up_exps)));
+    // same island shape as the f16 variant, but activations are stored as q8_0 and the
+    // repack mmid consumes them pre-quantized (no per-mm quantization at all);
+    // requires block-quantizable row widths on both mmid inputs
+    const int64_t q8_blck = ggml_blck_size(GGML_TYPE_Q8_0);
+    const bool int8_island = cpu_int8_intermediate && loras->empty() &&
+        n_embd % q8_blck == 0 && down_exps && down_exps->ne[0] % q8_blck == 0 &&
+        on_cpu_repack_q8_act(down_exps) &&
+        (on_cpu_repack_q8_act(gate_up_exps) || (on_cpu_repack_q8_act(gate_exps) && on_cpu_repack_q8_act(up_exps)));
     ggml_tensor * moe_input = cur;
-    if (cpu_moe_q8_min_tokens > 0 && n_tokens >= cpu_moe_q8_min_tokens &&
+    if (int8_island) {
+        moe_input = ggml_cast(ctx0, cur, GGML_TYPE_Q8_0);
+        ggml_cpy_set_q8_0_nearest_even(moe_input);
+        cb(moe_input, "ffn_moe_q8_act_input", il);
+    } else if (fp16_island) {
+        moe_input = ggml_cast(ctx0, cur, GGML_TYPE_F16);
+        cb(moe_input, "ffn_moe_f16_input", il);
+    } else if (cpu_moe_q8_min_tokens > 0 && n_tokens >= cpu_moe_q8_min_tokens &&
             arch == LLM_ARCH_DEEPSEEK4 && gate_exps && up_exps &&
             gate_exps->type == GGML_TYPE_MXFP4 && up_exps->type == GGML_TYPE_MXFP4) {
         ggml_backend_buffer_t gate_buffer = gate_exps->view_src ? gate_exps->view_src->buffer : gate_exps->buffer;
@@ -2657,6 +2707,17 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ABORT("fatal error");
     }
 
+    if (int8_island) {
+        // feed the down projection with pre-quantized q8_0 activations
+        cur = ggml_cast(ctx0, cur, GGML_TYPE_Q8_0);
+        ggml_cpy_set_q8_0_nearest_even(cur);
+        cb(cur, "ffn_moe_act_q8", il);
+    } else if (fp16_island) {
+        // feed the down projection with f16 activations
+        cur = ggml_cast(ctx0, cur, GGML_TYPE_F16);
+        cb(cur, "ffn_moe_act_f16", il);
+    }
+
     experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
     cb(experts, "ffn_moe_down", il);
 
@@ -2667,6 +2728,17 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (down_exps_b) {
         experts = ggml_add_id(ctx0, experts, down_exps_b, selected_experts);
         cb(experts, "ffn_moe_down_biased", il);
+    }
+
+    if (int8_island) {
+        // keep the routing-weight mul and the expert aggregation in q8_0
+        experts = ggml_cast(ctx0, experts, GGML_TYPE_Q8_0);
+        ggml_cpy_set_q8_0_nearest_even(experts);
+        cb(experts, "ffn_moe_down_q8", il);
+    } else if (fp16_island) {
+        // keep the routing-weight mul and the expert aggregation in f16
+        experts = ggml_cast(ctx0, experts, GGML_TYPE_F16);
+        cb(experts, "ffn_moe_down_f16", il);
     }
 
     if (!weight_before_ffn) {
@@ -2702,6 +2774,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (hparams.n_expert_used == 1) {
         // avoid returning a non-contiguous tensor
         moe_out = ggml_cont(ctx0, moe_out);
+    }
+
+    if (int8_island || fp16_island) {
+        // back to f32 at the MoE boundary (residual/hc stream stays f32)
+        moe_out = ggml_cast(ctx0, moe_out, GGML_TYPE_F32);
+        ggml_build_forward_expand(gf, moe_out);
     }
 
     cb(moe_out, "ffn_moe_out", il);

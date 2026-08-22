@@ -1,10 +1,160 @@
 #include "binary-ops.h"
 
+#define GGML_COMMON_DECL_CPP
+#include "ggml-common.h"
+
 #if defined(GGML_USE_ACCELERATE)
 #include <Accelerate/Accelerate.h>
 
 using vDSP_fn_t = void (*)(const float *, vDSP_Stride, const float *, vDSP_Stride, float *, vDSP_Stride, vDSP_Length);
 #endif
+
+// ---- q8_0 intermediate-activation kernels (GGML_CPU_INT8_INTERMEDIATE path) ----
+// Row-wise, block-aware binary ops on q8_0 activations. Rows are contiguous in
+// blocks (nb0 == sizeof(block_q8_0)); row strides are arbitrary (view support).
+
+#if defined(__AVX512F__)
+// one q8_0 block = 32 values = two 16-lane f32 vectors
+static inline void q8_0_block_to_ps2(const block_q8_0 * b, __m512 & v0, __m512 & v1) {
+    const __m256i q8 = _mm256_loadu_si256((const __m256i *) b->qs);
+    const __m512   d  = _mm512_set1_ps(GGML_CPU_FP16_TO_FP32(b->d));
+    v0 = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm256_castsi256_si128(q8))),    d);
+    v1 = _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm256_extracti128_si256(q8, 1))), d);
+}
+
+static inline void ps2_to_q8_0_block(__m512 v0, __m512 v1, block_q8_0 * y) {
+    const __m512 sign_bit = _mm512_set1_ps(-0.f);
+    const __m512 vamax = _mm512_max_ps(_mm512_andnot_ps(sign_bit, v0), _mm512_andnot_ps(sign_bit, v1));
+    const float amax = _mm512_reduce_max_ps(vamax);
+    const float d  = amax / 127.f;
+    const float id = amax ? 127.f / amax : 0.f;
+    y->d = GGML_CPU_FP32_TO_FP16(d);
+    const __m512 vid = _mm512_set1_ps(id);
+    const __m512i q0 = _mm512_cvtps_epi32(_mm512_mul_ps(v0, vid)); // RNE
+    const __m512i q1 = _mm512_cvtps_epi32(_mm512_mul_ps(v1, vid));
+    _mm_storeu_si128((__m128i *) (y->qs +  0), _mm512_cvtepi32_epi8(q0));
+    _mm_storeu_si128((__m128i *) (y->qs + 16), _mm512_cvtepi32_epi8(q1));
+}
+#endif
+
+// z = x + y per block: dequant both, add in f32, requantize (amax + RNE)
+static void add_row_q8_0(const block_q8_0 * GGML_RESTRICT x, const block_q8_0 * GGML_RESTRICT y,
+                         block_q8_0 * GGML_RESTRICT z, int64_t n) {
+    const int64_t nb = n / QK8_0;
+#if defined(__AVX512F__)
+    for (int64_t b = 0; b < nb; ++b) {
+        __m512 x0, x1, y0, y1;
+        q8_0_block_to_ps2(x + b, x0, x1);
+        q8_0_block_to_ps2(y + b, y0, y1);
+        ps2_to_q8_0_block(_mm512_add_ps(x0, y0), _mm512_add_ps(x1, y1), z + b);
+    }
+#else
+    for (int64_t b = 0; b < nb; ++b) {
+        const float dx = GGML_CPU_FP16_TO_FP32(x[b].d);
+        const float dy = GGML_CPU_FP16_TO_FP32(y[b].d);
+        float v[QK8_0];
+        float amax = 0.0f;
+        for (int j = 0; j < QK8_0; ++j) {
+            v[j] = dx*x[b].qs[j] + dy*y[b].qs[j];
+            amax = MAX(amax, fabsf(v[j]));
+        }
+        const float d  = amax / 127.f;
+        const float id = amax ? 127.f / amax : 0.f;
+        z[b].d = GGML_CPU_FP32_TO_FP16(d);
+        for (int j = 0; j < QK8_0; ++j) {
+            z[b].qs[j] = (int8_t) rintf(v[j] * id); // RNE
+        }
+    }
+#endif
+}
+
+// z = x * w with a per-row scalar w: q8_0 stays exact by folding w into the scale
+static void mul_row_q8_0_f32(const block_q8_0 * GGML_RESTRICT x, block_q8_0 * GGML_RESTRICT z, int64_t n, float w) {
+    const int64_t nb = n / QK8_0;
+    for (int64_t b = 0; b < nb; ++b) {
+        z[b].d = GGML_CPU_FP32_TO_FP16(GGML_CPU_FP16_TO_FP32(x[b].d) * w);
+        memcpy(z[b].qs, x[b].qs, QK8_0);
+    }
+}
+
+// add(q8_0, q8_0) -> q8_0, same shape, block-contiguous rows with arbitrary strides
+void ggml_compute_forward_add_q8_0_q8_0(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    GGML_ASSERT(ggml_are_same_shape(src0, src1) && ggml_are_same_shape(src0, dst));
+    GGML_ASSERT(src0->type == GGML_TYPE_Q8_0 && src1->type == GGML_TYPE_Q8_0 && dst->type == GGML_TYPE_Q8_0);
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    // rows must be contiguous in blocks; higher-dim strides are arbitrary
+    GGML_ASSERT(nb00 == (int64_t) sizeof(block_q8_0));
+    GGML_ASSERT(nb10 == (int64_t) sizeof(block_q8_0));
+    GGML_ASSERT(nb0  == (int64_t) sizeof(block_q8_0));
+    GGML_ASSERT(ne00 % QK8_0 == 0);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int nr = (int) ggml_nrows(dst);
+    const int dr = (nr + nth - 1)/nth;
+    const int ir0 = dr*ith;
+    const int ir1 = MIN(ir0 + dr, nr);
+
+    for (int ir = ir0; ir < ir1; ++ir) {
+        const int64_t i03 = ir/(ne02*ne01);
+        const int64_t i02 = (ir - i03*ne02*ne01)/ne01;
+        const int64_t i01 = (ir - i03*ne02*ne01 - i02*ne01);
+
+        const block_q8_0 * x = (const block_q8_0 *) ((const char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
+        const block_q8_0 * y = (const block_q8_0 *) ((const char *) src1->data + i01*nb11 + i02*nb12 + i03*nb13);
+        block_q8_0       * z = (block_q8_0 *)       ((char *)       dst->data + i01*nb1  + i02*nb2  + i03*nb3 );
+
+        add_row_q8_0(x, y, z, ne00);
+    }
+}
+
+// mul(q8_0, f32) -> q8_0 with f32 broadcast as a per-row scalar (src1->ne[0] == 1);
+// exact: the scalar folds into each block's scale, qs are copied unchanged
+void ggml_compute_forward_mul_q8_0_f32(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    GGML_ASSERT(ggml_can_repeat(src1, src0) && ggml_are_same_shape(src0, dst));
+    GGML_ASSERT(src0->type == GGML_TYPE_Q8_0 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_Q8_0);
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    GGML_ASSERT(ne10 == 1); // per-row scalar broadcast only
+    GGML_ASSERT(nb00 == (int64_t) sizeof(block_q8_0));
+    GGML_ASSERT(nb10 == (int64_t) sizeof(float));
+    GGML_ASSERT(nb0  == (int64_t) sizeof(block_q8_0));
+    GGML_ASSERT(ne00 % QK8_0 == 0);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int nr = (int) ggml_nrows(dst);
+    const int dr = (nr + nth - 1)/nth;
+    const int ir0 = dr*ith;
+    const int ir1 = MIN(ir0 + dr, nr);
+
+    for (int ir = ir0; ir < ir1; ++ir) {
+        const int64_t i03 = ir/(ne02*ne01);
+        const int64_t i02 = (ir - i03*ne02*ne01)/ne01;
+        const int64_t i01 = (ir - i03*ne02*ne01 - i02*ne01);
+
+        const int64_t i13 = i03 % ne13;
+        const int64_t i12 = i02 % ne12;
+        const int64_t i11 = i01 % ne11;
+
+        const block_q8_0 * x = (const block_q8_0 *) ((const char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
+        const float        w = *(const float *)     ((const char *) src1->data + i11*nb11 + i12*nb12 + i13*nb13);
+        block_q8_0       * z = (block_q8_0 *)       ((char *)       dst->data + i01*nb1  + i02*nb2  + i03*nb3 );
+
+        mul_row_q8_0_f32(x, z, ne00, w);
+    }
+}
 
 static inline float op_add(float a, float b) {
     return a + b;
@@ -146,6 +296,10 @@ void ggml_compute_forward_sub(const ggml_compute_params * params, ggml_tensor * 
 }
 
 void ggml_compute_forward_mul(const ggml_compute_params * params, ggml_tensor * dst) {
+    if (dst->type == GGML_TYPE_Q8_0 && dst->src[0]->type == GGML_TYPE_Q8_0 && dst->src[1]->type == GGML_TYPE_F32) {
+        ggml_compute_forward_mul_q8_0_f32(params, dst);
+        return;
+    }
     binary_op<op_mul>(params, dst);
 }
 

@@ -1017,6 +1017,106 @@ void ggml_vec_dot_mxfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
     *s = sumf;
 }
 
+void ggml_vec_dot_q3_r_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    assert(n % QK3_R == 0);
+    static_assert(QK3_R % QK8_0 == 0, "QK3_R must be a multiple of QK8_0");
+
+    const block_q3_r * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK3_R;
+
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__) && defined(__AVX512VL__) && defined(__AVX512VBMI__)
+
+    // Unpack tables for one 64-code group (24-byte payload = 2 sub-blocks of 32 codes):
+    // code v occupies bits [3v, 3v+2] of the group stream. The window+multishift
+    // scheme (same as the repack.cpp kernels) decodes a group with one vpermb +
+    // vpmultishiftqb + vpand: qword lane L of the vpermb output holds payload bytes
+    // [3L, 3L+8), covering codes 8L..8L+7, and the multishift control picks bit
+    // offset 3m per window byte m. Output lane order is the natural code order.
+    static const uint8_t q3_r_win_idx[64] = {
+         0,  1,  2,  3,  4,  5,  6,  7,
+         3,  4,  5,  6,  7,  8,  9, 10,
+         6,  7,  8,  9, 10, 11, 12, 13,
+         9, 10, 11, 12, 13, 14, 15, 16,
+        12, 13, 14, 15, 16, 17, 18, 19,
+        15, 16, 17, 18, 19, 20, 21, 22,
+        18, 19, 20, 21, 22, 23, 24, 25,
+        21, 22, 23, 24, 25, 26, 27, 28,
+    };
+    static const uint8_t q3_r_ms_ctrl[64] = {
+        0, 3, 6, 9, 12, 15, 18, 21,
+        0, 3, 6, 9, 12, 15, 18, 21,
+        0, 3, 6, 9, 12, 15, 18, 21,
+        0, 3, 6, 9, 12, 15, 18, 21,
+        0, 3, 6, 9, 12, 15, 18, 21,
+        0, 3, 6, 9, 12, 15, 18, 21,
+        0, 3, 6, 9, 12, 15, 18, 21,
+        0, 3, 6, 9, 12, 15, 18, 21,
+    };
+    // per-group broadcast of the two sub-block scales into [s0 x8 | s1 x8] epi32 lanes
+    static const int q3_r_sv_idx[4][16] = {
+        { 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1 },
+        { 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3 },
+        { 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5 },
+        { 6, 6, 6, 6, 6, 6, 6, 6, 7, 7, 7, 7, 7, 7, 7, 7 },
+    };
+
+    const __m512i win_idx = _mm512_loadu_si512(q3_r_win_idx);
+    const __m512i ms_ctrl = _mm512_loadu_si512(q3_r_ms_ctrl);
+    const __m512i m7     = _mm512_set1_epi8(7);
+    const __m512i ones   = _mm512_set1_epi8(1);
+
+    __m512 acc = _mm512_setzero_ps();
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const __m512  dv  = _mm512_set1_ps(GGML_CPU_FP16_TO_FP32(x[ib].d));
+        const __m512i s32 = _mm512_cvtepi8_epi32(_mm_loadl_epi64((const __m128i *) x[ib].scales));
+        for (int g = 0; g < 4; ++g) {
+            // masked 24-byte load: the payload of group g; never over-reads the block
+            const __m512i pk  = _mm512_maskz_loadu_epi8(0x00FFFFFF, x[ib].qs + 24*g);
+            const __m512i win = _mm512_permutexvar_epi8(win_idx, pk);
+            const __m512i q   = _mm512_and_si512(_mm512_multishift_epi64_epi8(ms_ctrl, win), m7); // 64 x u8 codes in natural order
+
+            const block_q8_0 * GGML_RESTRICT y0 = y + 8*ib + 2*g + 0;
+            const block_q8_0 * GGML_RESTRICT y1 = y + 8*ib + 2*g + 1;
+            const __m512i a = _mm512_inserti32x8(_mm512_castsi256_si512(
+                    _mm256_loadu_si256((const __m256i *) y0->qs)),
+                    _mm256_loadu_si256((const __m256i *) y1->qs), 1);
+
+            // sum (q_i - 4)*a_i per sub-block = sum q_i*a_i - 4*sum a_i, applied in
+            // fp32 (iacc/asum are small exact ints); avoids the 10c-latency vpmulld chain
+            const __m512i iacc = _mm512_dpbusd_epi32(_mm512_setzero_si512(), q, a);
+            const __m512i asum = _mm512_dpbusd_epi32(_mm512_setzero_si512(), ones, a);
+
+            const __m512 svf  = _mm512_cvtepi32_ps(_mm512_permutexvar_epi32(_mm512_loadu_si512(q3_r_sv_idx[g]), s32));
+            const __m512 part = _mm512_mul_ps(_mm512_fnmadd_ps(_mm512_set1_ps(4.f), _mm512_cvtepi32_ps(asum),
+                                                               _mm512_cvtepi32_ps(iacc)), svf);
+
+            const __m512 dyv = _mm512_insertf32x8(_mm512_castps256_ps512(
+                    _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(y0->d))),
+                    _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(y1->d)), 1);
+            acc = _mm512_fmadd_ps(part, _mm512_mul_ps(dv, dyv), acc);
+        }
+    }
+
+    *s = _mm512_reduce_add_ps(acc);
+    return;
+#else
+    ggml_vec_dot_q3_r_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc);
+    return;
+#endif
+
+    UNUSED(x);
+    UNUSED(y);
+    UNUSED(nb);
+}
+
 void ggml_vec_dot_nvfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(nrc == 1);
     UNUSED(nrc);

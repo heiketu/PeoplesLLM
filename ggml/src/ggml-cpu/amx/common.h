@@ -4,6 +4,7 @@
 #include "ggml-cpu-impl.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <memory>
 #include <type_traits>
 
@@ -102,9 +103,18 @@ inline void parallel_for_ggml(const ggml_compute_params * params, int n, const f
     f(tbegin, tend);
 }
 
+// opt-in AMX-BF16 tile kernels (GGML_AMX_BF16=1, default off)
+inline bool ggml_amx_bf16_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_AMX_BF16");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return enabled;
+}
+
 // quantized types that have AMX support
+// TODO: fix padding for vnni format
 inline bool qtype_has_amx_kernels(const enum ggml_type type) {
-    // TODO: fix padding for vnni format
     return (type == GGML_TYPE_Q4_0) ||
         (type == GGML_TYPE_Q4_1) ||
         (type == GGML_TYPE_Q8_0) ||

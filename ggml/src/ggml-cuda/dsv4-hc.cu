@@ -681,6 +681,146 @@ void ggml_cuda_op_dsv4_moe_topk(ggml_backend_cuda_context & ctx, ggml_tensor * d
             n_groups, n_group_used, k);
 }
 
+// fused DeepSeek-V4 router for the n_expert_groups == 1 path:
+// softplus -> sqrt -> add(bias) -> argsort(desc) -> view -> dsv4_moe_weights.
+// one warp per token computes probs = sqrt(softplus(logits)) and writes them to the
+// (otherwise elided) SQRT node output, then selects the top-k experts on probs + bias
+// (descending, ties keep the lower index, matching ggml_argsort_top_k) and writes them
+// to the first k entries of the ARGSORT node output. DSV4_MOE_WEIGHTS runs unfused
+// on top of these two outputs.
+template <int n_experts>
+__launch_bounds__(4 * WARP_SIZE, 1) __global__ void dsv4_moe_router_f32(
+        const float * logits,
+        const float * bias,
+        float * probs,
+        int32_t * ids,
+        int64_t n_tokens,
+        int64_t sl0,
+        int64_t sl1,
+        int64_t sb0,
+        int64_t sp0,
+        int64_t sp1,
+        int64_t si0,
+        int64_t si1,
+        int32_t k) {
+    constexpr int experts_per_thread = n_experts / WARP_SIZE;
+
+    const int64_t it = (int64_t) blockIdx.x * blockDim.y + threadIdx.y;
+    if (it >= n_tokens) {
+        return;
+    }
+
+    ggml_cuda_pdl_sync();
+
+    float wt[experts_per_thread];
+
+    // identical to op_softplus followed by op_sqrt in unary.cu
+#pragma unroll
+    for (int i = 0; i < experts_per_thread; ++i) {
+        const int   e = threadIdx.x + i*WARP_SIZE;
+        const float x = logits[e*sl0 + it*sl1];
+        wt[i] = sqrtf(x > 20.0f ? x : logf(1.0f + expf(x)));
+        probs[e*sp0 + it*sp1] = wt[i];
+    }
+
+    // selection scores, identical to the elided ADD of the bias
+    float sel[experts_per_thread];
+#pragma unroll
+    for (int i = 0; i < experts_per_thread; ++i) {
+        const int e = threadIdx.x + i*WARP_SIZE;
+        sel[i] = __fadd_rn(wt[i], bias[e*sb0]);
+        // keep the argmax total even for NaN scores (same as topk_moe_cuda)
+        if (__isnanf(sel[i])) {
+            sel[i] = -FLT_MAX;
+        }
+    }
+
+    for (int32_t i = 0; i < k; ++i) {
+        float best_v = sel[0];
+        int   best_e = threadIdx.x;
+
+#pragma unroll
+        for (int j = 1; j < experts_per_thread; ++j) {
+            if (sel[j] > best_v) {
+                best_v = sel[j];
+                best_e = threadIdx.x + j*WARP_SIZE;
+            }
+        }
+
+#pragma unroll
+        for (int mask = WARP_SIZE/2; mask > 0; mask >>= 1) {
+            const float v = __shfl_xor_sync(0xffffffff, best_v, mask, WARP_SIZE);
+            const int   e = __shfl_xor_sync(0xffffffff, best_e, mask, WARP_SIZE);
+            if (v > best_v || (v == best_v && e < best_e)) {
+                best_v = v;
+                best_e = e;
+            }
+        }
+
+        if ((best_e & (WARP_SIZE - 1)) == threadIdx.x) {
+            sel[best_e / WARP_SIZE] = -INFINITY;
+            ids[i*si0 + it*si1] = best_e;
+        }
+    }
+}
+
+void ggml_cuda_op_dsv4_moe_router(ggml_backend_cuda_context & ctx,
+                                  const ggml_tensor *         logits,
+                                  const ggml_tensor *         bias,
+                                  ggml_tensor *               probs,
+                                  ggml_tensor *               ids,
+                                  int32_t                     k) {
+    GGML_ASSERT(logits->type == GGML_TYPE_F32);
+    GGML_ASSERT(bias->type   == GGML_TYPE_F32);
+    GGML_ASSERT(probs->type  == GGML_TYPE_F32);
+    GGML_ASSERT(ids->type    == GGML_TYPE_I32);
+
+    GGML_TENSOR_LOCALS(size_t, nbl, logits, nb);
+    GGML_TENSOR_LOCALS(size_t, nbb, bias,   nb);
+    GGML_TENSOR_LOCALS(size_t, nbp, probs,  nb);
+    GGML_TENSOR_LOCALS(size_t, nbi, ids,    nb);
+
+    const int64_t n_expert = logits->ne[0];
+    const int64_t n_tokens = logits->ne[1];
+
+    GGML_ASSERT(ggml_is_contiguous(logits));
+    GGML_ASSERT(ggml_is_contiguous(probs));
+    GGML_ASSERT(ggml_is_contiguous(ids));
+    GGML_ASSERT(bias->ne[0] == n_expert);
+    GGML_ASSERT(probs->ne[0] == n_expert && probs->ne[1] == n_tokens);
+    GGML_ASSERT(ids->ne[0] == n_expert && ids->ne[1] == n_tokens);
+    GGML_ASSERT(k > 0 && k <= 32 && k <= n_expert);
+
+    const int  rows_per_block = 4;
+    const dim3 grid_dims((n_tokens + rows_per_block - 1) / rows_per_block, 1, 1);
+    const dim3 block_dims(WARP_SIZE, rows_per_block, 1);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
+
+#define DSV4_MOE_ROUTER_CASE(N) \
+    case N: \
+        ggml_cuda_kernel_launch(dsv4_moe_router_f32<N>, launch_params, \
+                (const float *) logits->data, (const float *) bias->data, \
+                (float *) probs->data, (int32_t *) ids->data, \
+                n_tokens, \
+                nbl0 / sizeof(float), nbl1 / sizeof(float), \
+                nbb0 / sizeof(float), \
+                nbp0 / sizeof(float), nbp1 / sizeof(float), \
+                nbi0 / sizeof(int32_t), nbi1 / sizeof(int32_t), \
+                k); \
+        break
+
+    switch (n_expert) {
+        DSV4_MOE_ROUTER_CASE(32);
+        DSV4_MOE_ROUTER_CASE(64);
+        DSV4_MOE_ROUTER_CASE(128);
+        DSV4_MOE_ROUTER_CASE(256);
+        default:
+            GGML_ASSERT(false && "unsupported n_expert");
+            break;
+    }
+#undef DSV4_MOE_ROUTER_CASE
+}
+
 void ggml_cuda_op_dsv4_moe_weights(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * probs    = dst->src[0];
     const ggml_tensor * selected = dst->src[1];

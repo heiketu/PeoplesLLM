@@ -91,6 +91,8 @@
 #include <cstdlib>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #if defined(__gnu_linux__)
@@ -2518,6 +2520,16 @@ static void ggml_backend_cuda_moe_prefetch_init(ggml_backend_cuda_context * cuda
     }
 }
 
+// VRAM headroom (bytes) that MoE prefetch staging must leave free when
+// allocating a slot; GGML_CUDA_MOE_PP_RESERVE_MB overrides (default 2048).
+static size_t ggml_cuda_moe_pp_reserve() {
+    static const size_t reserve = []() {
+        const char * env = getenv("GGML_CUDA_MOE_PP_RESERVE_MB");
+        return env != nullptr ? (size_t) atoll(env) * 1024 * 1024 : 2ull * 1024 * 1024 * 1024;
+    }();
+    return reserve;
+}
+
 static bool ggml_backend_cuda_moe_prefetch(
         ggml_backend_t backend, int slot, const void * data, size_t size) {
     if (slot < 0 || slot >= GGML_CUDA_MOE_PP_MAX_PREFETCH) {
@@ -2528,12 +2540,20 @@ static bool ggml_backend_cuda_moe_prefetch(
     ggml_backend_cuda_moe_prefetch_init(cuda_ctx, slot);
 
     if (cuda_ctx->moe_prefetch_size[slot] < size) {
-        constexpr size_t reserve = 2ull * 1024 * 1024 * 1024;
+        const size_t reserve = ggml_cuda_moe_pp_reserve();
         size_t free = 0;
         size_t total = 0;
         CUDA_CHECK(cudaMemGetInfo(&free, &total));
         GGML_UNUSED(total);
         if (free < size + reserve) {
+            static std::once_flag warn_once;
+            std::call_once(warn_once, [&] {
+                GGML_LOG_WARN("%s: CUDA%d prefetch slot %d needs %.2f GiB but only %.2f GiB free "
+                    "(reserve %.2f GiB, tune GGML_CUDA_MOE_PP_RESERVE_MB); "
+                    "falling back to in-stream weight copies\n",
+                    __func__, cuda_ctx->device, slot, size/1073741824.0, free/1073741824.0,
+                    reserve/1073741824.0);
+            });
             return false;
         }
         CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->moe_h2d_stream));
@@ -2549,10 +2569,18 @@ static bool ggml_backend_cuda_moe_prefetch(
         if (alloc_status == cudaErrorMemoryAllocation) {
             cuda_ctx->moe_prefetch_data[slot] = nullptr;
             (void) cudaGetLastError();
+            static std::once_flag warn_once;
+            std::call_once(warn_once, [&] {
+                GGML_LOG_WARN("%s: CUDA%d prefetch slot %d cudaMalloc of %.2f GiB failed; "
+                    "falling back to in-stream weight copies\n",
+                    __func__, cuda_ctx->device, slot, size/1073741824.0);
+            });
             return false;
         }
         CUDA_CHECK(alloc_status);
         cuda_ctx->moe_prefetch_size[slot] = size;
+        GGML_LOG_INFO("%s: CUDA%d prefetch slot %d staged %.2f GiB (%.2f GiB free)\n",
+            __func__, cuda_ctx->device, slot, size/1073741824.0, free/1073741824.0);
     }
 
     // Layer-major prefill submits the same immutable expert tensor once per
@@ -2929,12 +2957,20 @@ static bool ggml_backend_cuda_moe_prefetch_src(
     }
 
     if (cuda_ctx->moe_prefetch_size[slot] < size) {
-        constexpr size_t reserve = 2ull * 1024 * 1024 * 1024;
+        const size_t reserve = ggml_cuda_moe_pp_reserve();
         size_t free = 0;
         size_t total = 0;
         CUDA_CHECK(cudaMemGetInfo(&free, &total));
         GGML_UNUSED(total);
         if (free < size + reserve) {
+            static std::once_flag warn_once;
+            std::call_once(warn_once, [&] {
+                GGML_LOG_WARN("%s: CUDA%d prefetch slot %d needs %.2f GiB but only %.2f GiB free "
+                    "(reserve %.2f GiB, tune GGML_CUDA_MOE_PP_RESERVE_MB); "
+                    "falling back to in-stream weight copies\n",
+                    __func__, cuda_ctx->device, slot, size/1073741824.0, free/1073741824.0,
+                    reserve/1073741824.0);
+            });
             return false;
         }
         CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->moe_h2d_stream));
@@ -2950,6 +2986,12 @@ static bool ggml_backend_cuda_moe_prefetch_src(
         if (alloc_status == cudaErrorMemoryAllocation) {
             cuda_ctx->moe_prefetch_data[slot] = nullptr;
             (void) cudaGetLastError();
+            static std::once_flag warn_once;
+            std::call_once(warn_once, [&] {
+                GGML_LOG_WARN("%s: CUDA%d prefetch slot %d cudaMalloc of %.2f GiB failed; "
+                    "falling back to in-stream weight copies\n",
+                    __func__, cuda_ctx->device, slot, size/1073741824.0);
+            });
             return false;
         }
         CUDA_CHECK(alloc_status);
@@ -3217,6 +3259,9 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     const void * graph_key = ggml_cuda_graph_get_key(cgraph);
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
+    // [GGML_CUDA_GRAPH_DEBUG] one-time env check
+    static const bool graph_debug = getenv("GGML_CUDA_GRAPH_DEBUG") != nullptr;
+
     if (cgraph->uid != 0 &&
         cgraph->uid == graph->uid) {
         GGML_LOG_DEBUG("CUDA Graph id %zu reused\n", cgraph->uid);
@@ -3230,8 +3275,12 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     if ((int)graph->node_props.size() != cgraph->n_nodes) {
         res = true;
         graph->node_props.resize(cgraph->n_nodes);
+        if (graph_debug) {
+            fprintf(stderr, "%s: graph %p size changed to %d nodes\n", __func__, graph_key, cgraph->n_nodes);
+        }
     }
 
+    bool mismatch_logged = false;
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_cuda_graph::node_properties prop = {};
         memcpy(&prop.node, cgraph->nodes[i], sizeof(ggml_tensor));
@@ -3245,6 +3294,36 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         }
 
         if (res || memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
+            if (graph_debug && !mismatch_logged && !res && graph->node_props[i].node.op != GGML_OP_NONE) {
+                mismatch_logged = true;
+                const ggml_cuda_graph::node_properties & old = graph->node_props[i];
+                const ggml_tensor & a = old.node;
+                const ggml_tensor & b = prop.node;
+                std::string diff;
+                if (memcmp(a.ne, b.ne, sizeof(a.ne)) != 0) {
+                    char tmp[128];
+                    snprintf(tmp, sizeof(tmp), " ne(%lld,%lld,%lld,%lld)->(%lld,%lld,%lld,%lld)",
+                        (long long)a.ne[0], (long long)a.ne[1], (long long)a.ne[2], (long long)a.ne[3],
+                        (long long)b.ne[0], (long long)b.ne[1], (long long)b.ne[2], (long long)b.ne[3]);
+                    diff += tmp;
+                }
+                if (memcmp(a.nb, b.nb, sizeof(a.nb)) != 0) { diff += " nb"; }
+                if (a.op != b.op)                             { diff += " op"; }
+                if (a.type != b.type)                         { diff += " type"; }
+                if (a.flags != b.flags)                       { diff += " flags"; }
+                if (memcmp(a.op_params, b.op_params, sizeof(a.op_params)) != 0) { diff += " op_params"; }
+                if (a.data != b.data)                         { diff += " data"; }
+                if (a.view_src != b.view_src)                 { diff += " view_src"; }
+                if (a.view_offs != b.view_offs)               { diff += " view_offs"; }
+                for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                    if (a.src[j] != b.src[j]) { diff += " src" + std::to_string(j); }
+                    if (old.node_src_data_ptrs[j] != prop.node_src_data_ptrs[j]) { diff += " src" + std::to_string(j) + ".data"; }
+                    if (memcmp(old.node_src_ne[j], prop.node_src_ne[j], sizeof(old.node_src_ne[j])) != 0) { diff += " src" + std::to_string(j) + ".ne"; }
+                    if (memcmp(old.node_src_nb[j], prop.node_src_nb[j], sizeof(old.node_src_nb[j])) != 0) { diff += " src" + std::to_string(j) + ".nb"; }
+                }
+                fprintf(stderr, "%s: graph %p first mismatch at node %d %s op %s:%s\n",
+                    __func__, graph_key, i, b.name, ggml_op_name(b.op), diff.c_str());
+            }
             graph->node_props[i] = prop;
             res = true;
         }
@@ -3902,6 +3981,120 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+// DeepSeek-V4 router with n_expert_groups == 1 (no fused dsv4_moe_topk):
+// UNARY(softplus) -> SQRT -> ADD(1D bias) -> ARGSORT(desc) -> VIEW -> DSV4_MOE_WEIGHTS.
+// When matched, one kernel (ggml_cuda_op_dsv4_moe_router) writes the SQRT output
+// (probs, bit-identical) and the first k entries of the ARGSORT output; the
+// softplus/ADD intermediates are elided and DSV4_MOE_WEIGHTS runs unfused.
+static bool ggml_cuda_dsv4_router_fusion(const ggml_cgraph *  cgraph,
+                                         int                  node_idx,
+                                         const ggml_tensor *& logits,
+                                         const ggml_tensor *& bias,
+                                         ggml_tensor *&       probs,
+                                         ggml_tensor *&       ids,
+                                         int32_t &            k) {
+    ggml_tensor ** nodes   = cgraph->nodes;
+    const int      n_nodes = cgraph->n_nodes;
+
+    if (node_idx + 5 >= n_nodes) {
+        return false;
+    }
+
+    ggml_tensor * softplus = nodes[node_idx];
+    ggml_tensor * sqrtn    = nodes[node_idx + 1];
+    ggml_tensor * add      = nodes[node_idx + 2];
+    ggml_tensor * argsort  = nodes[node_idx + 3];
+    ggml_tensor * view     = nodes[node_idx + 4];
+    ggml_tensor * weights  = nodes[node_idx + 5];
+
+    if (sqrtn->op   != GGML_OP_SQRT   || sqrtn->src[0]   != softplus) {
+        return false;
+    }
+    if (add->op     != GGML_OP_ADD    || add->src[0]     != sqrtn) {
+        return false;
+    }
+    if (argsort->op != GGML_OP_ARGSORT || argsort->src[0] != add) {
+        return false;
+    }
+    if (view->op    != GGML_OP_VIEW   || view->src[0]    != argsort) {
+        return false;
+    }
+    if (weights->op != GGML_OP_DSV4_MOE_WEIGHTS || weights->src[0] != sqrtn || weights->src[1] != view) {
+        return false;
+    }
+
+    // only the descending order used by ggml_argsort_top_k is fused
+    if (ggml_get_op_params_i32(argsort, 0) != GGML_SORT_ORDER_DESC) {
+        return false;
+    }
+
+    // the fused kernel only writes the first k ids of the ARGSORT output
+    if (argsort->flags & GGML_TENSOR_FLAG_OUTPUT) {
+        return false;
+    }
+
+    logits = softplus->src[0];
+    bias   = add->src[1];
+    probs  = sqrtn;
+    ids    = argsort;
+    k      = view->ne[0];
+
+    const int64_t n_expert = logits->ne[0];
+    const int64_t n_tokens = logits->ne[1];
+
+    // kernel instantiation set (n_expert % WARP_SIZE == 0, one warp per token)
+    if (n_expert != 32 && n_expert != 64 && n_expert != 128 && n_expert != 256) {
+        return false;
+    }
+
+    const bool shapes_ok =
+            logits->ne[2]  == 1 && logits->ne[3]  == 1 &&
+            sqrtn->ne[0]   == n_expert && sqrtn->ne[1]   == n_tokens && sqrtn->ne[2]   == 1 && sqrtn->ne[3]   == 1 &&
+            bias->ne[0]    == n_expert && bias->ne[1]    == 1        && bias->ne[2]    == 1 && bias->ne[3]    == 1 &&
+            argsort->ne[0] == n_expert && argsort->ne[1] == n_tokens && argsort->ne[2] == 1 && argsort->ne[3] == 1 &&
+            view->ne[1]    == n_tokens && view->ne[2]    == 1        && view->ne[3]    == 1;
+    if (!shapes_ok) {
+        return false;
+    }
+
+    const bool types_ok =
+            logits->type  == GGML_TYPE_F32 && softplus->type == GGML_TYPE_F32 &&
+            sqrtn->type   == GGML_TYPE_F32 && add->type      == GGML_TYPE_F32 &&
+            bias->type    == GGML_TYPE_F32 && argsort->type  == GGML_TYPE_I32 &&
+            view->type    == GGML_TYPE_I32;
+    if (!types_ok) {
+        return false;
+    }
+
+    if (k <= 0 || k > 32 || k > n_expert) {
+        return false;
+    }
+
+    // exact fan-out: sqrt feeds add + weights, and argsort feeds only the view
+    // (anything else reading the ARGSORT output could observe the unwritten tail
+    // beyond the first k ids). View consumers all see correct data, so the view
+    // itself may have extra uses (e.g. the CPU MoE expert gather).
+    if (ggml_node_get_use_count(cgraph, node_idx + 1) != 2 ||
+        ggml_node_get_use_count(cgraph, node_idx + 3) != 1) {
+        return false;
+    }
+
+    if (!ggml_is_contiguous(logits) || !ggml_is_contiguous(sqrtn) ||
+            !ggml_is_contiguous(argsort) || !ggml_is_contiguous(bias)) {
+        return false;
+    }
+
+    const std::initializer_list<ggml_op> ops = { GGML_OP_UNARY, GGML_OP_SQRT, GGML_OP_ADD, GGML_OP_ARGSORT, GGML_OP_VIEW };
+    int out_nodes[3] = { node_idx + 1, node_idx + 3, node_idx + 4 };
+
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, ops.size(), ops.begin(), out_nodes, 3)) {
+        return false;
+    }
+
+    int write_nodes[2] = { node_idx + 1, node_idx + 3 };
+    return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int) ops.size(), write_nodes, 2, /*is_topk_moe=*/true);
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -3999,6 +4192,24 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     return ops.size() - 1;
                 }
             }
+        }
+    }
+
+    // DeepSeek-V4 router with n_expert_groups == 1:
+    // softplus -> sqrt -> add(bias) -> argsort -> view, consumed by dsv4_moe_weights
+    if (node->op == GGML_OP_UNARY && ggml_get_unary_op(node) == GGML_UNARY_OP_SOFTPLUS) {
+        const ggml_tensor * logits = nullptr;
+        const ggml_tensor * bias   = nullptr;
+        ggml_tensor *       probs  = nullptr;
+        ggml_tensor *       ids    = nullptr;
+        int32_t             k      = 0;
+
+        if (ggml_cuda_dsv4_router_fusion(cgraph, i, logits, bias, probs, ids, k)) {
+#ifdef GGML_CUDA_DEBUG
+            GGML_LOG_INFO("%s: fused dsv4 router for %s\n", __func__, node->name);
+#endif
+            ggml_cuda_op_dsv4_moe_router(*cuda_ctx, logits, bias, probs, ids, k);
+            return 4;
         }
     }
 
@@ -4847,8 +5058,34 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         if (cuda_graph_update_required) { // Update graph executable
             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
         }
+        // [GGML_CUDA_GRAPH_DEBUG] measure graph exec wall: bracket the launch
+        // with timing events, read back the previous pair every 512 launches
+        static const bool graph_debug_timing = getenv("GGML_CUDA_GRAPH_DEBUG") != nullptr;
+        static cudaEvent_t ev_start[GGML_CUDA_MAX_DEVICES] = {}, ev_end[GGML_CUDA_MAX_DEVICES] = {};
+        const int dbg_dev = cuda_ctx->device;
+        if (graph_debug_timing && ev_start[dbg_dev] == nullptr) {
+            CUDA_CHECK(cudaEventCreate(&ev_start[dbg_dev]));
+            CUDA_CHECK(cudaEventCreate(&ev_end[dbg_dev]));
+        }
+        if (graph_debug_timing) {
+            CUDA_CHECK(cudaEventRecord(ev_start[dbg_dev], cuda_ctx->stream()));
+        }
         // Launch graph
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+        if (graph_debug_timing) {
+            static uint64_t n_timing = 0;
+            static double sum_ms = 0, max_ms = 0;
+            CUDA_CHECK(cudaEventRecord(ev_end[dbg_dev], cuda_ctx->stream()));
+            n_timing++;
+            if (n_timing % 512 == 0) {
+                float ms = 0;
+                CUDA_CHECK(cudaEventSynchronize(ev_end[dbg_dev]));
+                CUDA_CHECK(cudaEventElapsedTime(&ms, ev_start[dbg_dev], ev_end[dbg_dev]));
+                sum_ms += ms; if (ms > max_ms) max_ms = ms;
+                fprintf(stderr, "%s: graph exec wall (dev%d, last of 512): %.3f ms, running avg %.3f ms max %.3f ms\n",
+                    __func__, dbg_dev, ms, sum_ms/(n_timing/512), max_ms);
+            }
+        }
 #else
         GGML_UNUSED(graph_key);
         graph_evaluated_or_captured = true;
@@ -4890,6 +5127,14 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
     if (graph->is_enabled()) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
+        if (!graph_compatible && getenv("GGML_CUDA_GRAPH_DEBUG") != nullptr) {
+            static std::unordered_set<const void *> incompatible_reported;
+            if (incompatible_reported.insert(graph_key).second) {
+                fprintf(stderr, "%s: graph %p incompatible (device %d, nodes %d, first %s)\n",
+                    __func__, graph_key, cuda_ctx->device, cgraph->n_nodes,
+                    cgraph->n_nodes > 0 ? cgraph->nodes[0]->name : "?");
+            }
+        }
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
@@ -4916,6 +5161,19 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         }
     }
 #endif // USE_CUDA_GRAPH
+
+    // [GGML_CUDA_GRAPH_DEBUG] periodic heartbeat: how often graphs actually launch
+    static const bool graph_debug_calls = getenv("GGML_CUDA_GRAPH_DEBUG") != nullptr;
+    if (graph_debug_calls) {
+        static std::atomic<uint64_t> n_graph_launch{0}, n_direct{0};
+        const uint64_t nl = use_cuda_graph ? n_graph_launch.fetch_add(1) + 1 : n_graph_launch.load();
+        const uint64_t nd = use_cuda_graph ? n_direct.load() : n_direct.fetch_add(1) + 1;
+        const uint64_t total = nl + nd;
+        if (total % 256 == 0) {
+            fprintf(stderr, "%s: cuda graph used %llu / %llu calls (device %d)\n", __func__,
+                (unsigned long long) nl, (unsigned long long) total, cuda_ctx->device);
+        }
+    }
 
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture

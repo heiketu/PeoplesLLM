@@ -46,7 +46,8 @@ static __global__ void flash_attn_ext_vec(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int32_t nb32, const int64_t nb33) {
+                            const int32_t nb31, const int32_t nb32, const int64_t nb33,
+        const int32_t fattn_flags) {
     GGML_UNUSED_VARS(sparse_idx_ptr, sparse_n_raw, sparse_nb1, sparse_nb3,
         sparse_mask_ptr, sparse_mask_nb1, sparse_mask_nb3);
     ggml_cuda_pdl_lc();
@@ -70,7 +71,7 @@ static __global__ void flash_attn_ext_vec(
                   nb11, nb12, nb13,
                   nb21, nb22, nb23,
                   ne31, ne32, ne33,
-                  nb31, nb32, nb33);
+                  nb31, nb32, nb33, fattn_flags);
         NO_DEVICE_CODE;
         return;
     }
@@ -371,9 +372,42 @@ static __global__ void flash_attn_ext_vec(
             }
 #pragma unroll
             for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
+                const int i0 = 2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread;
+                if constexpr (type_V == GGML_TYPE_Q8_0) {
+                    if (fattn_flags & FATTN_FLAGS_PV_Q8_0) {
+                        // P*V directly from the raw q8_0 data with the block scale folded into the
+                        // softmax probability: VKQ += qs * (d*P) instead of VKQ += (d*qs) * P.
+                        // Saves one multiply per element and skips the dequantization staging.
+                        static_assert(V_rows_per_thread == 4, "bad V_rows_per_thread");
+                        const block_q8_0 * V_q8_0 = (const block_q8_0 *) (V + k*nb21);
+
+                        const int ib  = i0 / QK8_0;
+                        const int iqs = i0 % QK8_0;
+
+                        int32_t q32;
+                        ggml_cuda_memcpy_1<sizeof(q32), 2>(&q32, V_q8_0[ib].qs + iqs);
+
+                        const int8_t * qs8 = (const int8_t *) &q32;
+                        float qf[V_rows_per_thread];
+#pragma unroll
+                        for (int l = 0; l < V_rows_per_thread; ++l) {
+                            qf[l] = qs8[l];
+                        }
+
+                        const float d = V_q8_0[ib].d;
+#pragma unroll
+                        for (int j = 0; j < ncols; ++j) {
+                            const float pd = d*KQ_k[j];
+                            VKQ[j][i_VKQ_0/nthreads_V + 0].x += qf[0]*pd;
+                            VKQ[j][i_VKQ_0/nthreads_V + 0].y += qf[1]*pd;
+                            VKQ[j][i_VKQ_0/nthreads_V + 1].x += qf[2]*pd;
+                            VKQ[j][i_VKQ_0/nthreads_V + 1].y += qf[3]*pd;
+                        }
+                        continue;
+                    }
+                }
                 float2 tmp[V_rows_per_thread/2];
-                dequantize_V(V + k*nb21, tmp,
-                    2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
+                dequantize_V(V + k*nb21, tmp, i0);
 #pragma unroll
                 for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
 #pragma unroll
@@ -531,7 +565,7 @@ static __global__ void flash_attn_ext_vec(
               nb11, nb12, nb13,
               nb21, nb22, nb23,
               ne31, ne32, ne33,
-              nb31, nb32, nb33);
+              nb31, nb32, nb33, fattn_flags);
     NO_DEVICE_CODE;
 #endif // FLASH_ATTN_AVAILABLE
 }

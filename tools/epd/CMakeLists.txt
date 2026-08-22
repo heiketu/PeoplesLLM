@@ -116,6 +116,11 @@ target_include_directories(${TARGET} PRIVATE
 target_link_libraries(${TARGET} PRIVATE llama llama-common ${CMAKE_THREAD_LIBS_INIT})
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 
+set(TARGET moe-pp-prefetch-bench)
+add_executable(${TARGET} moe-pp-prefetch-bench.cpp)
+target_link_libraries(${TARGET} PRIVATE ggml ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
 if (LLAMA_EP_RDMA_ENABLED)
     foreach (T llama-epd llama-ep-transport-bench)
         target_sources(${T} PRIVATE llama-ep-rdma.cpp)

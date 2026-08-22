@@ -71,6 +71,16 @@ static void ggml_backend_amx_buffer_memset_tensor(ggml_backend_buffer_t buffer, 
 
 static void ggml_backend_amx_buffer_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor,
                                                const void * data, size_t offset, size_t size) {
+#if defined(__AMX_BF16__) && defined(__AVX512BF16__)
+    // opt-in AMX-BF16: 2D bf16 weights are repacked into the bf16 tile layout;
+    // everything else keeps the plain memcpy path
+    if (tensor->type == GGML_TYPE_BF16 && ggml_amx_bf16_enabled() && tensor->ne[2] * tensor->ne[3] == 1 &&
+        tensor->ne[0] % 32 == 0 && tensor->ne[1] % 32 == 0) {
+        GGML_LOG_DEBUG("%s: amx bf16 repack tensor %s\n", __func__, tensor->name);
+        ggml_backend_amx_convert_weight(tensor, data, offset, size);
+        return;
+    }
+#endif
     if (qtype_has_amx_kernels(tensor->type)) {
         GGML_LOG_DEBUG("%s: amx repack tensor %s of type %s\n", __func__, tensor->name, ggml_type_name(tensor->type));
         ggml_backend_amx_convert_weight(tensor, data, offset, size);
@@ -189,6 +199,15 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
             case GGML_TYPE_F16:
                 alignment = 16;
                 break;
+#if defined(__AMX_BF16__) && defined(__AVX512BF16__)
+            case GGML_TYPE_BF16:
+                // opt-in AMX-BF16: 2D weights only, packed by set_tensor (see above)
+                if (!ggml_amx_bf16_enabled() || src0->ne[2] * src0->ne[3] != 1) {
+                    return false;
+                }
+                alignment = 32;
+                break;
+#endif
             default:
                 return false;
         }
@@ -196,7 +215,14 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
             return false;
         }
         if (src1->type != GGML_TYPE_F32) {
+#if defined(__AMX_BF16__) && defined(__AVX512BF16__)
+            // bf16 activations feed the AMX-BF16 kernels in place
+            if (!(ggml_amx_bf16_enabled() && src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_BF16)) {
+                return false;
+            }
+#else
             return false;
+#endif
         }
         if (op->op == GGML_OP_MUL_MAT_ID) {
             auto * ids = op->src[2];
@@ -224,6 +250,16 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
     ggml::cpu::tensor_traits * get_tensor_traits(const struct ggml_tensor * op) override {
         if ((op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID) && op->src[0]->buffer &&
             op->src[0]->buffer->buft == ggml_backend_amx_buffer_type()) {
+#if defined(__AMX_BF16__) && defined(__AVX512BF16__)
+            // bf16 without the opt-in (or non-packable shapes) must fall back to the
+            // plain cpu path instead of hitting the quantized AMX dispatch
+            const ggml_tensor * src0 = op->src[0];
+            if (src0->type == GGML_TYPE_BF16 &&
+                !(ggml_amx_bf16_enabled() && src0->ne[2] * src0->ne[3] == 1 &&
+                  src0->ne[0] % 32 == 0 && src0->ne[1] % 32 == 0)) {
+                return nullptr;
+            }
+#endif
             return (ggml::cpu::tensor_traits *) op->src[0]->extra;
         }
 

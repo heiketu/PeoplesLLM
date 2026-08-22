@@ -92,7 +92,11 @@ bool make_repacked(ggml_type type, const std::vector<float> & w, int nc, int k, 
 
     const size_t row_bytes = ggml_row_size(type, k);
     out.raw.resize(row_bytes * nc);
-    if (traits->from_float_ref) {
+    if (type == GGML_TYPE_UDNL_MX) {
+        // UDNL_MX rows of a 16-row panel share the mode word: quantize the
+        // whole plane at once (panel DP) instead of row-wise from_float_ref.
+        ggml_quantize_chunk(type, w.data(), out.raw.data(), 0, nc, k, nullptr);
+    } else if (traits->from_float_ref) {
         for (int r = 0; r < nc; r++) {
             traits->from_float_ref(w.data() + (size_t) r * k, out.raw.data() + row_bytes * r, k);
         }
@@ -150,7 +154,11 @@ bool make_expert_weights(
     const size_t row_bytes = ggml_row_size(type, k);
     const size_t plane_bytes = row_bytes * nc;
     std::vector<char> raw_plane(plane_bytes);
-    if (traits->from_float_ref) {
+    if (type == GGML_TYPE_UDNL_MX) {
+        // UDNL_MX rows of a 16-row panel share the mode word: quantize the
+        // whole plane at once (panel DP) instead of row-wise from_float_ref.
+        ggml_quantize_chunk(type, plane.data(), raw_plane.data(), 0, nc, k, nullptr);
+    } else if (traits->from_float_ref) {
         for (int r = 0; r < nc; ++r) {
             traits->from_float_ref(plane.data() + (size_t) r * k,
                                    raw_plane.data() + row_bytes * r, k);
@@ -205,7 +213,11 @@ bool make_expert_weight_pair(
     const size_t row_bytes = ggml_row_size(type, k);
     const size_t plane_bytes = row_bytes * nc;
     std::vector<char> raw_plane(plane_bytes);
-    if (traits->from_float_ref) {
+    if (type == GGML_TYPE_UDNL_MX) {
+        // UDNL_MX rows of a 16-row panel share the mode word: quantize the
+        // whole plane at once (panel DP) instead of row-wise from_float_ref.
+        ggml_quantize_chunk(type, plane.data(), raw_plane.data(), 0, nc, k, nullptr);
+    } else if (traits->from_float_ref) {
         for (int r = 0; r < nc; ++r) {
             traits->from_float_ref(plane.data() + (size_t) r * k,
                                    raw_plane.data() + row_bytes * r, k);
@@ -286,6 +298,22 @@ std::vector<char> quantize_act_row(const std::vector<float> & x, int k, ggml_typ
     return vy;
 }
 
+// Quantize nr activation rows into plain row-major blocks. Q3_R is an
+// INTER_SIZE == 1 identity layout, so its gemm takes this layout rather than
+// the 4x8-interleaved block_q8_0x4 one.
+std::vector<char> quantize_act_rows(const std::vector<float> & x, int nr, int k, ggml_type act = GGML_TYPE_Q8_K) {
+    const size_t qrow = ggml_row_size(act, k);
+    std::vector<char> vy(qrow * nr);
+    for (int r = 0; r < nr; r++) {
+        if (act == GGML_TYPE_Q8_K) {
+            quantize_row_q8_K(x.data() + (size_t) r * k, vy.data() + qrow * r, k);
+        } else {
+            quantize_row_q8_0(x.data() + (size_t) r * k, vy.data() + qrow * r, k);
+        }
+    }
+    return vy;
+}
+
 typedef void (*vec_dot_fn)(int, float *, size_t, const void *, size_t, const void *, size_t, int);
 
 struct kernel_fns {
@@ -352,6 +380,31 @@ bool test_type(const kernel_fns & fn, int nc, int k, const std::vector<int> & ge
         ok = ok && (!has_gen_gemv || st_ng.n_bad == 0) && (!fn.compare_legacy || st_nl.n_bad == 0);
     }
 
+    if (fn.type == GGML_TYPE_Q3_R) {
+        // The default gemv path is the integer-scale variant (maddubs+madd,
+        // multi-accumulator), which reassociates the fp finalize and is only
+        // rounding-level accurate vs legacy vec_dot — it is covered by the
+        // 1e-3 tolerance above. The GGML_REPACK_Q3_R_GEMV_INT=0 fallback must
+        // remain bit-exact; verify the switch and the fallback here.
+        std::vector<float> x  = make_random_f32(k, 555);
+        std::vector<char>  q8 = quantize_act_row(x, k, fn.act_type);
+        std::vector<float> s_fb(nc, 0.0f);
+        setenv("GGML_REPACK_Q3_R_GEMV_INT", "0", 1);
+        fn.gemv(k, s_fb.data(), nc, rw.data, q8.data(), 1, nc);
+        unsetenv("GGML_REPACK_Q3_R_GEMV_INT");
+        int n_diff = 0;
+        for (int c = 0; c < nc; c++) {
+            float ref = 0.0f;
+            fn.vec_dot(k, &ref, 0, rw.raw.data() + row_bytes * c, 0, q8.data(), 0, 1);
+            if (memcmp(&s_fb[c], &ref, sizeof(float)) != 0) {
+                n_diff++;
+            }
+        }
+        printf("  [%s] gemv int-variant fallback (GGML_REPACK_Q3_R_GEMV_INT=0) vs legacy: %s\n",
+               fn.name, n_diff == 0 ? "bit-exact" : "FAILED");
+        ok = ok && n_diff == 0;
+    }
+
     if (fn.type == GGML_TYPE_MXFP4) {
         for (int nr = 2; nr <= 8; ++nr) {
             const std::vector<float> x = make_random_f32((int64_t) nr * k, 780 + nr);
@@ -377,7 +430,9 @@ bool test_type(const kernel_fns & fn, int nc, int k, const std::vector<int> & ge
     // ---- gemm: native vs generic vs legacy vec_dot ----
     for (int nr : gemm_nrs) {
         std::vector<float> x  = make_random_f32((int64_t) nr * k, 999 + nr);
-        std::vector<char>  q8 = quantize_acts_4x8(x, nr, k, fn.act_type);
+        std::vector<char>  q8 = fn.type == GGML_TYPE_Q3_R || fn.type == GGML_TYPE_UDNL_W4 || fn.type == GGML_TYPE_UDNL_MX
+                              ? quantize_act_rows(x, nr, k, fn.act_type)
+                              : quantize_acts_4x8(x, nr, k, fn.act_type);
         std::vector<float> s_nat((size_t) nr * nc, 0.0f), s_gen((size_t) nr * nc, 0.0f);
 
         fn.gemm(k, s_nat.data(), nc, rw.data, q8.data(), nr, nc);
@@ -558,7 +613,9 @@ void perf_type(const kernel_fns & fn, int nc, int k, int nr, int nthreads, int n
             printf("  [MXFP4] one-call vs chunks-4 nr=%-3d: %.2fx\n", nr, t_split4 / t_shared);
         }
     } else {
-        std::vector<char> q8 = quantize_acts_4x8(x, nr, k, fn.act_type);
+        std::vector<char> q8 = fn.type == GGML_TYPE_Q3_R || fn.type == GGML_TYPE_UDNL_W4 || fn.type == GGML_TYPE_UDNL_MX
+                             ? quantize_act_rows(x, nr, k, fn.act_type)
+                             : quantize_acts_4x8(x, nr, k, fn.act_type);
         const double t = time_it(("repack gemm nr=" + std::to_string(nr)).c_str(), [&](int c0, int ncols) {
             fn.gemm(k, s.data() + c0, nc, (const char *) rw.data + row_bytes * c0, q8.data(), nr, ncols);
         });
@@ -587,6 +644,33 @@ bool perf_mul_mat_id(
     if (!make_expert_weights(fn.type, nc, k, n_experts, use_repack, rw)) {
         fprintf(stderr, "[%s] failed to create %s expert tensor\n", fn.name, use_repack ? "repacked" : "generic");
         return false;
+    }
+
+    // Optional NUMA-EP replication (GGML_NUMA_EP=1): init NUMA and bind each
+    // expert's row windows to their node, matching the model loader's EP
+    // placement and the mmid claim path's per-node windows. UDNL_MX repack
+    // stores 16-row panels contiguously and ep_win is a multiple of 128 rows,
+    // so a row window maps to one contiguous byte range per expert. Without
+    // the env the bench keeps its historical flat (unpinned, unbound) behavior.
+    {
+        const char * numa_env = getenv("GGML_NUMA_EP");
+        if (numa_env && atoi(numa_env) != 0) {
+            ggml_numa_init(GGML_NUMA_STRATEGY_DISTRIBUTE);
+            const int n_nodes = ggml_numa_node_count();
+            if (n_nodes > 1) {
+                const int64_t ep_win = (((int64_t) nc + n_nodes - 1)/n_nodes + 127)/128*128;
+                const int64_t row_stride = rw.tensor->nb[2]/nc;
+                for (int e = 0; e < n_experts; ++e) {
+                    for (int n = 0; n < n_nodes; ++n) {
+                        const int64_t r0 = (int64_t) n*ep_win;
+                        const int64_t r1 = std::min<int64_t>(r0 + ep_win, nc);
+                        if (r1 <= r0) continue;
+                        ggml_numa_bind((char *) rw.data + e*rw.tensor->nb[2] + r0*row_stride,
+                                       (size_t) ((r1 - r0)*row_stride), n);
+                    }
+                }
+            }
+        }
     }
 
     const int n_active = n_active_experts > 0 ? n_active_experts : n_experts;
@@ -1256,6 +1340,20 @@ int main(int argc, char ** argv) {
           ggml_gemm_iq4_xs_8x8_q8_0, nullptr, GGML_TYPE_Q8_0, false },
         { GGML_TYPE_MXFP4, "MXFP4", ggml_vec_dot_mxfp4_q8_0, ggml_gemv_mxfp4_8x8_q8_0, ggml_gemv_mxfp4_8x8_q8_0_generic,
           ggml_gemm_mxfp4_8x8_q8_0, ggml_gemm_mxfp4_8x8_q8_0_generic, GGML_TYPE_Q8_0 },
+        // Q3_R is an INTER_SIZE == 1 identity repack: gemm activations are plain
+        // row-major q8_0 rows (see quantize_act_rows); no column-count constraint
+        { GGML_TYPE_Q3_R, "Q3_R", ggml_vec_dot_q3_r_q8_0, ggml_gemv_q3_r_1x1_q8_0, ggml_gemv_q3_r_1x1_q8_0_generic,
+          ggml_gemm_q3_r_1x1_q8_0, ggml_gemm_q3_r_1x1_q8_0_generic, GGML_TYPE_Q8_0 },
+        // UDNL_W4 is an INTER_SIZE == 1 NR16xK4 panel repack: gemm activations
+        // are plain row-major q8_0 rows (see quantize_act_rows), like Q3_R.
+        // nc must be a multiple of 16; the nc=8/nc=520 shapes are skipped below.
+        { GGML_TYPE_UDNL_W4, "UDNL_W4", ggml_vec_dot_udnl_w4_q8_0, ggml_gemv_udnl_w4_1x16_q8_0, ggml_gemv_udnl_w4_1x16_q8_0_generic,
+          ggml_gemm_udnl_w4_1x16_q8_0, ggml_gemm_udnl_w4_1x16_q8_0_generic, GGML_TYPE_Q8_0 },
+        // UDNL_MX is an INTER_SIZE == 1 NR16 panel repack like UDNL_W4, with
+        // a panel-shared per-group W2/W3/W4 mode word. nc must be a multiple
+        // of 16; the nc=8/nc=520 shapes are skipped below.
+        { GGML_TYPE_UDNL_MX, "UDNL_MX", ggml_vec_dot_udnl_mx_q8_0, ggml_gemv_udnl_mx_1x16_q8_0, ggml_gemv_udnl_mx_1x16_q8_0_generic,
+          ggml_gemm_udnl_mx_1x16_q8_0, ggml_gemm_udnl_mx_1x16_q8_0_generic, GGML_TYPE_Q8_0 },
         // Q8_0 has no generic 8x8 kernels; native-vs-generic checks are skipped for it
         { GGML_TYPE_Q8_0, "Q8_0", ggml_vec_dot_q8_0_q8_0, ggml_gemv_q8_0_8x8_q8_0, nullptr,
           ggml_gemm_q8_0_8x8_q8_0, nullptr, GGML_TYPE_Q8_0 },
@@ -1497,10 +1595,16 @@ int main(int argc, char ** argv) {
         }
         printf("[%s] nc=512 k=2048 (main paths)\n", fn.name);
         ok &= test_type(fn, 512, 2048, gemm_nrs, false);
-        printf("[%s] nc=8 k=2048 (256-bit tail column group only)\n", fn.name);
-        ok &= test_type(fn, 8, 2048, { 4, 8, 16 }, false);
-        printf("[%s] nc=520 k=2048 (odd trailing 8-column group)\n", fn.name);
-        ok &= test_type(fn, 520, 2048, { 4, 20 }, false);
+        if (fn.type == GGML_TYPE_UDNL_W4 || fn.type == GGML_TYPE_UDNL_MX) {
+            // UDNL panels are 16 columns wide; nc=8 and nc=520 cannot be
+            // repacked (the registration rejects them, row vec_dot covers them)
+            printf("[%s] nc=8/nc=520 shapes skipped (require nc %% 16 == 0)\n", fn.name);
+        } else {
+            printf("[%s] nc=8 k=2048 (256-bit tail column group only)\n", fn.name);
+            ok &= test_type(fn, 8, 2048, { 4, 8, 16 }, false);
+            printf("[%s] nc=520 k=2048 (odd trailing 8-column group)\n", fn.name);
+            ok &= test_type(fn, 520, 2048, { 4, 20 }, false);
+        }
         if (fn.type == GGML_TYPE_MXFP4) {
             printf("[%s] nc=64 k=1024 (small-batch model path)\n", fn.name);
             ok &= test_type(fn, 64, 1024, { 8 }, false);

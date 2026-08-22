@@ -574,6 +574,15 @@ void dequantize_row_mxfp4(const block_mxfp4 * GGML_RESTRICT x, float * GGML_REST
     const int nb = k / qk;
 
     for (int i = 0; i < nb; i++) {
+        // 0xFF is the OCP E8M0 NaN encoding; ggml_e8m0_to_fp32_half would turn it into
+        // 2^127, which overflows fp16 super-scales when requantizing (and is garbage for
+        // any to_float consumer). such blocks occur in the wild on never-routed experts;
+        // dequantize them to zeros — strictly saner than the production vec_dot result
+        if (x[i].e == 0xff) {
+            memset(y + i*qk, 0, qk*sizeof(float));
+            continue;
+        }
+
         const float d = GGML_E8M0_TO_FP32_HALF(x[i].e);
 
         for (int j = 0; j < qk/2; ++j) {
@@ -1447,6 +1456,590 @@ size_t quantize_q3_K(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, 
             quantize_row_q3_K_impl(src, (block_q3_K*)qrow, n_per_row, quant_weights);
             src += n_per_row;
             qrow += row_size;
+        }
+    }
+    return nrow * row_size;
+}
+
+// ====================== Q3_R: 3-bit, 256-element super-block, int8 sub-scales
+
+// values beyond this magnitude would overflow the fp16 super-scale (d = step/127,
+// step <= amax/3); they only occur in degenerate/corrupt source data (e.g. never-initialized
+// regions of MXFP4 expert tensors) and are quantized as zero
+#define Q3_R_SANITIZE_MAX (65504.0f*127.0f)
+
+void quantize_row_q3_r_ref(const float * GGML_RESTRICT x, block_q3_r * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK3_R == 0);
+    const int64_t nb = k / QK3_R;
+
+    int8_t L[QK3_R];
+    float  xs[QK3_R]; // sanitized copy of the current super-block
+
+    for (int64_t i = 0; i < nb; i++) {
+        for (int j = 0; j < QK3_R; ++j) {
+            const float f = x[j];
+            xs[j] = isfinite(f) && fabsf(f) <= Q3_R_SANITIZE_MAX ? f : 0.0f;
+        }
+        // range-fitting, sign-aware sub-scales: the 7-level grid covers [-4,3] for a
+        // positive scale and [-3,4] for a negative one. per sub-block pick the sign and
+        // the minimal step that covers both extremes without clamping (q3_K avoids this
+        // via a separate dmin; we have no offset, so we widen the step instead)
+        float ext[8]; // required step per sub-block
+        bool  neg[8];
+        float ext_max = 0;
+        for (int j = 0; j < QK3_R/32; ++j) {
+            float ap = 0, an = 0;
+            for (int v = 0; v < 32; ++v) {
+                const float f = xs[32*j + v];
+                if (f > ap) ap = f;
+                if (-f > an) an = -f;
+            }
+            const float sp = MAX(an*0.25f, ap*(1.f/3)); // step if scale > 0
+            const float sn = MAX(ap*0.25f, an*(1.f/3)); // step if scale < 0
+            neg[j] = sn < sp;
+            ext[j] = neg[j] ? sn : sp;
+            if (ext_max < ext[j]) ext_max = ext[j];
+        }
+
+        if (ext_max < GROUP_MAX_EPS) { // all zero
+            memset(&y[i], 0, sizeof(block_q3_r));
+            y[i].d = GGML_FP32_TO_FP16(0.f);
+            x += QK3_R;
+            continue;
+        }
+
+        const float d = ext_max/127;
+        y[i].d = GGML_FP32_TO_FP16(d);
+        const float df = GGML_FP16_TO_FP32(y[i].d);
+
+        for (int j = 0; j < QK3_R/32; ++j) {
+            int s = ext[j] > 0 ? MIN(127, nearest_int(ext[j]/df)) : 0;
+            if (neg[j]) s = -s;
+            y[i].scales[j] = (int8_t) s;
+            const float dj = df*s;
+            for (int v = 0; v < 32; ++v) {
+                int q = dj != 0 ? nearest_int(xs[32*j + v]/dj) + 4 : 4;
+                L[32*j + v] = MAX(0, MIN(7, q));
+            }
+        }
+
+        memset(y[i].qs, 0, sizeof(y[i].qs));
+        for (int j = 0; j < QK3_R/32; ++j) {
+            uint8_t * qs = y[i].qs + 12*j;
+            for (int v = 0; v < 32; ++v) {
+                const int bit = 3*v;
+                const int qv  = L[32*j + v];
+                qs[bit/8] |= qv << (bit%8);
+                if (bit%8 > 5) {
+                    qs[bit/8 + 1] |= qv >> (8 - bit%8);
+                }
+            }
+        }
+
+        x += QK3_R;
+    }
+}
+
+static void quantize_row_q3_r_impl(const float * GGML_RESTRICT x, block_q3_r * GGML_RESTRICT y, int64_t n_per_row, const float * GGML_RESTRICT quant_weights) {
+    assert(n_per_row % QK3_R == 0);
+    const int64_t nb = n_per_row / QK3_R;
+
+    if (!quant_weights) {
+        quantize_row_q3_r_ref(x, y, n_per_row);
+        return;
+    }
+
+    int8_t L[QK3_R];
+    float  weight[32];
+    float  xs[QK3_R]; // sanitized copy of the current super-block (see Q3_R_SANITIZE_MAX)
+
+    for (int64_t i = 0; i < nb; i++) {
+        for (int j = 0; j < QK3_R; ++j) {
+            const float f = x[j];
+            xs[j] = isfinite(f) && fabsf(f) <= Q3_R_SANITIZE_MAX ? f : 0.0f;
+        }
+
+        float sumx2 = 0;
+        for (int j = 0; j < QK3_R; ++j) sumx2 += xs[j]*xs[j];
+        const float sigma2 = 2*sumx2/QK3_R;
+
+        float ext[8]; // required step per sub-block (weighted, range-fitting)
+        bool  neg[8];
+        float ext_max = 0;
+        for (int j = 0; j < QK3_R/32; ++j) {
+            const float * qw = quant_weights + QK3_R*i + 32*j;
+            float ap = 0, an = 0;
+            for (int v = 0; v < 32; ++v) {
+                weight[v] = qw[v]*sqrtf(sigma2 + xs[32*j + v]*xs[32*j + v]);
+                const float f = weight[v]*xs[32*j + v];
+                if (f > ap) ap = f;
+                if (-f > an) an = -f;
+            }
+            const float sp = MAX(an*0.25f, ap*(1.f/3)); // step if scale > 0
+            const float sn = MAX(ap*0.25f, an*(1.f/3)); // step if scale < 0
+            neg[j] = sn < sp;
+            ext[j] = neg[j] ? sn : sp;
+            if (ext_max < ext[j]) ext_max = ext[j];
+        }
+
+        if (ext_max < GROUP_MAX_EPS) { // all zero
+            memset(&y[i], 0, sizeof(block_q3_r));
+            y[i].d = GGML_FP32_TO_FP16(0.f);
+            x += QK3_R;
+            continue;
+        }
+
+        const float d = ext_max/127;
+        y[i].d = GGML_FP32_TO_FP16(d);
+        const float df = GGML_FP16_TO_FP32(y[i].d);
+
+        for (int j = 0; j < QK3_R/32; ++j) {
+            const float * qw = quant_weights + QK3_R*i + 32*j;
+            for (int v = 0; v < 32; ++v) {
+                weight[v] = qw[v]*sqrtf(sigma2 + xs[32*j + v]*xs[32*j + v]);
+            }
+            int s = ext[j] > 0 ? MIN(127, nearest_int(ext[j]/df)) : 0;
+            if (neg[j]) s = -s;
+            y[i].scales[j] = (int8_t) s;
+            const float dj = df*s;
+            for (int v = 0; v < 32; ++v) {
+                int best_q = 4;
+                if (dj != 0) {
+                    const float wv = xs[32*j + v];
+                    int q = MAX(0, MIN(7, nearest_int(wv/dj) + 4));
+                    // local search over the two neighbours, weighted squared error
+                    float best_err = weight[v]*(wv - dj*(q - 4))*(wv - dj*(q - 4));
+                    best_q = q;
+                    for (int qq = MAX(0, q - 1); qq <= MIN(7, q + 1); ++qq) {
+                        const float err = weight[v]*(wv - dj*(qq - 4))*(wv - dj*(qq - 4));
+                        if (err < best_err) {
+                            best_err = err;
+                            best_q   = qq;
+                        }
+                    }
+                }
+                L[32*j + v] = best_q;
+            }
+        }
+
+        memset(y[i].qs, 0, sizeof(y[i].qs));
+        for (int j = 0; j < QK3_R/32; ++j) {
+            uint8_t * qs = y[i].qs + 12*j;
+            for (int v = 0; v < 32; ++v) {
+                const int bit = 3*v;
+                const int qv  = L[32*j + v];
+                qs[bit/8] |= qv << (bit%8);
+                if (bit%8 > 5) {
+                    qs[bit/8 + 1] |= qv >> (8 - bit%8);
+                }
+            }
+        }
+
+        x += QK3_R;
+    }
+}
+
+size_t quantize_q3_r(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    size_t row_size = ggml_row_size(GGML_TYPE_Q3_R, n_per_row);
+    if (!quant_weights) {
+        quantize_row_q3_r_ref(src, dst, (int64_t)nrow*n_per_row);
+    }
+    else {
+        char * qrow = (char *)dst;
+        for (int64_t row = 0; row < nrow; ++row) {
+            quantize_row_q3_r_impl(src, (block_q3_r*)qrow, n_per_row, quant_weights);
+            src += n_per_row;
+            qrow += row_size;
+        }
+    }
+    return nrow * row_size;
+}
+
+void dequantize_row_q3_r(const block_q3_r * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK3_R == 0);
+    const int64_t nb = k / QK3_R;
+
+    for (int64_t i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        for (int j = 0; j < QK3_R/32; ++j) {
+            const float dj = d*x[i].scales[j];
+            const uint8_t * qs = x[i].qs + 12*j;
+            for (int v = 0; v < 32; ++v) {
+                const int bit = 3*v;
+                int q = qs[bit/8] >> (bit%8);
+                if (bit%8 > 5) {
+                    q |= qs[bit/8 + 1] << (8 - bit%8);
+                }
+                y[32*j + v] = dj*(float)((q & 7) - 4);
+            }
+        }
+        y += QK3_R;
+    }
+}
+
+// UDNL W4 single mode (4+4): nearest-codebook quantization over the 16-entry
+// non-linear grid (kvalues_iq4nl), per-KQ (32 weights) u8 relative scales under
+// an fp16 super-block scale. imatrix weighting is not implemented yet (Slice 2
+// MVP): quant_weights is accepted for ABI compatibility and ignored.
+void quantize_row_udnl_w4_ref(const float * GGML_RESTRICT x, block_udnl_w4 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_UDNL_W4 == 0);
+    const int64_t nb = k / QK_UDNL_W4;
+
+    uint8_t L[QK_UDNL_W4];
+    float   xs[QK_UDNL_W4]; // sanitized copy of the current super-block (same guard as Q3_R)
+
+    for (int64_t i = 0; i < nb; i++) {
+        for (int j = 0; j < QK_UDNL_W4; ++j) {
+            const float f = x[j];
+            xs[j] = isfinite(f) && fabsf(f) <= Q3_R_SANITIZE_MAX ? f : 0.0f;
+        }
+        // per-KQ required step: the codebook spans [-127, 113], so the scale must
+        // cover both extremes: s >= max(amax_pos/113, amax_neg/127)
+        float ext[QK_UDNL_W4/32];
+        float ext_max = 0;
+        for (int j = 0; j < QK_UDNL_W4/32; ++j) {
+            float ap = 0, an = 0;
+            for (int v = 0; v < 32; ++v) {
+                const float f = xs[32*j + v];
+                if (f > ap) ap = f;
+                if (-f > an) an = -f;
+            }
+            ext[j] = MAX(ap*(1.f/113), an*(1.f/127));
+            if (ext_max < ext[j]) ext_max = ext[j];
+        }
+
+        if (ext_max < GROUP_MAX_EPS) { // all zero
+            memset(&y[i], 0, sizeof(block_udnl_w4));
+            y[i].d = GGML_FP32_TO_FP16(0.f);
+            x += QK_UDNL_W4;
+            continue;
+        }
+
+        y[i].d = GGML_FP32_TO_FP16(ext_max/255);
+        const float df = GGML_FP16_TO_FP32(y[i].d);
+
+        for (int j = 0; j < QK_UDNL_W4/32; ++j) {
+            const int s = ext[j] > 0 ? MIN(255, MAX(1, nearest_int(ext[j]/df))) : 0;
+            y[i].srel[j] = (uint8_t) s;
+            const float dj = df*s;
+            for (int v = 0; v < 32; ++v) {
+                int best = 0;
+                if (s > 0) {
+                    const float t = xs[32*j + v]/dj;
+                    float bd = INFINITY;
+                    for (int c = 0; c < 16; ++c) {
+                        const float d = fabsf(t - (float) kvalues_iq4nl[c]);
+                        if (d < bd) { bd = d; best = c; }
+                    }
+                }
+                L[32*j + v] = (uint8_t) best;
+            }
+        }
+
+        for (int j = 0; j < QK_UDNL_W4/32; ++j) {
+            uint8_t * qs = y[i].qs + 16*j;
+            for (int v = 0; v < 16; ++v) {
+                qs[v] = (uint8_t) (L[32*j + 2*v] | (L[32*j + 2*v + 1] << 4));
+            }
+        }
+
+        x += QK_UDNL_W4;
+    }
+}
+
+void dequantize_row_udnl_w4(const block_udnl_w4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_UDNL_W4 == 0);
+    const int64_t nb = k / QK_UDNL_W4;
+
+    for (int64_t i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        for (int j = 0; j < QK_UDNL_W4/32; ++j) {
+            const float dj = d*x[i].srel[j];
+            const uint8_t * qs = x[i].qs + 16*j;
+            for (int v = 0; v < 16; ++v) {
+                y[32*j + 2*v + 0] = dj*(float) kvalues_iq4nl[qs[v] & 0xf];
+                y[32*j + 2*v + 1] = dj*(float) kvalues_iq4nl[qs[v] >>  4];
+            }
+        }
+        y += QK_UDNL_W4;
+    }
+}
+
+size_t quantize_udnl_w4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    // no imatrix weighting yet (Slice 2 MVP); quant_weights is ignored
+    GGML_UNUSED(quant_weights);
+    quantize_row_udnl_w4_ref(src, dst, (int64_t)nrow*n_per_row);
+    const size_t row_size = ggml_row_size(GGML_TYPE_UDNL_W4, n_per_row);
+    return nrow * row_size;
+}
+
+// ====================== UDNL_MX mixed W2/W3/W4
+//
+// Per-KQ mixed-width codebook quantization: each of the 8 KQ groups (32
+// weights) of a 256-weight super-block uses the W2 (4-entry), W3 (8-entry) or
+// W4 (16-entry) codebook — all subsets of the IQ4_NL grid. The mode word is
+// chosen per panel of 16 rows by a DP minimizing the summed (optionally
+// imatrix-weighted) squared error under the exact 96-byte payload budget
+// (x3 + 2*x4 == 8 in 4-byte units: costs 2/3/4, budget 24). The panel-shared
+// mode word lets the NR16 repack kernels decode whole panels with a uniform
+// layout. quantize_row_udnl_mx_ref quantizes rows independently (panels of
+// 1); quantize_udnl_mx quantizes full 16-row panels jointly and falls back to
+// independent rows for a tail of nrow % 16 != 0 (such tensors never satisfy
+// the repack row alignment, so the non-uniform mode words are harmless).
+
+static const int8_t * const udnl_mx_codebook[4] = { NULL, kvalues_udnl2, kvalues_udnl3, kvalues_iq4nl };
+static const int            udnl_mx_ncb[4]      = { 0, 4, 8, 16 };
+static const int            udnl_mx_bytes[4]    = { 0, 8, 12, 16 }; // payload bytes per group
+static const int            udnl_mx_units[4]    = { 0, 2, 3, 4 };   // payload in 4-byte units
+static const float          udnl_mx_rmaxp[4]    = { 0, 1.f/113, 1.f/89, 1.f/113 }; // reciprocal max positive extent
+static const float          udnl_mx_rmaxn[4]    = { 0, 1.f/127, 1.f/127, 1.f/127 }; // reciprocal max negative extent
+
+// Range-fitting step and squared error for one KQ group (32 weights) at the
+// given mode. The step is fit on the raw values; the imatrix enters only via
+// the (weighted) error metric below. Fitting the step on weighted values would
+// let the raw imatrix magnitude (in_sum2/count, up to ~1e4 here) blow the fp16
+// super scale d past its range — observed as 'validate: found inf value' when
+// requantizing ffn_*_exps with --imatrix. Returns the error, step via step_out.
+static float udnl_mx_group_eval(const float * GGML_RESTRICT xs, const float * GGML_RESTRICT wt, int mode, float * step_out) {
+    const int8_t * cb  = udnl_mx_codebook[mode];
+    const int      ncb = udnl_mx_ncb[mode];
+    float ap = 0, an = 0;
+    for (int v = 0; v < 32; ++v) {
+        const float f = xs[v];
+        if (f > ap) ap = f;
+        if (-f > an) an = -f;
+    }
+    const float step = MAX(ap*udnl_mx_rmaxp[mode], an*udnl_mx_rmaxn[mode]);
+    *step_out = step;
+    if (step <= 0) {
+        return 0;
+    }
+    float err = 0;
+    for (int v = 0; v < 32; ++v) {
+        const float wv = xs[v];
+        const float t  = wv/step;
+        int   best = 0;
+        float bd   = INFINITY;
+        for (int c = 0; c < ncb; ++c) {
+            const float d = fabsf(t - (float) cb[c]);
+            if (d < bd) { bd = d; best = c; }
+        }
+        if (wt) {
+            // local search over the two neighbours, weighted squared error
+            float be = wt[v]*(wv - step*cb[best])*(wv - step*cb[best]);
+            for (int q = MAX(0, best - 1); q <= MIN(ncb - 1, best + 1); ++q) {
+                const float e = wt[v]*(wv - step*cb[q])*(wv - step*cb[q]);
+                if (e < be) { be = e; }
+            }
+            err += be;
+        } else {
+            const float r = wv - step*cb[best];
+            err += r*r;
+        }
+    }
+    return err;
+}
+
+// Quantize a panel of nr rows (16 from quantize_udnl_mx, 1 from the ref path)
+// with one shared mode word per 256-weight super-block.
+static void udnl_mx_quantize_panel(const float * GGML_RESTRICT x, block_udnl_mx * GGML_RESTRICT y,
+        int64_t nr, int64_t n_per_row, const float * GGML_RESTRICT quant_weights) {
+    const int64_t nb = n_per_row / QK_UDNL_MX;
+
+    float xs[16][QK_UDNL_MX]; // sanitized copy of the panel's current super-blocks
+    float wt[16][QK_UDNL_MX/32][32]; // imatrix weights per (row, group)
+
+    for (int64_t i = 0; i < nb; i++) {
+        for (int64_t r = 0; r < nr; ++r) {
+            const float * xr = x + r*n_per_row + QK_UDNL_MX*i;
+            float sumx2 = 0;
+            for (int j = 0; j < QK_UDNL_MX; ++j) {
+                const float f = xr[j];
+                xs[r][j] = isfinite(f) && fabsf(f) <= Q3_R_SANITIZE_MAX ? f : 0.0f;
+                sumx2 += xs[r][j]*xs[r][j];
+            }
+            if (quant_weights) {
+                const float sigma2 = 2*sumx2/QK_UDNL_MX;
+                const float * qw = quant_weights + r*n_per_row + QK_UDNL_MX*i;
+                for (int j = 0; j < QK_UDNL_MX/32; ++j) {
+                    for (int v = 0; v < 32; ++v) {
+                        wt[r][j][v] = qw[32*j + v]*sqrtf(sigma2 + xs[r][32*j + v]*xs[r][32*j + v]);
+                    }
+                }
+            }
+        }
+
+        // per (row, group, mode) candidate step + panel-summed error
+        float step[16][8][3];
+        float E[8][3] = {};
+        for (int64_t r = 0; r < nr; ++r) {
+            for (int g = 0; g < 8; ++g) {
+                const float * wtg = quant_weights ? wt[r][g] : NULL;
+                for (int m = 0; m < 3; ++m) {
+                    const float e = udnl_mx_group_eval(&xs[r][32*g], wtg, m + 1, &step[r][g][m]);
+                    E[g][m] += e;
+                }
+            }
+        }
+
+        // DP over groups with an exact payload budget of 24 4-byte units
+        // (costs 2/3/4 for W2/W3/W4; exactly 24 units == 96 bytes)
+        float  dp[9][25];
+        int8_t choice[9][25];
+        for (int g = 0; g < 9; ++g) {
+            for (int b = 0; b < 25; ++b) { dp[g][b] = INFINITY; choice[g][b] = 0; }
+        }
+        dp[0][0] = 0;
+        for (int g = 1; g <= 8; ++g) {
+            for (int b = 0; b <= 24; ++b) {
+                for (int m = 1; m <= 3; ++m) {
+                    const int u = udnl_mx_units[m];
+                    if (b >= u && dp[g-1][b-u] + E[g-1][m-1] < dp[g][b]) {
+                        dp[g][b]      = dp[g-1][b-u] + E[g-1][m-1];
+                        choice[g][b]  = (int8_t) m;
+                    }
+                }
+            }
+        }
+        int      mode[8];
+        uint16_t mw = 0;
+        for (int g = 8, b = 24; g >= 1; --g) {
+            mode[g-1] = choice[g][b] > 0 ? choice[g][b] : 2; // unreachable; W3 default
+            b        -= udnl_mx_units[mode[g-1]];
+            mw       |= (uint16_t) mode[g-1] << 2*(g-1);
+        }
+
+        for (int64_t r = 0; r < nr; ++r) {
+            block_udnl_mx * blk = y + r*nb + i;
+            blk->modes = mw;
+            float ext_max = 0;
+            for (int g = 0; g < 8; ++g) {
+                if (ext_max < step[r][g][mode[g]-1]) ext_max = step[r][g][mode[g]-1];
+            }
+            if (ext_max < GROUP_MAX_EPS) { // all zero
+                // zero srel/qs separately: a single memset spanning both
+                // would clobber blk->modes (it sits between them in the
+                // struct) and break the panel-shared mode word
+                memset(blk->srel, 0, sizeof(blk->srel));
+                memset(blk->qs,   0, sizeof(blk->qs));
+                blk->d     = GGML_FP32_TO_FP16(0.f);
+                blk->modes = mw;
+                continue;
+            }
+            blk->d = GGML_FP32_TO_FP16(ext_max/255);
+            const float df = GGML_FP16_TO_FP32(blk->d);
+
+            int off = 0;
+            for (int g = 0; g < 8; ++g) {
+                const int m = mode[g];
+                const float st = step[r][g][m-1];
+                const int s = st > 0 ? MIN(255, MAX(1, nearest_int(st/df))) : 0;
+                blk->srel[g] = (uint8_t) s;
+                const float dj = df*s;
+                const int8_t * cb  = udnl_mx_codebook[m];
+                const int      ncb = udnl_mx_ncb[m];
+                const float *  wtg = quant_weights ? wt[r][g] : NULL;
+                uint8_t L[32];
+                for (int v = 0; v < 32; ++v) {
+                    int best = 0;
+                    if (s > 0) {
+                        const float wv = xs[r][32*g + v];
+                        const float t  = wv/dj;
+                        float bd = INFINITY;
+                        for (int c = 0; c < ncb; ++c) {
+                            const float d = fabsf(t - (float) cb[c]);
+                            if (d < bd) { bd = d; best = c; }
+                        }
+                        if (wtg) { // local search over the two neighbours
+                            float be = wtg[v]*(wv - dj*cb[best])*(wv - dj*cb[best]);
+                            for (int q = MAX(0, best - 1); q <= MIN(ncb - 1, best + 1); ++q) {
+                                const float e = wtg[v]*(wv - dj*cb[q])*(wv - dj*cb[q]);
+                                if (e < be) { be = e; best = q; }
+                            }
+                        }
+                    }
+                    L[v] = (uint8_t) best;
+                }
+                uint8_t * qs = blk->qs + off;
+                if (m == 3) {          // W4: nibble pairs
+                    for (int v = 0; v < 16; ++v) {
+                        qs[v] = (uint8_t) (L[2*v] | (L[2*v + 1] << 4));
+                    }
+                } else if (m == 2) {   // W3: low2 plane (8 B) + high1 plane (4 B)
+                    for (int j = 0; j < 8; ++j) {
+                        qs[j] = (uint8_t) ((L[4*j] & 3) | ((L[4*j+1] & 3) << 2) | ((L[4*j+2] & 3) << 4) | ((L[4*j+3] & 3) << 6));
+                    }
+                    for (int j = 0; j < 4; ++j) {
+                        uint8_t hb = 0;
+                        for (int v = 0; v < 8; ++v) {
+                            hb |= (uint8_t) (((L[8*j + v] >> 2) & 1) << v);
+                        }
+                        qs[8 + j] = hb;
+                    }
+                } else {               // W2: 2-bit packed
+                    for (int j = 0; j < 8; ++j) {
+                        qs[j] = (uint8_t) (L[4*j] | (L[4*j+1] << 2) | (L[4*j+2] << 4) | (L[4*j+3] << 6));
+                    }
+                }
+                off += udnl_mx_bytes[m];
+            }
+        }
+    }
+}
+
+void quantize_row_udnl_mx_ref(const float * GGML_RESTRICT x, block_udnl_mx * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_UDNL_MX == 0);
+    udnl_mx_quantize_panel(x, y, 1, k, NULL);
+}
+
+void dequantize_row_udnl_mx(const block_udnl_mx * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_UDNL_MX == 0);
+    const int64_t nb = k / QK_UDNL_MX;
+
+    for (int64_t i = 0; i < nb; i++) {
+        const float    d  = GGML_FP16_TO_FP32(x[i].d);
+        const uint16_t mw = x[i].modes;
+        int off = 0;
+        for (int g = 0; g < QK_UDNL_MX/32; ++g) {
+            const int    m  = (mw >> 2*g) & 3;
+            const float  dj = d*x[i].srel[g];
+            const int8_t * cb = udnl_mx_codebook[m > 0 ? m : 1];
+            const uint8_t * qs = x[i].qs + off;
+            if (m == 3) {
+                for (int v = 0; v < 16; ++v) {
+                    y[32*g + 2*v + 0] = dj*(float) cb[qs[v] & 0xf];
+                    y[32*g + 2*v + 1] = dj*(float) cb[qs[v] >>  4];
+                }
+            } else if (m == 2) {
+                for (int v = 0; v < 32; ++v) {
+                    const int idx = ((qs[v/4] >> 2*(v%4)) & 3) | (((qs[8 + v/8] >> (v%8)) & 1) << 2);
+                    y[32*g + v] = dj*(float) cb[idx];
+                }
+            } else { // W2 (also the never-written mode 0: srel == 0 -> zeros)
+                for (int v = 0; v < 32; ++v) {
+                    y[32*g + v] = dj*(float) cb[(qs[v/4] >> 2*(v%4)) & 3];
+                }
+            }
+            off += udnl_mx_bytes[m > 0 ? m : 1];
+        }
+        y += QK_UDNL_MX;
+    }
+}
+
+size_t quantize_udnl_mx(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    const size_t row_size = ggml_row_size(GGML_TYPE_UDNL_MX, n_per_row);
+    int64_t row = 0;
+    for (; row + 16 <= nrow; row += 16) {
+        udnl_mx_quantize_panel(src + row*n_per_row, (block_udnl_mx *) ((char *) dst + row*row_size), 16, n_per_row,
+                quant_weights ? quant_weights + row*n_per_row : NULL);
+    }
+    if (row < nrow) {
+        // tail rows: quantized independently. A tensor whose row count is not a
+        // multiple of 16 never takes the NR16 repack path, so the resulting
+        // non-uniform panel mode words are harmless.
+        for (; row < nrow; ++row) {
+            udnl_mx_quantize_panel(src + row*n_per_row, (block_udnl_mx *) ((char *) dst + row*row_size), 1, n_per_row,
+                    quant_weights ? quant_weights + row*n_per_row : NULL);
         }
     }
     return nrow * row_size;
@@ -5364,10 +5957,11 @@ static bool validate_fp16(ggml_fp16_t f, size_t i) {
 }
 
 static bool validate_e_e8m0(uint8_t e, size_t i) {
-    if (e == 0xff) {
-        fprintf(stderr, "ggml_validate_row_data: found invalid e value %d at block %zu\n", e, i);
-        return false;
-    }
+    // OCP assigns NaN to 0xFF, but ggml_e8m0_to_fp32_half maps it to 2^127 (finite) and
+    // dequantize_row_mxfp4 sanitizes such blocks to zeros, so the byte is accepted here;
+    // real-world MXFP4 files may contain degenerate 0xFF blocks (e.g. never-routed experts)
+    GGML_UNUSED(e);
+    GGML_UNUSED(i);
 
     return true;
 }
@@ -5574,6 +6168,18 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_Q3_K:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_q3_K, data, nb);
+            } break;
+        case GGML_TYPE_Q3_R:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_q3_r, data, nb);
+            } break;
+        case GGML_TYPE_UDNL_W4:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_udnl_w4, data, nb);
+            } break;
+        case GGML_TYPE_UDNL_MX:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_udnl_mx, data, nb);
             } break;
         case GGML_TYPE_Q4_K:
             {

@@ -399,4 +399,14 @@ if (NOT LLAMA_USE_SYSTEM_GGML AND TARGET ggml-cpu)
     add_test(NAME test-repack-iq4-xs-policy-force
         COMMAND ${CMAKE_COMMAND} -E env GGML_REPACK_IQ4_XS=1
             $<TARGET_FILE:test-repack-kernels> --iq4-xs-policy)
+
+    # Slice-0 UD-NL microbench: per-format single-core decode ceiling plus the
+    # W4-NL NR16xK4 prototype kernel (x86-64 only; self-skips without AVX512).
+    if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+        add_executable(test-udnl-w4nl test-udnl-w4nl.cpp)
+        target_link_libraries(test-udnl-w4nl PRIVATE ggml-cpu ggml)
+        target_include_directories(test-udnl-w4nl PRIVATE
+            ${PROJECT_SOURCE_DIR}/ggml/src
+            ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cpu)
+    endif()
 endif()

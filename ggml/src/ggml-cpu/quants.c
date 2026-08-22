@@ -62,6 +62,18 @@ void quantize_row_nvfp4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, i
     quantize_row_nvfp4_ref(x, y, k);
 }
 
+void quantize_row_q3_r(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_q3_r_ref(x, y, k);
+}
+
+void quantize_row_udnl_w4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_udnl_w4_ref(x, y, k);
+}
+
+void quantize_row_udnl_mx(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_udnl_mx_ref(x, y, k);
+}
+
 //
 // 2-6 bit quantization in super-blocks
 //
@@ -322,6 +334,127 @@ void ggml_vec_dot_mxfp4_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, 
             sumi2 += y[ib].qs[j + QK_MXFP4/2] * kvalues_mxfp4[x[ib].qs[j] >>  4];
         }
         sumf += d * (sumi1 + sumi2);
+    }
+    *s = sumf;
+}
+
+void ggml_vec_dot_q3_r_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    assert(n % QK3_R == 0);
+    static_assert(QK3_R % QK8_0 == 0, "QK3_R must be a multiple of QK8_0");
+
+    const block_q3_r * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK3_R;
+
+    float sumf = 0;
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const float d = GGML_CPU_FP16_TO_FP32(x[ib].d);
+        for (int j = 0; j < QK3_R/32; ++j) {
+            const block_q8_0 * GGML_RESTRICT yb = y + QK3_R/QK8_0*ib + j;
+            const uint8_t * qs = x[ib].qs + 12*j;
+            int sumi = 0;
+            for (int v = 0; v < 32; ++v) {
+                const int bit = 3*v;
+                int q = qs[bit/8] >> (bit%8);
+                if (bit%8 > 5) {
+                    q |= qs[bit/8 + 1] << (8 - bit%8);
+                }
+                sumi += ((q & 7) - 4)*yb->qs[v];
+            }
+            sumf += d*x[ib].scales[j]*GGML_CPU_FP16_TO_FP32(yb->d)*(float)sumi;
+        }
+    }
+    *s = sumf;
+}
+
+// UDNL W4 scalar vec_dot: the panel-layout NR16 kernels in repack.cpp are the
+// fast path; this row-wise reference is used when repack is unavailable.
+void ggml_vec_dot_udnl_w4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    assert(n % QK_UDNL_W4 == 0);
+    static_assert(QK_UDNL_W4 % QK8_0 == 0, "QK_UDNL_W4 must be a multiple of QK8_0");
+
+    const block_udnl_w4 * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK_UDNL_W4;
+
+    float sumf = 0;
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const float d = GGML_CPU_FP16_TO_FP32(x[ib].d);
+        for (int j = 0; j < QK_UDNL_W4/32; ++j) {
+            const block_q8_0 * GGML_RESTRICT yb = y + QK_UDNL_W4/QK8_0*ib + j;
+            const uint8_t * qs = x[ib].qs + 16*j;
+            int sumi = 0;
+            for (int v = 0; v < 16; ++v) {
+                sumi += yb->qs[2*v + 0] * kvalues_iq4nl[qs[v] & 0xf];
+                sumi += yb->qs[2*v + 1] * kvalues_iq4nl[qs[v] >>  4];
+            }
+            sumf += d*x[ib].srel[j]*GGML_CPU_FP16_TO_FP32(yb->d)*(float)sumi;
+        }
+    }
+    *s = sumf;
+}
+
+// UDNL_MX scalar vec_dot: row-wise reference for when the NR16 panel repack
+// path is unavailable. Per-KQ mode-dependent decode (W2/W3/W4 codebooks).
+void ggml_vec_dot_udnl_mx_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    assert(n % QK_UDNL_MX == 0);
+    static_assert(QK_UDNL_MX % QK8_0 == 0, "QK_UDNL_MX must be a multiple of QK8_0");
+
+    const block_udnl_mx * GGML_RESTRICT x = vx;
+    const block_q8_0  * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK_UDNL_MX;
+
+    float sumf = 0;
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const float    d  = GGML_CPU_FP16_TO_FP32(x[ib].d);
+        const uint16_t mw = x[ib].modes;
+        int off = 0;
+        for (int j = 0; j < QK_UDNL_MX/32; ++j) {
+            const int m = (mw >> 2*j) & 3;
+            const block_q8_0 * GGML_RESTRICT yb = y + QK_UDNL_MX/QK8_0*ib + j;
+            const uint8_t * qs = x[ib].qs + off;
+            int sumi = 0;
+            if (m == 3) {
+                for (int v = 0; v < 16; ++v) {
+                    sumi += yb->qs[2*v + 0] * kvalues_iq4nl[qs[v] & 0xf];
+                    sumi += yb->qs[2*v + 1] * kvalues_iq4nl[qs[v] >>  4];
+                }
+                off += 16;
+            } else if (m == 2) {
+                for (int v = 0; v < 32; ++v) {
+                    const int idx = ((qs[v/4] >> 2*(v%4)) & 3) | (((qs[8 + v/8] >> (v%8)) & 1) << 2);
+                    sumi += yb->qs[v] * kvalues_udnl3[idx];
+                }
+                off += 12;
+            } else { // W2 (or the never-written mode 0: srel == 0 -> zeros)
+                for (int v = 0; v < 32; ++v) {
+                    sumi += yb->qs[v] * kvalues_udnl2[(qs[v/4] >> 2*(v%4)) & 3];
+                }
+                off += 8;
+            }
+            sumf += d*x[ib].srel[j]*GGML_CPU_FP16_TO_FP32(yb->d)*(float)sumi;
+        }
     }
     *s = sumf;
 }
