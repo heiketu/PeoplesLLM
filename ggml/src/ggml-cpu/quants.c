@@ -74,6 +74,10 @@ void quantize_row_udnl_mx(const float * GGML_RESTRICT x, void * GGML_RESTRICT y,
     quantize_row_udnl_mx_ref(x, y, k);
 }
 
+void quantize_row_e4a(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_e4a_ref(x, y, k);
+}
+
 //
 // 2-6 bit quantization in super-blocks
 //
@@ -403,6 +407,40 @@ void ggml_vec_dot_udnl_w4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const 
                 sumi += yb->qs[2*v + 1] * kvalues_iq4nl[qs[v] >>  4];
             }
             sumf += d*x[ib].srel[j]*GGML_CPU_FP16_TO_FP32(yb->d)*(float)sumi;
+        }
+    }
+    *s = sumf;
+}
+
+// E4A scalar vec_dot: row-wise reference for when the NR16 panel repack path
+// is unavailable. w = kvalues_mxfp4[idx] * 2^(e-128) per 32-weight KQ group.
+void ggml_vec_dot_e4a_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    assert(n % QK_E4A == 0);
+    static_assert(QK_E4A % QK8_0 == 0, "QK_E4A must be a multiple of QK8_0");
+
+    const block_e4a  * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK_E4A;
+
+    float sumf = 0;
+
+    for (int ib = 0; ib < nb; ++ib) {
+        for (int j = 0; j < QK_E4A/32; ++j) {
+            const block_q8_0 * GGML_RESTRICT yb = y + QK_E4A/QK8_0*ib + j;
+            const uint8_t * qs = x[ib].qs + 16*j;
+            int sumi = 0;
+            for (int v = 0; v < 16; ++v) {
+                sumi += yb->qs[2*v + 0] * kvalues_mxfp4[qs[v] & 0xf];
+                sumi += yb->qs[2*v + 1] * kvalues_mxfp4[qs[v] >>  4];
+            }
+            const float d = x[ib].e[j] == 0xff ? 0.0f : GGML_E8M0_TO_FP32_HALF(x[ib].e[j]);
+            sumf += d*GGML_CPU_FP16_TO_FP32(yb->d)*(float)sumi;
         }
     }
     *s = sumf;

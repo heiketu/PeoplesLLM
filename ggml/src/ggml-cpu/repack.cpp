@@ -20,6 +20,7 @@
 #include <cstring>
 #include <cassert>
 #include <cstdio>  // for GGML_ASSERT
+#include <cstdlib> // getenv/atoi/atexit
 #include <type_traits>
 
 #include "repack.h"
@@ -44,6 +45,67 @@ static bool ggml_repack_fp16_intermediate_enabled() {
         return e != nullptr && atoi(e) != 0;
     }();
     return enabled;
+}
+
+// opt-in MoE expert hit statistics (GGML_MOE_HOT_STATS=1, default off): counts each
+// (token, selected-expert) pair once per layer via the gate projection's mul_mat_id
+// ids and dumps "layer\texpert\thits" to GGML_MOE_HOT_STATS_PATH
+// (default /tmp/expert-hot.tsv) at exit. Measurement/diagnostic only.
+#define GGML_MOE_HOT_MAX_LAYERS  128
+#define GGML_MOE_HOT_MAX_EXPERTS 1024
+
+static std::atomic<uint64_t> ggml_moe_hot_hits[GGML_MOE_HOT_MAX_LAYERS][GGML_MOE_HOT_MAX_EXPERTS];
+
+static void ggml_moe_hot_stats_dump() {
+    const char * path = getenv("GGML_MOE_HOT_STATS_PATH");
+    if (path == nullptr) {
+        path = "/tmp/expert-hot.tsv";
+    }
+    FILE * f = fopen(path, "w");
+    if (f == nullptr) {
+        return;
+    }
+    for (int l = 0; l < GGML_MOE_HOT_MAX_LAYERS; ++l) {
+        for (int e = 0; e < GGML_MOE_HOT_MAX_EXPERTS; ++e) {
+            const uint64_t h = ggml_moe_hot_hits[l][e].load(std::memory_order_relaxed);
+            if (h > 0) {
+                fprintf(f, "%d\t%d\t%llu\n", l, e, (unsigned long long) h);
+            }
+        }
+    }
+    fclose(f);
+}
+
+static bool ggml_moe_hot_stats_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_MOE_HOT_STATS");
+        const bool on = e != nullptr && atoi(e) != 0;
+        if (on) {
+            atexit(ggml_moe_hot_stats_dump);
+        }
+        return on;
+    }();
+    return enabled;
+}
+
+// src0_name: e.g. "blk.12.ffn_gate_exps.weight"; only the gate projection is counted
+// so each (token, expert) selection contributes exactly one hit per layer.
+static void ggml_moe_hot_stats_count(const char * src0_name, const ggml_tensor * ids, int n_ids, int n_as) {
+    int layer = -1;
+    if (sscanf(src0_name, "blk.%d.ffn_gate_exps.weight", &layer) != 1 ||
+        layer < 0 || layer >= GGML_MOE_HOT_MAX_LAYERS) {
+        return;
+    }
+    auto * hits = ggml_moe_hot_hits[layer];
+    for (int32_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
+        for (int32_t id = 0; id < n_ids; ++id) {
+            const int32_t i02 =
+                *(const int32_t *) ((const char *) ids->data + iid1 * ids->nb[1] + id * ids->nb[0]);
+            if (i02 >= 0 && i02 < n_as && i02 < GGML_MOE_HOT_MAX_EXPERTS) {
+                hits[i02].fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
 }
 
 // quantize one f16 activation row to q8_0; same amax/round-to-nearest-even scheme as
@@ -3356,6 +3418,64 @@ void ggml_gemm_udnl_w4_1x16_q8_0_generic(int n, float * GGML_RESTRICT s, size_t 
     ggml_gemv_udnl_w4_1x16_q8_0_generic(n, s, bs, vx, vy, nr, nc);
 }
 
+// E4A 1x16 panel layout (NR16 x K4): UDNL_W4's layout minus the fp16 d tail.
+// Per (panel, 256-K block): 8 x [payload 256B | e 16B] = 2176 B
+// (= 16 x sizeof(block_e4a): repack is a pure byte rearrangement; the payload
+// byte mapping is identical to UDNL_W4's above). w = kvalues_mxfp4[idx] *
+// 2^(e-128); e == 0xFF (OCP NaN, never-routed experts) decodes to zero.
+
+static float ggml_e4a_dot_q8_0_panel_row_generic(const uint8_t * GGML_RESTRICT pb, int nb, int r,
+                                                 const block_q8_0 * GGML_RESTRICT a_ptr) {
+    float sumf = 0;
+    const int l = r/4, i = r%4;
+    for (int b = 0; b < nb; ++b, pb += E4A_PB) {
+        for (int g = 0; g < 8; ++g) {
+            const uint8_t * pl = pb + (256 + 16)*g;
+            const uint8_t e = pl[256 + r];
+            const block_q8_0 * GGML_RESTRICT ab = a_ptr + 8*b + g;
+            int sumi = 0;
+            for (int s = 0; s < 4; ++s) {
+                for (int q = 0; q < 2; ++q) {
+                    const uint8_t b0 = pl[64*s + 16*l + 2*i + q];
+                    const uint8_t b1 = pl[64*s + 16*l + 8 + 2*i + q];
+                    const int j = 8*s + 2*q;
+                    sumi += ab->qs[j + 0]*kvalues_mxfp4[b0 & 0xF];
+                    sumi += ab->qs[j + 1]*kvalues_mxfp4[b0 >>  4];
+                    sumi += ab->qs[j + 4]*kvalues_mxfp4[b1 & 0xF];
+                    sumi += ab->qs[j + 5]*kvalues_mxfp4[b1 >>  4];
+                }
+            }
+            const float d = e == 0xff ? 0.0f : GGML_E8M0_TO_FP32_HALF(e);
+            sumf += d*GGML_CPU_FP16_TO_FP32(ab->d)*(float)sumi;
+        }
+    }
+    return sumf;
+}
+
+void ggml_gemv_e4a_1x16_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+    assert(n % QK_E4A == 0);
+    assert(nc % 16 == 0);
+
+    const int nb = n / QK_E4A;
+
+    const uint8_t * w_ptr      = (const uint8_t *) vx;
+    const size_t    a_row_size = (size_t)(n/QK8_0)*sizeof(block_q8_0);
+    for (int y = 0; y < nr; y++) {
+        const block_q8_0 * a_ptr = (const block_q8_0 *)((const char *) vy + y*a_row_size);
+        for (int p = 0; p < nc/16; p++) {
+            const uint8_t * pb = w_ptr + (int64_t)p*nb*E4A_PB;
+            for (int r = 0; r < 16; r++) {
+                s[y*bs + 16*p + r] = ggml_e4a_dot_q8_0_panel_row_generic(pb, nb, r, a_ptr);
+            }
+        }
+    }
+}
+
+void ggml_gemm_e4a_1x16_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+    assert(nr % 4 == 0);
+    ggml_gemv_e4a_1x16_q8_0_generic(n, s, bs, vx, vy, nr, nc);
+}
+
 // UDNL_MX 1x16 panel layout (NR16; see ggml-common.h UDNL_MX_PB): per (panel,
 // 256-K block) 8 x [payload_g (128/192/256B by the shared mode) | srel 16B] +
 // d[16] fp16 at offset 1664 + modes u16 at 1696 + 30B pad = 1728 B.
@@ -5653,6 +5773,51 @@ template <> int repack<block_udnl_w4, 1, 16>(struct ggml_tensor * t, const void 
     GGML_UNUSED(data_size);
 }
 
+// E4A: row blocks -> NR16xK4 panel layout (see the layout comment above
+// ggml_gemv_e4a_1x16_q8_0_generic). Pure byte rearrangement: the panel stream
+// is exactly 16 x sizeof(block_e4a) per (panel, 256-K block).
+template <> int repack<block_e4a, 1, 16>(struct ggml_tensor * t, const void * data, size_t data_size) {
+    GGML_ASSERT(t->type == GGML_TYPE_E4A);
+
+    const block_e4a * src = (const block_e4a *) data;
+    uint8_t *       dst = (uint8_t *) t->data;
+
+    const int64_t nrow    = ggml_nrows(t);
+    const int64_t nblocks = t->ne[0] / QK_E4A;
+
+    GGML_ASSERT(data_size == (size_t) nrow * nblocks * sizeof(block_e4a));
+
+    if (nrow % 16 != 0) {
+        return -1;
+    }
+
+    for (int64_t p = 0; p < nrow/16; ++p) {
+        for (int64_t b = 0; b < nblocks; ++b) {
+            uint8_t * pb = dst + (p*nblocks + b)*E4A_PB;
+            for (int r = 0; r < 16; ++r) {
+                const block_e4a * blk = src + (16*p + r)*nblocks + b;
+                const int l = r/4, i = r%4;
+                for (int g = 0; g < 8; ++g) {
+                    uint8_t * pl = pb + (256 + 16)*g;
+                    pl[256 + r] = blk->e[g];
+                    const uint8_t * qs = blk->qs + 16*g;
+                    // nibble pairs line up: row byte 4s+q already holds
+                    // idx(8s+2q)|idx(8s+2q+1)<<4 — a pure byte gather
+                    for (int s = 0; s < 4; ++s) {
+                        pl[64*s + 16*l + 2*i + 0]     = qs[4*s + 0];
+                        pl[64*s + 16*l + 2*i + 1]     = qs[4*s + 1];
+                        pl[64*s + 16*l + 8 + 2*i + 0] = qs[4*s + 2];
+                        pl[64*s + 16*l + 8 + 2*i + 1] = qs[4*s + 3];
+                    }
+                }
+            }
+        }
+    }
+    return 0;
+
+    GGML_UNUSED(data_size);
+}
+
 // UDNL_MX: row blocks -> NR16 panel layout (see the layout comment above
 // ggml_gemv_udnl_mx_1x16_q8_0_generic). Byte-count preserving
 // (UDNL_MX_PB = 16 x sizeof(block_udnl_mx)); the 16 duplicate row mode words
@@ -5878,6 +6043,10 @@ template <> void gemv<block_udnl_mx, 1, 16, GGML_TYPE_Q8_0>(int n, float * s, si
     ggml_gemv_udnl_mx_1x16_q8_0(n, s, bs, vx, vy, nr, nc);
 }
 
+template <> void gemv<block_e4a, 1, 16, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemv_e4a_1x16_q8_0(n, s, bs, vx, vy, nr, nc);
+}
+
 template <> void gemv<block_q8_0, 4, 4, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
     ggml_gemv_q8_0_4x4_q8_0(n, s, bs, vx, vy, nr, nc);
 }
@@ -6017,6 +6186,10 @@ template <> void gemm<block_udnl_w4, 1, 16, GGML_TYPE_Q8_0>(int n, float * s, si
 
 template <> void gemm<block_udnl_mx, 1, 16, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
     ggml_gemm_udnl_mx_1x16_q8_0(n, s, bs, vx, vy, nr, nc);
+}
+
+template <> void gemm<block_e4a, 1, 16, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
+    ggml_gemm_e4a_1x16_q8_0(n, s, bs, vx, vy, nr, nc);
 }
 
 template <> void gemm<block_q8_0, 4, 4, GGML_TYPE_Q8_0>(int n, float * s, size_t bs, const void * vx, const void * vy, int nr, int nc) {
@@ -6207,7 +6380,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                                      4*op->src[1]->ne[0]*sizeof(float));
 
                     if constexpr ((std::is_same<BLOC_TYPE, block_udnl_w4>::value ||
-                                   std::is_same<BLOC_TYPE, block_udnl_mx>::value) && PARAM_TYPE == GGML_TYPE_Q8_0) {
+                                   std::is_same<BLOC_TYPE, block_udnl_mx>::value ||
+                                   std::is_same<BLOC_TYPE, block_e4a>::value) && PARAM_TYPE == GGML_TYPE_Q8_0) {
                         // Hoisted UDNL activation records (see forward_mul_mat_id):
                         // one udnl_w4_arec per q8_0 block per src1 row, shared by all
                         // threads (laid out after the row-claim region), plus one tile
@@ -6604,7 +6778,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         // gathered q8 rows and calls the weight-panel-stationary arec gemm, so
         // the kernels never rebuild asum/dy per claim.
         constexpr bool mmid_arec = (std::is_same<BLOC_TYPE, block_udnl_w4>::value ||
-                                    std::is_same<BLOC_TYPE, block_udnl_mx>::value) && PARAM_TYPE == GGML_TYPE_Q8_0;
+                                    std::is_same<BLOC_TYPE, block_udnl_mx>::value ||
+                                    std::is_same<BLOC_TYPE, block_e4a>::value) && PARAM_TYPE == GGML_TYPE_Q8_0;
         const int64_t anb = ne00/QK8_0; // q8_0 blocks per src1 row
         const size_t  arec_all_bytes = mmid_arec ? (size_t) ne11*ne12*anb*sizeof(udnl_w4_arec) : 0;
 
@@ -6698,6 +6873,18 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 #define MMID_MATRIX_ROW(row_id, i1) matrix_rows[matrix_row_offsets[(row_id)] + (i1)]
 
         if (ith == 0) {
+            // Slice 12 (GGML_HOT_EXPERT=1): hot-expert slots are masked to
+            // out-of-range sentinel ids by llama_hot_expert_mask_ids_cb. Skip
+            // them here (their expert weights are resident on GPU and must not
+            // be read from DRAM) and zero their dst columns so they contribute
+            // exactly 0 downstream.
+            static const bool hot_expert_sentinels = []() {
+                const char * e = getenv("GGML_HOT_EXPERT");
+                return e && atoi(e) != 0;
+            }();
+            int64_t n_skipped = 0;
+            int32_t skipped[2*256] = {0}; // (slot, token) pairs; hot-path uses n_tokens == 1
+
             memset(matrix_row_counts, 0, n_as * sizeof(int64_t));
 
             // First count each expert, then prefix-sum into a compact row map. This
@@ -6707,6 +6894,14 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                     const int32_t i02 =
                         *(const int32_t *) ((const char *) ids->data + iid1 * ids->nb[1] + id * ids->nb[0]);
 
+                    if (hot_expert_sentinels && (i02 < 0 || i02 >= n_as)) {
+                        if (n_skipped < (int64_t) (sizeof(skipped)/sizeof(skipped[0]))/2) {
+                            skipped[2*n_skipped]   = id;
+                            skipped[2*n_skipped+1] = iid1;
+                            n_skipped++;
+                        }
+                        continue;
+                    }
                     GGML_ASSERT(i02 >= 0 && i02 < n_as);
                     matrix_row_counts[i02] += 1;
                 }
@@ -6717,16 +6912,28 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                 matrix_row_offsets[cur_a + 1] = matrix_row_offsets[cur_a] + matrix_row_counts[cur_a];
                 matrix_row_cursors[cur_a] = 0;
             }
-            GGML_ASSERT(matrix_row_offsets[n_as] == n_selected);
+            GGML_ASSERT(matrix_row_offsets[n_as] <= n_selected);
+
+            if (ggml_moe_hot_stats_enabled()) {
+                ggml_moe_hot_stats_count(src0->name, ids, n_ids, n_as);
+            }
 
             for (int32_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
                 for (int32_t id = 0; id < n_ids; ++id) {
                     const int32_t i02 =
                         *(const int32_t *) ((const char *) ids->data + iid1 * ids->nb[1] + id * ids->nb[0]);
+                    if (hot_expert_sentinels && (i02 < 0 || i02 >= n_as)) {
+                        continue;
+                    }
                     MMID_MATRIX_ROW(i02, matrix_row_cursors[i02]++) = { id, iid1 };
                 }
             }
 
+            // zero the dst columns of skipped (slot, token) pairs
+            for (int64_t i = 0; i < n_skipped; ++i) {
+                char * dst_col = (char *) op->data + skipped[2*i] * op->nb[1] + skipped[2*i+1] * op->nb[2];
+                memset(dst_col, 0, op->ne[0] * sizeof(float));
+            }
         }
 
         // NUMA expert parallelism (GGML_NUMA_EP): every expert's rows are split into
@@ -6864,6 +7071,9 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                     if constexpr (std::is_same<BLOC_TYPE, block_udnl_mx>::value) {
                         ggml_gemm_udnl_mx_1x16_q8_0_arec(ne00, dst_tile, ncols,
                                                          src0_cur + ws*nb01, vy_scratch, arec_tile, tr, ncols);
+                    } else if constexpr (std::is_same<BLOC_TYPE, block_e4a>::value) {
+                        ggml_gemm_e4a_1x16_q8_0_arec(ne00, dst_tile, ncols,
+                                                     src0_cur + ws*nb01, vy_scratch, arec_tile, tr, ncols);
                     } else {
                         ggml_gemm_udnl_w4_1x16_q8_0_arec(ne00, dst_tile, ncols,
                                                          src0_cur + ws*nb01, vy_scratch, arec_tile, tr, ncols);
@@ -6926,6 +7136,9 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                     if constexpr (std::is_same<BLOC_TYPE, block_udnl_mx>::value) {
                         ggml_gemv_udnl_mx_1x16_q8_0_arec(ne00, dst_tile, ncols,
                                                          src0_cur + ws*nb01, vy_scratch, arec_tile, tr, ncols);
+                    } else if constexpr (std::is_same<BLOC_TYPE, block_e4a>::value) {
+                        ggml_gemv_e4a_1x16_q8_0_arec(ne00, dst_tile, ncols,
+                                                     src0_cur + ws*nb01, vy_scratch, arec_tile, tr, ncols);
                     } else {
                         ggml_gemv_udnl_w4_1x16_q8_0_arec(ne00, dst_tile, ncols,
                                                          src0_cur + ws*nb01, vy_scratch, arec_tile, tr, ncols);
@@ -6958,6 +7171,9 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                     if constexpr (std::is_same<BLOC_TYPE, block_udnl_mx>::value) {
                         ggml_gemv_udnl_mx_1x16_q8_0_arec(ne00, dst_row, ne01,
                                                          src0_cur + ws*nb01, src1_col, rec_row, 1, ncols);
+                    } else if constexpr (std::is_same<BLOC_TYPE, block_e4a>::value) {
+                        ggml_gemv_e4a_1x16_q8_0_arec(ne00, dst_row, ne01,
+                                                     src0_cur + ws*nb01, src1_col, rec_row, 1, ncols);
                     } else {
                         ggml_gemv_udnl_w4_1x16_q8_0_arec(ne00, dst_row, ne01,
                                                          src0_cur + ws*nb01, src1_col, rec_row, 1, ncols);
@@ -7618,6 +7834,22 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
         if (udnl_mx_repack_enabled && ggml_cpu_has_avx512() && ggml_cpu_has_avx512_vnni() && ggml_cpu_has_avx512_vbmi()) {
             if (cur->ne[1] % 16 == 0) {
                 return &udnl_mx_1x16_q8_0;
+            }
+        }
+    } else if (cur->type == GGML_TYPE_E4A) {
+        // E4A repack is a pure byte rearrangement into NR16xK4 panels
+        // (E4A_PB = 16 x sizeof(block_e4a)). The hot gemv/gemm kernels need
+        // AVX512F+BW (vpshufb/vpunpck) + VNNI (vpdpbusd); no VBMI. On anything
+        // older the scalar row-major vec_dot path is used instead.
+        // GGML_REPACK_E4A=0 forces that fallback (A/B knob).
+        static const bool e4a_repack_enabled = []() {
+            const char * e = getenv("GGML_REPACK_E4A");
+            return !e || atoi(e) != 0;
+        }();
+        static const ggml::cpu::repack::tensor_traits<block_e4a, 1, 16, GGML_TYPE_Q8_0> e4a_1x16_q8_0;
+        if (e4a_repack_enabled && ggml_cpu_has_avx512() && ggml_cpu_has_avx512_vnni()) {
+            if (cur->ne[1] % 16 == 0) {
+                return &e4a_1x16_q8_0;
             }
         }
     } else if (cur->type == GGML_TYPE_Q8_0) {

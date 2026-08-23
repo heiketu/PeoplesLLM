@@ -1773,6 +1773,76 @@ size_t quantize_udnl_w4(const float * GGML_RESTRICT src, void * GGML_RESTRICT ds
     return nrow * row_size;
 }
 
+// ====================== E4A (E2M1x2 + per-KQ E8M0)
+//
+// Bit-exact NR16-panel container for native MXFP4 weights: same E2M1x2 grid
+// (kvalues_mxfp4 code order) and the same per-32 E8M0 exponent rule as
+// quantize_row_mxfp4_ref, stored in the UDNL nibble pairing (group byte j =
+// code(2j) | code(2j+1)<<4) so the panel repack is a pure byte rearrangement.
+
+void quantize_row_e4a_ref(const float * GGML_RESTRICT x, block_e4a * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_E4A == 0);
+
+    const int64_t nb = k / QK_E4A;
+
+    for (int64_t i = 0; i < nb; ++i) {
+        for (int j = 0; j < QK_E4A/32; ++j) {
+            const float * xg = x + i*QK_E4A + 32*j;
+
+            float amax = 0.0f;
+            for (int v = 0; v < 32; ++v) {
+                if (amax < fabsf(xg[v])) {
+                    amax = fabsf(xg[v]);
+                }
+            }
+
+            const uint8_t e = amax > 0.0f ? (uint8_t) (floorf(log2f(amax)) - 2 + 127) : 0;
+            const float   d = GGML_E8M0_TO_FP32_HALF(e);
+
+            y[i].e[j] = e;
+
+            uint8_t * qs = y[i].qs + 16*j;
+            for (int v = 0; v < 16; ++v) {
+                const uint8_t x0 = best_index_mxfp4(xg[2*v + 0], d);
+                const uint8_t x1 = best_index_mxfp4(xg[2*v + 1], d);
+                qs[v] = (uint8_t) (x0 | (x1 << 4));
+            }
+        }
+    }
+}
+
+void dequantize_row_e4a(const block_e4a * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_E4A == 0);
+
+    const int64_t nb = k / QK_E4A;
+
+    for (int64_t i = 0; i < nb; ++i) {
+        for (int j = 0; j < QK_E4A/32; ++j) {
+            float * yg = y + i*QK_E4A + 32*j;
+            // 0xFF is the OCP E8M0 NaN encoding (never-routed experts in the
+            // wild); dequantize such groups to zeros like dequantize_row_mxfp4
+            if (x[i].e[j] == 0xff) {
+                memset(yg, 0, 32*sizeof(float));
+                continue;
+            }
+            const float d = GGML_E8M0_TO_FP32_HALF(x[i].e[j]);
+            const uint8_t * qs = x[i].qs + 16*j;
+            for (int v = 0; v < 16; ++v) {
+                yg[2*v + 0] = kvalues_mxfp4[qs[v] & 0x0F]*d;
+                yg[2*v + 1] = kvalues_mxfp4[qs[v] >>   4]*d;
+            }
+        }
+    }
+}
+
+size_t quantize_e4a(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    // no imatrix weighting (bit-exact MXFP4 container); quant_weights is ignored
+    GGML_UNUSED(quant_weights);
+    quantize_row_e4a_ref(src, dst, (int64_t)nrow*n_per_row);
+    const size_t row_size = ggml_row_size(GGML_TYPE_E4A, n_per_row);
+    return nrow * row_size;
+}
+
 // ====================== UDNL_MX mixed W2/W3/W4
 //
 // Per-KQ mixed-width codebook quantization: each of the 8 KQ groups (32
@@ -6180,6 +6250,14 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_UDNL_MX:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_udnl_mx, data, nb);
+            } break;
+        case GGML_TYPE_E4A:
+            {
+                // E8M0 exponents and 4-bit payload are raw u8 — every byte
+                // value decodes to a finite weight (0xFF groups emit zeros
+                // in dequantize_row_e4a)
+                GGML_UNUSED(data);
+                GGML_UNUSED(nb);
             } break;
         case GGML_TYPE_Q4_K:
             {

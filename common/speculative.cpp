@@ -2619,6 +2619,13 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
     }
 }
 
+// Slice 7: per-call profiling of the speculative pipeline stages (env-gated).
+// Emits "SPC_PROF kind=<proc|draft> t_us=<ts> dur_us=<d> n_tokens=<n>" to stderr.
+static bool spc_prof_enabled() {
+    static const bool enabled = getenv("LLAMA_SPC_PROF") != nullptr;
+    return enabled;
+}
+
 bool common_speculative_process(common_speculative * spec, const llama_batch & batch) {
     bool result = true;
 
@@ -2626,8 +2633,16 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
         return result;
     }
 
+    const bool prof = spc_prof_enabled();
+
     for (auto & impl : spec->impls) {
+        const int64_t t0 = prof ? ggml_time_us() : 0;
         result = result && impl->process(batch);
+        if (prof) {
+            const int64_t t1 = ggml_time_us();
+            fprintf(stderr, "SPC_PROF kind=proc t_us=%lld dur_us=%lld n_tokens=%d\n",
+                    (long long) t1, (long long) (t1 - t0), (int) batch.n_tokens);
+        }
     }
 
     return result;
@@ -2659,8 +2674,15 @@ void common_speculative_draft(common_speculative * spec) {
     for (auto & impl : spec->impls) {
         {
             common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
+            const bool prof = spc_prof_enabled();
+            const int64_t t0 = prof ? ggml_time_us() : 0;
             impl->draft(dparams);
             impl->n_call_draft++;
+            if (prof) {
+                const int64_t t1 = ggml_time_us();
+                fprintf(stderr, "SPC_PROF kind=draft t_us=%lld dur_us=%lld\n",
+                        (long long) t1, (long long) (t1 - t0));
+            }
         }
 
         int n_drafting = 0;

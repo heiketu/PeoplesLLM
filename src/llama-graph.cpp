@@ -12,6 +12,7 @@
 #include "llama-kv-cache-msa.h"
 #include "llama-kv-cache-dsv4.h"
 #include "llama-layer-major.h"
+#include "llama-hot-expert.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
@@ -2564,6 +2565,75 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_tensor * repeated = ggml_repeat_4d(ctx0, cur, n_embd, n_expert_used, n_tokens, 1);
         cur = ggml_mul(ctx0, repeated, weights);
         cb(cur, "ffn_moe_weighted", il);
+    }
+
+    // Slice 12: hot-expert GPU fork (GGML_HOT_EXPERT=1). The GPU route computes
+    // the top-K hot experts on a side device from within the graph (custom ops,
+    // backend event join — no scheduler splits); the CPU chain below computes
+    // only the cold slots (hot ids masked to a sentinel that the repack mmid
+    // skips and zeroes), so hot expert weights are never read from DRAM.
+    const bool hot_expert_ok = il >= 0 && !cparams.warmup &&
+        n_tokens <= llama_hot_expert_max_tokens() && llama_hot_expert_layer_active(il) &&
+        !weight_before_ffn && type_op == LLM_FFN_SILU && gate_exps && up_exps && down_exps && !gate_up_exps &&
+        gate_exps->type == GGML_TYPE_MXFP4 && up_exps->type == GGML_TYPE_MXFP4 && down_exps->type == GGML_TYPE_MXFP4 &&
+        !up_exps_b && !gate_exps_b && !down_exps_b && !gate_up_exps_b &&
+        !up_exps_s && !gate_exps_s && !down_exps_s && loras->empty() &&
+        !int8_island && !fp16_island && moe_input == cur;
+
+    if (hot_expert_ok) {
+        void * ud = llama_hot_expert_userdata(il);
+
+        // dispatch the GPU hot-expert FFN asynchronously; the CPU backend runs
+        // nodes in creation order with barriers between them, so this returns
+        // before the cold chain below starts
+        ggml_tensor * send = ggml_map_custom3(ctx0, cur, selected_experts, weights,
+                llama_hot_expert_send_cb, 1, ud);
+        ggml_build_forward_expand(gf, send);
+
+        // cold ids: hot slots masked to the sentinel (n_expert)
+        ggml_tensor * ids_cold = ggml_map_custom1(ctx0, selected_experts,
+                llama_hot_expert_mask_ids_cb, 1, ud);
+        ggml_build_forward_expand(gf, ids_cold);
+
+        // same chain as the classic path, on the cold slots only
+        ggml_tensor * up_c   = build_lora_mm_id(up_exps,   cur, ids_cold, nullptr); // [n_ff, k, n_tokens]
+        ggml_tensor * gate_c = build_lora_mm_id(gate_exps, cur, ids_cold, nullptr);
+
+        const float limit = hparams.swiglu_clamp_exp[il];
+        constexpr float eps = 1e-6f;
+        ggml_tensor * act_c = nullptr;
+        if (limit > eps) {
+            up_c   = ggml_clamp(ctx0, up_c, -limit, limit);
+            gate_c = ggml_clamp(ctx0, gate_c, -INFINITY, limit);
+            act_c  = ggml_swiglu_split(ctx0, gate_c, up_c);
+        } else {
+            act_c  = ggml_swiglu_split(ctx0, gate_c, up_c);
+        }
+
+        ggml_tensor * experts_c = build_lora_mm_id(down_exps, act_c, ids_cold, nullptr); // [n_embd, k, n_tokens]
+        experts_c = ggml_mul(ctx0, experts_c, weights);
+        cb(experts_c, "ffn_moe_down", il);
+        ggml_build_forward_expand(gf, experts_c);
+
+        // cold partial: ascending slot adds; masked slots are exact zeros from
+        // the mmid, so this is bit-identical to the baseline cold contribution
+        ggml_tensor * moe_out = ggml_view_2d(ctx0, experts_c, n_embd, n_tokens,
+                experts_c->nb[2], 0);
+        ggml_build_forward_expand(gf, moe_out);
+        for (uint32_t i = 1; i < hparams.n_expert_used; ++i) {
+            ggml_tensor * v = ggml_view_2d(ctx0, experts_c, n_embd, n_tokens,
+                    experts_c->nb[2], i * experts_c->nb[1]);
+            moe_out = ggml_add(ctx0, moe_out, v);
+            ggml_build_forward_expand(gf, moe_out);
+        }
+
+        // join: wait for the GPU partial (event) and add it
+        ggml_tensor * merged = ggml_map_custom2(ctx0, send, moe_out,
+                llama_hot_expert_merge_cb, 1, ud);
+        cb(merged, "ffn_moe_out", il);
+        ggml_build_forward_expand(gf, merged);
+
+        return ggml_reshape_2d(ctx0, merged, n_embd, n_tokens);
     }
 
     ggml_tensor * up = nullptr;

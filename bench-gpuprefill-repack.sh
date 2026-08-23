@@ -5,10 +5,11 @@
 #   16K dense  sum 4.091932428195e+05 top1 738
 #   16K sparse sum 4.081505154114e+05 top1 738
 #   2K  dense  sum 2.972226317873e+05 top1 223
+# H2 修复（2026-08-23）：WT 原指向 ../llama-gpuprefill worktree（已不存在），改指本仓库根。
 set -x
 LOCK=/tmp/xllama-bench.lock
 MODEL_MX=/media/heiketu/2922DB6548C1F185/DeepSeek-V4-Flash-Q4-mxfp4-0731.gguf
-WT=/home/heiketu/x-llama.cpp/llama-gpuprefill
+WT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 OUT=/tmp/gpuprefill-repack
 mkdir -p "$OUT"
 

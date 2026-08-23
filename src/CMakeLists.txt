@@ -20,6 +20,7 @@ add_library(llama
             llama-grammar.cpp
             llama-graph.cpp
             llama-hparams.cpp
+            llama-hot-expert.cpp
             llama-impl.cpp
             llama-io.cpp
             llama-layer-major.cpp

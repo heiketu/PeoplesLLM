@@ -400,6 +400,7 @@ static ggml_type tensor_type_fallback(quantize_state_impl & qs, const ggml_tenso
             case GGML_TYPE_Q3_R:    return_type = GGML_TYPE_Q8_0;   break;
             case GGML_TYPE_UDNL_W4: return_type = GGML_TYPE_Q8_0;   break;
             case GGML_TYPE_UDNL_MX: return_type = GGML_TYPE_Q8_0;   break;
+            case GGML_TYPE_E4A:     return_type = GGML_TYPE_Q8_0;   break;
             case GGML_TYPE_Q4_K:    return_type = GGML_TYPE_Q5_0;   break;
             case GGML_TYPE_Q5_K:    return_type = GGML_TYPE_Q5_1;   break;
             case GGML_TYPE_Q6_K:    return_type = GGML_TYPE_Q8_0;   break;

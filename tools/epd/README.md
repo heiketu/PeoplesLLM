@@ -122,7 +122,7 @@ target embedding/output，不能把 draft 与 target scheduler 的 device list �
 只在输入/最终 logits 边界跨卡，43 层 target 与 target KV 不跨层搬运。当前
 `llama-fit-params` 对该 remote-EP 组合会 segfault，容量验收固定 `-fit off` 真实启动。
 `0.0.0.0` 会对所有网卡开放，生产应配 API key、TLS/反向代理或防火墙白名单。完整 env 逐项
-解释见 [PEOPLESLLM-PARAMS.md](../../docs/PEOPLESLLM-PARAMS.md)。
+解释见 [PARAMETERS.md](../../docs/PARAMETERS.md)。
 
 ## 配置（master，env，风格对齐 GGML_NUMA_EP）
 

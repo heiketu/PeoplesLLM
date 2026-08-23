@@ -363,6 +363,28 @@ static_assert(sizeof(block_udnl_w4) == sizeof(ggml_half) + QK_UDNL_W4/32 + QK_UD
 // row block), byte 16l+8+2i+q = idx(8s+4+2q) | idx(8s+4+2q+1)<<4 (row byte 4s+2+q).
 #define UDNL_W4_PB (QK_UDNL_W4/32*(16*32/2 + 16) + 16*(int)sizeof(ggml_half))
 
+// E4A: E2M1x2 integer grid (kvalues_mxfp4 code order, sign in bit 3) + one
+// E8M0 exponent byte per KQ group (32 weights, aligned with q8_0 blocks):
+//   w = kvalues_mxfp4[idx] * 2^(e-128)
+// This is the bit-exact NR16-panel container for native MXFP4 weights (e.g.
+// DSV4-Flash experts): same 4.25 bpw, same code values, only the nibble
+// pairing differs — MXFP4 row byte j = code(j) | code(j+16)<<4 while E4A
+// group byte j = code(2j) | code(2j+1)<<4 (UDNL_W4 pairing). The panel
+// layout is UDNL_W4's minus the fp16 d tail: per (panel of 16 rows,
+// 256-K block)
+//   8 x [payload 256B | e 16B] = 2176 B = 16 x sizeof(block_e4a)
+// (repack is a pure byte rearrangement; the payload byte mapping is identical
+// to UDNL_W4's above). e == 0xFF blocks (OCP NaN, never-routed experts) are
+// passed through; dequantize_row_e4a emits zeros for them like mxfp4.
+#define QK_E4A 256
+typedef struct {
+    uint8_t e[QK_E4A/32];        // per-KQ E8M0 exponents
+    uint8_t qs[QK_E4A/2];        // 4-bit codebook indices, UDNL nibble pairing
+} block_e4a;
+static_assert(sizeof(block_e4a) == QK_E4A/32 + QK_E4A/2, "wrong e4a block size/padding");
+
+#define E4A_PB (QK_E4A/32*(16*32/2 + 16)) // 2176 B per (panel, 256-K block)
+
 // UDNL_MX mixed precision (W2/W3/W4 per KQ group): 256-element super-block of
 // 8 KQ groups (32 weights each, aligned with q8_0 blocks). Each KQ group uses
 // one of three codebooks (subsets of the IQ4_NL grid):

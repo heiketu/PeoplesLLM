@@ -334,6 +334,12 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_Q8_0,
         .nrows                    = 1,
     },
+    [GGML_TYPE_E4A] = {
+        .from_float               = quantize_row_e4a,
+        .vec_dot                  = ggml_vec_dot_e4a_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
     [GGML_TYPE_Q4_K] = {
         .from_float               = quantize_row_q4_K,
         .vec_dot                  = ggml_vec_dot_q4_K_q8_K,
@@ -625,6 +631,18 @@ struct ggml_numa_barrier_node {
     char pad1[GGML_NUMA_BARRIER_LINE - sizeof(atomic_int)];
 };
 
+// Optional third level (GGML_NUMA_HIER_BARRIER=2): within a node, threads sync in
+// small groups (GGML_NUMA_BARRIER_GROUP, default 8) on a group-local line; the last
+// arriver of each group escalates to the node line. This shortens the arrive-side
+// serialization on the node line from O(node_nth) line transfers to O(group) +
+// O(ngroups). Group lines are allocated node-local together with the node line.
+struct ggml_numa_barrier_group {
+    atomic_int arrive;
+    char pad0[GGML_NUMA_BARRIER_LINE - sizeof(atomic_int)];
+    atomic_int release;
+    char pad1[GGML_NUMA_BARRIER_LINE - sizeof(atomic_int)];
+};
+
 // ---------------------------------------------------------------------------
 // per-op wall-clock profiler, enabled with GGML_OP_TIMING=1. Thread 0 times each
 // ggml_compute_forward call (fused blocks count under the first node's op) and each
@@ -680,15 +698,19 @@ void ggml_backend_cpu_op_timing_dump(void) {
 
 static struct {
     struct ggml_numa_barrier_node * node[GGML_NUMA_MAX_NODES]; // node[k] lives in node-k memory
+    struct ggml_numa_barrier_group * groups[GGML_NUMA_MAX_NODES]; // groups[k]: node_ngroups[k] lines, node-k memory
     atomic_int global_arrive;
     char pad[GGML_NUMA_BARRIER_LINE];
     atomic_int global_release;
     int node_nth[GGML_NUMA_MAX_NODES];
+    int node_ngroups[GGML_NUMA_MAX_NODES];
+    int group_size;
     int n_leaders;
-    int active;
+    int active; // 0 = flat, 1 = 2-level, 2 = 3-level (group + node + global)
 } g_numa_barrier;
 
 static GGML_THREAD_LOCAL int tl_numa_node = 0; // this thread's NUMA node (set in set_numa_thread_affinity)
+static GGML_THREAD_LOCAL int tl_node_rank = 0; // this thread's rank within its node (same setter)
 
 static inline void ggml_numa_spin_pause(void) {
 #if defined(__SSE3__)
@@ -701,6 +723,54 @@ static inline void ggml_numa_spin_pause(void) {
 static void ggml_numa_hier_barrier(void) {
     const int node     = tl_numa_node;
     const int node_nth = g_numa_barrier.node_nth[node];
+
+    // ---- group level (mode 2 only): small group-local line, last arriver escalates ----
+    if (g_numa_barrier.active == 2 && node_nth > 1) {
+        const int gsize = g_numa_barrier.group_size;
+        const int g     = tl_node_rank / gsize;
+        struct ggml_numa_barrier_group * gb = &g_numa_barrier.groups[node][g];
+        const int gsz = MIN(gsize, node_nth - g*gsize);
+        const int rel_old = atomic_load(&gb->release);
+        if (atomic_fetch_add(&gb->arrive, 1) != gsz - 1) {
+            // group follower: wait for the group leader to release us
+            while (atomic_load(&gb->release) == rel_old) {
+                ggml_numa_spin_pause();
+            }
+            return;
+        }
+        // last arriver in the group becomes the group leader and proceeds to the
+        // node level, standing in for its gsz members
+        atomic_store(&gb->arrive, 0);
+        const int ngroups = g_numa_barrier.node_ngroups[node];
+        struct ggml_numa_barrier_node * nb = g_numa_barrier.node[node];
+        const int nrel_old = atomic_load(&nb->release);
+        const int na = atomic_fetch_add(&nb->arrive, 1);
+        if (na != ngroups - 1) {
+            // not the node's last group leader: wait for the node-level release
+            while (atomic_load(&nb->release) == nrel_old) {
+                ggml_numa_spin_pause();
+            }
+        } else {
+            atomic_store(&nb->arrive, 0);
+            // ---- cross-node level (only one leader per node participates) ----
+            const int n_leaders = g_numa_barrier.n_leaders;
+            if (n_leaders > 1) {
+                const int g_old = atomic_load(&g_numa_barrier.global_release);
+                if (atomic_fetch_add(&g_numa_barrier.global_arrive, 1) == n_leaders - 1) {
+                    atomic_store(&g_numa_barrier.global_arrive, 0);
+                    atomic_fetch_add(&g_numa_barrier.global_release, 1); // release all leaders
+                } else {
+                    while (atomic_load(&g_numa_barrier.global_release) == g_old) {
+                        ggml_numa_spin_pause();
+                    }
+                }
+            }
+            atomic_fetch_add(&g_numa_barrier.node[node]->release, 1);
+        }
+        // release this group's followers
+        atomic_fetch_add(&gb->release, 1);
+        return;
+    }
 
     // ---- intra-node level (node-local cache line) ----
     if (node_nth > 1) {
@@ -1132,9 +1202,13 @@ void ggml_numa_bind_policy(void * ptr, size_t size, int node) {
 static void ggml_numa_barrier_setup(int n_threads) {
     static int hier_enabled = -1;
     if (hier_enabled < 0) {
-        // default ON since 2026-08 (zero-cost, ~+1%); GGML_NUMA_HIER_BARRIER=0 forces the flat barrier
+        // default ON (1) since 2026-08 (zero-cost, ~+1%); GGML_NUMA_HIER_BARRIER=0 forces the
+        // flat barrier, =2 adds a small group level inside each node (GGML_NUMA_BARRIER_GROUP,
+        // default 8) so the node line's arrive serialization drops from O(node_nth) to
+        // O(group)+O(ngroups)
         const char * env = getenv("GGML_NUMA_HIER_BARRIER");
-        hier_enabled = (env && !atoi(env)) ? 0 : 1;
+        hier_enabled = env ? atoi(env) : 1;
+        if (hier_enabled < 0 || hier_enabled > 2) hier_enabled = 1;
     }
     const bool block_split = g_state.numa.numa_strategy == GGML_NUMA_STRATEGY_MIRROR ||
         (g_state.numa.numa_strategy == GGML_NUMA_STRATEGY_DISTRIBUTE && ggml_cpu_numa_ep_active());
@@ -1143,17 +1217,32 @@ static void ggml_numa_barrier_setup(int n_threads) {
         return;
     }
     const int n = (int) g_state.numa.n_nodes;
+    int gsize = 8;
+    if (hier_enabled == 2) {
+        const char * genv = getenv("GGML_NUMA_BARRIER_GROUP");
+        if (genv && atoi(genv) >= 2) gsize = atoi(genv);
+    }
     if (g_numa_barrier.node[0] == NULL) {
         for (int k = 0; k < n; ++k) {
             // node-local so the intra-node sync never crosses the interconnect (mmap is zeroed)
             g_numa_barrier.node[k] = (struct ggml_numa_barrier_node *)
                 ggml_numa_alloc(sizeof(struct ggml_numa_barrier_node), k);
-            if (g_numa_barrier.node[k] == NULL) {
+            // worst case: all threads on this node, one group line per group
+            const int max_groups = (n_threads + gsize - 1) / gsize;
+            g_numa_barrier.groups[k] = (struct ggml_numa_barrier_group *)
+                ggml_numa_alloc(sizeof(struct ggml_numa_barrier_group)*max_groups, k);
+            if (g_numa_barrier.node[k] == NULL || g_numa_barrier.groups[k] == NULL) {
                 // allocation failed: undo and fall back to the flat barrier instead of risking
                 // a NULL deref in ggml_numa_hier_barrier()
-                for (int j = 0; j < k; ++j) {
-                    ggml_numa_free(g_numa_barrier.node[j], sizeof(struct ggml_numa_barrier_node));
-                    g_numa_barrier.node[j] = NULL;
+                for (int j = 0; j <= k; ++j) {
+                    if (g_numa_barrier.node[j]) {
+                        ggml_numa_free(g_numa_barrier.node[j], sizeof(struct ggml_numa_barrier_node));
+                        g_numa_barrier.node[j] = NULL;
+                    }
+                    if (g_numa_barrier.groups[j]) {
+                        ggml_numa_free(g_numa_barrier.groups[j], sizeof(struct ggml_numa_barrier_group)*max_groups);
+                        g_numa_barrier.groups[j] = NULL;
+                    }
                 }
                 g_numa_barrier.active = 0;
                 return;
@@ -1168,12 +1257,14 @@ static void ggml_numa_barrier_setup(int n_threads) {
         const int first_k  = ( k      * n_threads + n - 1) / n;
         const int first_k1 = ((k + 1) * n_threads + n - 1) / n;
         g_numa_barrier.node_nth[k] = first_k1 - first_k;
+        g_numa_barrier.node_ngroups[k] = (g_numa_barrier.node_nth[k] + gsize - 1) / gsize;
         if (g_numa_barrier.node_nth[k] > 0) {
             ++leaders;
         }
     }
+    g_numa_barrier.group_size = gsize;
     g_numa_barrier.n_leaders = leaders;
-    g_numa_barrier.active = 1;
+    g_numa_barrier.active = hier_enabled;
 }
 
 void ggml_numa_tensor_set_mirror(struct ggml_tensor * tensor, void * const * node_data) {
@@ -2978,6 +3069,7 @@ static void set_numa_thread_affinity(int thread_n, int n_threads) {
     tl_affinity_cleared = false;
 
     int node_num;
+    int node_rank = 0; // rank within the node's thread block (hier barrier group level, pinning)
     int rv;
     size_t setsize = CPU_ALLOC_SIZE(g_state.numa.total_cpus);
 
@@ -2993,8 +3085,13 @@ static void set_numa_thread_affinity(int thread_n, int n_threads) {
             if (ggml_cpu_numa_ep_active()) {
                 node_num = ggml_numa_node_for_thread(thread_n, n_threads);
                 tl_numa_node = node_num; // remember our node for the hierarchical barrier
+                // same ceil split as ggml_numa_barrier_setup's node_nth[]
+                node_rank = thread_n - (node_num*n_threads + (int) g_state.numa.n_nodes - 1)
+                                      / (int) g_state.numa.n_nodes;
+                tl_node_rank = node_rank;
             } else {
                 node_num = thread_n % g_state.numa.n_nodes;
+                node_rank = thread_n / (int) g_state.numa.n_nodes;
             }
             break;
         case GGML_NUMA_STRATEGY_ISOLATE:
@@ -3006,6 +3103,9 @@ static void set_numa_thread_affinity(int thread_n, int n_threads) {
             // used to pick the node-local weight copy during compute.
             node_num = ggml_numa_node_for_thread(thread_n, n_threads);
             tl_numa_node = node_num; // remember our node for the hierarchical barrier
+            node_rank = thread_n - (node_num*n_threads + (int) g_state.numa.n_nodes - 1)
+                                  / (int) g_state.numa.n_nodes;
+            tl_node_rank = node_rank;
             break;
         case GGML_NUMA_STRATEGY_NUMACTL:
             // use the cpuset that numactl gave us
@@ -3022,8 +3122,39 @@ static void set_numa_thread_affinity(int thread_n, int n_threads) {
 
     cpu_set_t * cpus = CPU_ALLOC(g_state.numa.total_cpus);
     CPU_ZERO_S(setsize, cpus);
-    for (size_t i = 0; i < node->n_cpus; ++i) {
-        CPU_SET_S(node->cpus[i], setsize, cpus);
+
+    // Optional single-core pinning (GGML_NUMA_PIN_CORE=1, default off): pin each thread to
+    // one CPU chosen by mesh centrality (rank order measured in quant-sweep/c2c-matrix.tsv,
+    // Slice 10) instead of floating on the whole node cpuset. Central cores shorten the
+    // average cache-line hop count of barrier/claim traffic. The permutation is an index
+    // into node->cpus (ascending: physical cores first, HT siblings after); ranks beyond
+    // the physical set fall back to HT siblings in the same order. Only valid when the
+    // node exposes the expected layout; otherwise the node cpuset is kept.
+    static int pin_core = -1;
+    if (pin_core < 0) {
+        const char * e = getenv("GGML_NUMA_PIN_CORE");
+        pin_core = e ? atoi(e) : 0;
+    }
+    // centrality order of the 38 physical cores within one socket (Ice Lake SP ES mesh,
+    // measured 2026-08 via quant-sweep/c2c-matrix.tsv; both sockets symmetric:
+    // node1's order = these +38). Lower rank = more central. Core 23 is a measured
+    // outlier (~50ns worse than the node mean) and is deliberately last.
+    static const int pin_perm[38] = {
+        12,  8, 15, 13,  9,  6,  1, 11,  2,  3,
+         5, 10,  7,  4, 28, 16, 29, 25, 26, 31,
+        33,  0, 14, 32, 27, 34, 17, 35, 19, 22,
+        18, 30, 24, 20, 21, 36, 37, 23,
+    };
+    const size_t n_phys = node->n_cpus/2; // ascending cpu ids: physical first, HT siblings after
+    if (pin_core && n_phys == 38 && node_rank >= 0 && (size_t) node_rank < node->n_cpus) {
+        const size_t idx = (size_t) node_rank < n_phys
+            ? (size_t) pin_perm[node_rank]
+            : n_phys + (((size_t) node_rank - n_phys) % n_phys);
+        CPU_SET_S(node->cpus[idx], setsize, cpus);
+    } else {
+        for (size_t i = 0; i < node->n_cpus; ++i) {
+            CPU_SET_S(node->cpus[i], setsize, cpus);
+        }
     }
 
     rv = pthread_setaffinity_np(pthread_self(), setsize, cpus);

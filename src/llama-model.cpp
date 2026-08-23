@@ -7,6 +7,7 @@
 #include "llama-mmap.h"
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
+#include "llama-hot-expert.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -1152,6 +1153,7 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
 }
 
 llama_model::~llama_model() {
+    llama_hot_expert_shutdown();
     for (auto * lora : loras) {
         delete lora;
     }
@@ -2586,6 +2588,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             return false;
         }
     }
+
+    // Slice 12: optional hot-expert GPU offload (GGML_HOT_EXPERT=1); no-op otherwise
+    llama_hot_expert_init(hparams.swiglu_clamp_exp.data(), hparams.n_layer(), hparams.n_expert_used);
 
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {

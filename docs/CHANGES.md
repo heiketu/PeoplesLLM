@@ -70,7 +70,7 @@
 - `llama-ep-transport`：LEP1/协议 v2，支持 TCP 和 RoCEv2 RDMA；RDMA 建连失败自动回退 TCP
 - `llama-epd`：支持多分卷 GGUF、mmap/`--no-mmap`、持久线程池、运行时 repack、NUMA 加权交织和启动 autotune
 - classic 模式按层分片；mirror 模式把远端专家槽与本地槽并行计算；SCHED 模式通过 REQ2/RESP2 做专家槽级派单
-- DSV4 与 GLM-5.2 已完成逐字输出对拍和双机实测；生产参数与当前限制见 `docs/PEOPLESLLM-PARAMS.md`
+- DSV4 与 GLM-5.2 已完成逐字输出对拍和双机实测；生产参数与当前限制见 `docs/PARAMETERS.md`
 
 ## 六、版本控制策略
 

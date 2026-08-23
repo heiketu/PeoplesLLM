@@ -1,7 +1,7 @@
 # PeoplesLLM 开发与验证
 
 本文只描述可复现的工程流程。功能参数、生产配方和经过复核的性能结论分别以
-`docs/PEOPLESLLM-PARAMS.md` 和 `README.md` 为准。
+`docs/PARAMETERS.md` 和 `README.md` 为准。
 
 ## 仓库与分支
 
@@ -81,7 +81,7 @@ CPU-only 构建直接运行 `test-backend-ops` 会跳过作为参考实现的 CP
 
 - `README.md`：项目定位和经过复核的代表性结果。
 - `docs/CHANGES.md`：已合入能力，不记录未实现设想。
-- `docs/PEOPLESLLM-PARAMS.md`：当前代码实际支持的参数和生产配方。
+- `docs/PARAMETERS.md`：当前代码实际支持的参数和生产配方（PEOPLESLLM-PARAMS.md 已于 H0 退役为重定向页）。
 - `docs/LONG-CONTEXT-1M.md`：1M context 的 RAM/VRAM 硬预算与 release gate。
 - `tools/epd/*DESIGN.md`：设计与实验路线，必须标注 implemented / experimental / rejected。
 - 工作区 `HANDOVER.md`：本地研发日志和证据索引，不属于稳定用户接口。

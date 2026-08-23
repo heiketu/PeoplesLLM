@@ -1898,6 +1898,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         if (!sched->async_readback) {
             return false;
         }
+        // the staged copy is a flat memcpy of the logical tensor layout; only
+        // contiguous sources are eligible, others take the synchronous path
+        if (!ggml_is_contiguous(input)) {
+            return false;
+        }
         if (input_backend->iface.get_tensor_async == NULL || input_backend->iface.event_record == NULL) {
             return false;
         }

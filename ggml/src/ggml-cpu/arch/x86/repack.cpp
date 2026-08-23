@@ -6285,6 +6285,265 @@ void ggml_gemm_udnl_w4_1x16_q8_0_arec(int n, float * GGML_RESTRICT s, size_t bs,
     ggml_gemm_udnl_w4_1x16_q8_0_generic(n, s, bs, vx, vy, nr, nc);
 }
 
+// E4A NR16 panel kernels (AVX512F+BW+VNNI): UDNL_W4's panel family with the
+// kvalues_mxfp4-order biased LUT and a pow2 per-group scale path. Weight
+// layout (see ggml-common.h E4A_PB): per (panel of 16 rows, 256-K block)
+//   8 x [payload 256B | e 16B] = 2176 B
+// (payload byte mapping identical to UDNL_W4; no fp16 d tail). The per-row
+// group scale is 2^(e-128), built with the ggml_e8m0_half_to_f32x16
+// construction (normal path (e-1)<<23 for e >= 2, denormal 0x00200000<<e for
+// e < 2). Real DSV4 data spans the full e range — including e==0 dead groups
+// in otherwise-live experts — so the denormal branch is load-bearing: without
+// it e==0 yields -inf and the (exactly zero) group dot turns into NaN.
+// Numerics vs UDNL_W4: the two-level fp accumulation is kept (accq is fresh
+// per 256-K block, accf gets one add per block); folding the 8 group fmadds
+// straight into accf would make a serial 8*nb-long fmadd chain (~34% slower,
+// measured in the slice-8 probe).
+
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
+
+static inline __m512i e4a_lut_biased(void) {
+    uint8_t lut8[16];
+    for (int i = 0; i < 16; ++i) {
+        lut8[i] = (uint8_t) (kvalues_mxfp4[i] + 128);
+    }
+    return _mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i *) lut8));
+}
+
+// Dot NR activation rows against one 16-column weight panel (nb super-blocks
+// of K). rec holds the precomputed per-(row, q8_0 block) activation terms,
+// row-major NR x anb. s_p points at the panel's first output column.
+template <int NR>
+static void e4a_panel_avx512(
+        int nb,
+        const uint8_t * GGML_RESTRICT pw,
+        const block_q8_0 * GGML_RESTRICT a, int64_t anb,
+        const udnl_w4_arec * GGML_RESTRICT rec,
+        float * GGML_RESTRICT s_p, size_t bs) {
+    static_assert(NR >= 1 && NR <= 8, "invalid E4A GEMV row count");
+
+    const __m512i LUT = e4a_lut_biased();
+    const __m512i m0F = _mm512_set1_epi8(0x0F);
+    const __m512i one = _mm512_set1_epi32(1);
+
+    // [GGML_REPACK_GEMV_PREFETCH] same SW-prefetch policy as the mxfp4 gemv
+    static const bool pf_enable = []() {
+        const char * e = getenv("GGML_REPACK_GEMV_PREFETCH");
+        return !(e && (e[0] == '\0' || strcmp(e, "0") == 0));
+    }();
+
+    __m512 accf[NR];
+    for (int y = 0; y < NR; ++y) {
+        accf[y] = _mm512_setzero_ps();
+    }
+
+    for (int b = 0; b < nb; ++b) {
+        const uint8_t * GGML_RESTRICT pb = pw + (int64_t) b*E4A_PB;
+        if (pf_enable && b + 2 < nb) {
+            _mm_prefetch((const char *) (pb + 2*E4A_PB),      _MM_HINT_T0);
+            _mm_prefetch((const char *) (pb + 2*E4A_PB) + 64, _MM_HINT_T0);
+        }
+        __m512 accq[NR];
+        for (int y = 0; y < NR; ++y) {
+            accq[y] = _mm512_setzero_ps();
+        }
+
+        for (int g = 0; g < 8; ++g) {
+            const uint8_t * GGML_RESTRICT pl = pb + (256 + 16)*g;
+            // decode the 4 chunks once, apply to all NR rows
+            __m512i wA[4], wB[4];
+            for (int s4 = 0; s4 < 4; ++s4) {
+                const __m512i c  = _mm512_loadu_si512(pl + 64*s4);
+                const __m512i lo = _mm512_and_si512(c, m0F);
+                const __m512i hi = _mm512_and_si512(_mm512_srli_epi16(c, 4), m0F);
+                wA[s4] = _mm512_shuffle_epi8(LUT, _mm512_unpacklo_epi8(lo, hi));
+                wB[s4] = _mm512_shuffle_epi8(LUT, _mm512_unpackhi_epi8(lo, hi));
+            }
+            // per-row pow2 scales: 2^(e-128). The e<2 denormal branch (same
+            // construction as ggml_e8m0_half_to_f32x16) is NOT optional: real
+            // DSV4 experts contain e==0 dead groups (~0.4% of groups), and the
+            // bare (e-1)<<23 shortcut turns e==0 into 0xFF800000 = -inf, so the
+            // raw==0 dot there becomes 0 x -inf = NaN. e==0xFF keeps the
+            // production-mxfp4 behaviour (2^127, finite; harmless when raw==0).
+            const __m512i e32     = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *) (pl + 256)));
+            const __m512i e_norm  = _mm512_slli_epi32(_mm512_sub_epi32(e32, one), 23);
+            const __m512i e_denorm = _mm512_sllv_epi32(_mm512_set1_epi32(0x00200000), e32);
+            const __mmask16 e_is_norm = _mm512_cmpgt_epi32_mask(e32, one);
+            const __m512 ev = _mm512_castsi512_ps(_mm512_mask_blend_epi32(e_is_norm, e_denorm, e_norm));
+            for (int y = 0; y < NR; ++y) {
+                const block_q8_0 * GGML_RESTRICT ab = a + (int64_t) y*anb + 8*b + g;
+                const udnl_w4_arec * GGML_RESTRICT rg = rec + (int64_t) y*anb + 8*b + g;
+                __m512i accA = _mm512_setzero_si512();
+                __m512i accB = _mm512_setzero_si512();
+                for (int s4 = 0; s4 < 4; ++s4) {
+                    accA = _mm512_dpbusd_epi32(accA, wA[s4], _mm512_set1_epi32(udnl_w4_load_i32(ab->qs + 8*s4)));
+                    accB = _mm512_dpbusd_epi32(accB, wB[s4], _mm512_set1_epi32(udnl_w4_load_i32(ab->qs + 8*s4 + 4)));
+                }
+                const __m512i raw = _mm512_sub_epi32(_mm512_add_epi32(accA, accB),
+                                                     _mm512_set1_epi32(rg->asum128));
+                const __m512 part = _mm512_mul_ps(_mm512_cvtepi32_ps(raw), ev);
+                accq[y] = _mm512_fmadd_ps(part, _mm512_set1_ps(rg->dy), accq[y]);
+            }
+        }
+
+        for (int y = 0; y < NR; ++y) {
+            accf[y] = _mm512_add_ps(accf[y], accq[y]);
+        }
+    }
+
+    for (int y = 0; y < NR; ++y) {
+        _mm512_storeu_ps(s_p + y*bs, accf[y]);
+    }
+}
+
+template <int NR>
+static void ggml_gemv_e4a_1x16_q8_0_avx512(
+        int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy,
+        int nc) {
+    GGML_ASSERT(n % QK_E4A == 0);
+    GGML_ASSERT(nc % 16 == 0);
+    static_assert(NR >= 1 && NR <= 8, "invalid E4A GEMV row count");
+
+    const int nb  = n / QK_E4A;    // e4a blocks per weight column
+    const int anb = 8*nb;          // q8_0 blocks per activation row
+
+    const uint8_t * GGML_RESTRICT w = (const uint8_t *) vx;
+    const block_q8_0 * GGML_RESTRICT a = (const block_q8_0 *) vy;
+
+    // Hoisted activation terms, one 8 B record per (row y, q8_0 block j),
+    // row-major. Rebuilt once per call (O(NR*n)) instead of once per panel.
+    const int64_t nrec = (int64_t) anb*NR;
+    static thread_local std::vector<udnl_w4_arec> recs;
+    if ((int64_t) recs.size() < nrec) {
+        recs.resize((size_t) nrec);
+    }
+    udnl_w4_arec * GGML_RESTRICT rec = recs.data();
+    for (int y = 0; y < NR; ++y) {
+        const block_q8_0 * GGML_RESTRICT ay = a + (int64_t) y*anb;
+        for (int j = 0; j < anb; ++j) {
+            int asum = 0;
+            for (int v = 0; v < QK8_0; ++v) {
+                asum += ay[j].qs[v];
+            }
+            rec[(int64_t) y*anb + j].asum128 = 128*asum;
+            rec[(int64_t) y*anb + j].dy      = GGML_CPU_FP16_TO_FP32(ay[j].d);
+        }
+    }
+
+    for (int p = 0; p < nc/16; ++p) {
+        e4a_panel_avx512<NR>(nb, w + (int64_t) p*nb*E4A_PB, a, anb, rec, s + 16*p, bs);
+    }
+}
+#endif // __AVX512F__ && __AVX512BW__ && __AVX512VNNI__
+
+void ggml_gemv_e4a_1x16_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
+    switch (nr) {
+        case 1: ggml_gemv_e4a_1x16_q8_0_avx512<1>(n, s, bs, vx, vy, nc); return;
+        case 2: ggml_gemv_e4a_1x16_q8_0_avx512<2>(n, s, bs, vx, vy, nc); return;
+        case 3: ggml_gemv_e4a_1x16_q8_0_avx512<3>(n, s, bs, vx, vy, nc); return;
+        case 4: ggml_gemv_e4a_1x16_q8_0_avx512<4>(n, s, bs, vx, vy, nc); return;
+        case 5: ggml_gemv_e4a_1x16_q8_0_avx512<5>(n, s, bs, vx, vy, nc); return;
+        case 6: ggml_gemv_e4a_1x16_q8_0_avx512<6>(n, s, bs, vx, vy, nc); return;
+        case 7: ggml_gemv_e4a_1x16_q8_0_avx512<7>(n, s, bs, vx, vy, nc); return;
+        case 8: ggml_gemv_e4a_1x16_q8_0_avx512<8>(n, s, bs, vx, vy, nc); return;
+        default: break;
+    }
+#endif
+    ggml_gemv_e4a_1x16_q8_0_generic(n, s, bs, vx, vy, nr, nc);
+}
+
+// arec variants: same contract as the UDNL_W4 ones — the activation records
+// arrive precomputed (row-major nr x anb), skipping the per-call rebuild.
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
+template <int NR>
+static void ggml_gemv_e4a_1x16_q8_0_arec_avx512(
+        int n, float * GGML_RESTRICT s, size_t bs,
+        const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy,
+        const udnl_w4_arec * GGML_RESTRICT rec, int nc) {
+    GGML_ASSERT(n % QK_E4A == 0);
+    GGML_ASSERT(nc % 16 == 0);
+    static_assert(NR >= 1 && NR <= 8, "invalid E4A GEMV row count");
+    const int nb  = n / QK_E4A;
+    const int anb = 8*nb;
+    const uint8_t * GGML_RESTRICT w = (const uint8_t *) vx;
+    const block_q8_0 * GGML_RESTRICT a = (const block_q8_0 *) vy;
+    for (int p = 0; p < nc/16; ++p) {
+        e4a_panel_avx512<NR>(nb, w + (int64_t) p*nb*E4A_PB, a, anb, rec, s + 16*p, bs);
+    }
+}
+#endif
+
+void ggml_gemv_e4a_1x16_q8_0_arec(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, const udnl_w4_arec * GGML_RESTRICT arec, int nr, int nc) {
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
+    switch (nr) {
+        case 1: ggml_gemv_e4a_1x16_q8_0_arec_avx512<1>(n, s, bs, vx, vy, arec, nc); return;
+        case 2: ggml_gemv_e4a_1x16_q8_0_arec_avx512<2>(n, s, bs, vx, vy, arec, nc); return;
+        case 3: ggml_gemv_e4a_1x16_q8_0_arec_avx512<3>(n, s, bs, vx, vy, arec, nc); return;
+        case 4: ggml_gemv_e4a_1x16_q8_0_arec_avx512<4>(n, s, bs, vx, vy, arec, nc); return;
+        case 5: ggml_gemv_e4a_1x16_q8_0_arec_avx512<5>(n, s, bs, vx, vy, arec, nc); return;
+        case 6: ggml_gemv_e4a_1x16_q8_0_arec_avx512<6>(n, s, bs, vx, vy, arec, nc); return;
+        case 7: ggml_gemv_e4a_1x16_q8_0_arec_avx512<7>(n, s, bs, vx, vy, arec, nc); return;
+        case 8: ggml_gemv_e4a_1x16_q8_0_arec_avx512<8>(n, s, bs, vx, vy, arec, nc); return;
+        default: break;
+    }
+#endif
+    GGML_UNUSED(arec);
+    ggml_gemv_e4a_1x16_q8_0_generic(n, s, bs, vx, vy, nr, nc);
+}
+
+void ggml_gemm_e4a_1x16_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
+    GGML_ASSERT(nr % 4 == 0);
+    const size_t a_row = (size_t)(n/QK8_0)*sizeof(block_q8_0);
+    // MR8 row blocking (same rationale as the UDNL_W4 gemm): each decoded
+    // weight chunk is applied to 8 activation rows. A 4-row remainder
+    // (nr % 8 == 4) uses the MR4 instantiation.
+    int y0 = 0;
+    for (; y0 + 8 <= nr; y0 += 8) {
+        const char * ay = (const char *) vy + (int64_t) y0*a_row;
+        ggml_gemv_e4a_1x16_q8_0_avx512<8>(n, s + (int64_t) y0*bs, bs, vx, ay, nc);
+    }
+    if (y0 < nr) {
+        const char * ay = (const char *) vy + (int64_t) y0*a_row;
+        ggml_gemv_e4a_1x16_q8_0_avx512<4>(n, s + (int64_t) y0*bs, bs, vx, ay, nc);
+    }
+    return;
+#endif
+    ggml_gemm_e4a_1x16_q8_0_generic(n, s, bs, vx, vy, nr, nc);
+}
+
+void ggml_gemm_e4a_1x16_q8_0_arec(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, const udnl_w4_arec * GGML_RESTRICT arec, int nr, int nc) {
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
+    GGML_ASSERT(nr % 4 == 0);
+    GGML_ASSERT(n % QK_E4A == 0);
+    GGML_ASSERT(nc % 16 == 0);
+    const int nb  = n/QK_E4A;      // e4a blocks per weight column
+    const int anb = 8*nb;          // q8_0 blocks per activation row
+    const uint8_t * GGML_RESTRICT w = (const uint8_t *) vx;
+    const size_t a_row = (size_t)(n/QK8_0)*sizeof(block_q8_0);
+    // Panel-outermost variant (same rationale and numerics as the UDNL_W4
+    // arec gemm): each weight panel is decoded while L1/L2-resident and
+    // applied to every 8-row activation tile before moving on.
+    for (int p = 0; p < nc/16; ++p) {
+        const uint8_t * GGML_RESTRICT pw = w + (int64_t) p*nb*E4A_PB;
+        int y0 = 0;
+        for (; y0 + 8 <= nr; y0 += 8) {
+            e4a_panel_avx512<8>(nb, pw, (const block_q8_0 *) ((const char *) vy + (int64_t) y0*a_row), anb,
+                                arec + (int64_t) y0*anb, s + (int64_t) y0*bs + 16*p, bs);
+        }
+        if (y0 < nr) {
+            e4a_panel_avx512<4>(nb, pw, (const block_q8_0 *) ((const char *) vy + (int64_t) y0*a_row), anb,
+                                arec + (int64_t) y0*anb, s + (int64_t) y0*bs + 16*p, bs);
+        }
+    }
+    return;
+#endif
+    GGML_UNUSED(arec);
+    ggml_gemm_e4a_1x16_q8_0_generic(n, s, bs, vx, vy, nr, nc);
+}
+
 // UDNL_MX NR16 panel kernels (AVX512F+BW+VNNI+VBMI).
 //
 // Weight layout (repacked, see ggml-common.h UDNL_MX_PB): panels of 16 output

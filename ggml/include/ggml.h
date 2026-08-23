@@ -433,7 +433,8 @@ extern "C" {
         GGML_TYPE_Q3_R    = 43, // 3-bit, 256-element super-block, int8 sub-scales, repack-identity layout
         GGML_TYPE_UDNL_W4 = 44, // UDNL W4 single mode (4+4): 16-entry NL codebook, u8 KQ scales, fp16 super scale
         GGML_TYPE_UDNL_MX = 45, // UDNL mixed W2/W3/W4 per KQ group (panel-shared mode word), 3.375 bpw
-        GGML_TYPE_COUNT   = 46,
+        GGML_TYPE_E4A     = 46, // E4A: E2M1x2 integer grid + per-32 E8M0 exponent, NR16 panel repack, 4.25 bpw
+        GGML_TYPE_COUNT   = 47,
     };
 
     // precision

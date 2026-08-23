@@ -5156,6 +5156,7 @@ void ggml_compute_forward_get_rows(
         case GGML_TYPE_Q3_R:
         case GGML_TYPE_UDNL_W4:
         case GGML_TYPE_UDNL_MX:
+        case GGML_TYPE_E4A:
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
         case GGML_TYPE_Q6_K:
@@ -5934,6 +5935,7 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_Q3_R:
         case GGML_TYPE_UDNL_W4:
         case GGML_TYPE_UDNL_MX:
+        case GGML_TYPE_E4A:
         case GGML_TYPE_Q8_K:
         case GGML_TYPE_I8:
         case GGML_TYPE_I16:

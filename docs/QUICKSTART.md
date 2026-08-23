@@ -1,8 +1,8 @@
 # x-llama.cpp 上手指南（Quickstart）
 
 > 面向想在类似平台上复现本项目性能的用户：双路 Xeon/EPYC（2 NUMA 节点）+ 2 × GPU，
-> 可选第二台双路机器。所有参数语义见 [PARAMETERS.md](PARAMETERS.md)，逐项实测数据见
-> [PEOPLESLLM-PARAMS.md](PEOPLESLLM-PARAMS.md) 与 [tools/epd/README.md](../tools/epd/README.md)。
+> 可选第二台双路机器。所有参数语义见 [PARAMETERS.md](PARAMETERS.md)，EP worker 细节见
+> [tools/epd/README.md](../tools/epd/README.md)。
 >
 > 目录：1. 构建 → 2. 配置一（单机混合推理）→ 3. 配置二（双机 EP）→ 4. 纯 CPU 推理 → 5. 常见问题。
 
@@ -75,6 +75,9 @@ AMX buft 只在运行时 `arch_prctl` 授权成功（真 AMX 硬件或 SDE 模�
 ```bash
 tools/peoplesllm-run.sh dsv4-prod        # 单机混合生产:双GPU+NUMA EP+dspark,4 slot x 1M Q8 KV
 tools/peoplesllm-run.sh dsv4-prod-f16    # F16 KV 单槽质量优先档
+tools/peoplesllm-run.sh dsv4-dual        # 双机 DSV4 EP 生产(需 slave 在线,见 §3)
+tools/peoplesllm-run.sh glm-dual         # 双机 GLM-5.2 EP 生产(需 slave 在线,见 §3)
+tools/peoplesllm-run.sh cpu-pure         # 纯 CPU 生产(无 GPU,见 §4)
 tools/peoplesllm-run.sh bench-hybrid     # 混合推理基准
 ```
 
@@ -128,6 +131,10 @@ env \
 endpoint 由 `GGML_REMOTE_EP_SCHED_ENDPOINTS` / `GGML_REMOTE_EP_HOST:PORT` 指定。
 
 ### 3.1 基础双机（单 worker，classic 模式）
+
+一键 profile：`tools/peoplesllm-run.sh dsv4-dual`（DSV4，slave 默认认领 36-42）或
+`tools/peoplesllm-run.sh glm-dual`（GLM-5.2，slave 默认认领 3-17）——profile 只起 master 侧
+并等待 slave worker 端口就绪，slave 需按下节范例先行启动。
 
 slave（build-noncuda / build-avx2）：
 
@@ -202,6 +209,8 @@ env `GGML_NUMA_EP=1 GGML_NUMA_HIER_BARRIER=1`）→ 轮询等端口就绪 → se
 
 ## 4. 纯 CPU 推理配置
 
+一键 profile：`tools/peoplesllm-run.sh cpu-pure`（即下面这段的展开，用 build-noncuda）。
+
 双路机器、无 GPU 或不用 GPU 时（DeepSeek-V4-Flash mxfp4，2 × 38C/251 GiB 实测 RSS ~165 GiB、
 TG512 ≈ 12 tok/s 量级）：
 
@@ -261,4 +270,4 @@ env \
 - 双机 A/B 测速有 ~25% 运行顺序效应：必须同会话反序复测（ABBA），且跑前
   `sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'`、`numactl --interleave=all` 统一基线口径。
 - 多个模型进程全程 `flock -x /tmp/xllama-bench.lock`，防止并发加载 OOM。
-- 完整已知坑清单见 [PEOPLESLLM-PARAMS.md](PEOPLESLLM-PARAMS.md) 第 5 节。
+- 完整已知坑清单见 [PARAMETERS.md](PARAMETERS.md) §8 与 §10（L3 实验/否决留档）。

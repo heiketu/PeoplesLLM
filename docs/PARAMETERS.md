@@ -3,7 +3,7 @@
 > 适用范围：本仓库 `local` 分支新增的环境变量（env vars）与命令行参数（CLI flags）。
 > 「默认」指不设置该变量 / 不传该开关时的代码路径。除特别注明外，环境变量置 `1` 开启、置 `0` 或不设置关闭。
 > 所有语义均对照源码读取点核实，不确定处直接标注「见源码 <file:line>」。
-> 更完整的逐项实测数据见 [PEOPLESLLM-PARAMS.md](PEOPLESLLM-PARAMS.md)；上手配置见 [QUICKSTART.md](QUICKSTART.md)。
+> 上手配置见 [QUICKSTART.md](QUICKSTART.md)。旧文档 PEOPLESLLM-PARAMS.md 已被本文档取代（仅保留重定向页）。
 
 目录：
 
@@ -15,6 +15,8 @@
 6. 调试与观测
 7. CLI 参数（server / llama-bench / llama-epd）
 8. 已废弃或建议避免
+9. AMX 加速路径（Sapphire Rapids+）
+10. 附录：L3 实验/否决留档
 
 ---
 
@@ -36,12 +38,15 @@
 | `GGML_NUMA_EP_GATE_UP_PARALLEL` | 关 | 小批 decode 时把每个节点内线程对半分给独立的 gate/up 专家投影并融合 clamp/GLU；要求 2 节点、线程数可被 4 整除、repack 权重、token 维 ≤8，不满足自动回退。`ggml-cpu.c:5452` | 配合 `GGML_NUMA_EP=1` + `GGML_NUMA_HIER_BARRIER=1` 的双路纯 CPU decode；混合模式 PP 自动走原路径 |
 | `GGML_NUMA_EP_DEBUG` | 关 | 行窗 EP claim 诊断：每 256 次调用打印 wall/spread/busy/两节点认领行数/窃取统计。`repack.cpp:6021` | 调试专用；共享计数器热行有明显海森堡效应（TG 约 -18%），只看相对结构 |
 | `GGML_NUMA_EP_MMAP` | 关 | 允许对 mmap 加载的模型做 **policy-only** 专家放置（`mbind(MPOL_BIND, flags=0)`，只设 VMA 策略、不迁移已缓存页）。不设时 mmap + EP 直接跳过放置并打日志。`src/llama-model.cpp:1521` | **避免**：冷 page cache 下首触页按 interleave 落两节点后被钉死在错位节点，PP 减半。EP 生产配置请用 `--no-mmap` |
+| `GGML_NUMA_EP_PLACE` | 行窗（默认） | `=block` 时专家权重改按 2 MiB PMD 块交替 mbind 到各节点（块号从首个 PMD 边界起计，头部字节记为 block -1），计算侧 claim 按同一字节网格推导节点本地行区间。`src/llama-model.cpp:1595`、`repack.cpp:6275` | **否决留档**：为使 `GGML_NUMA_THP=collapse` 生效而设，大页修通后端到端零收益（HANDOVER:1377-1383），保持默认 |
 
 ### 1.2 NUMA barrier、大页与 mirror
 
 | 变量 | 默认 | 作用 | 何时开 / 关 |
 |---|---|---|---|
-| `GGML_NUMA_HIER_BARRIER` | **开**（2026-08 起默认开，设 `0` 回退 flat barrier） | 纯自旋两级 NUMA 分级 barrier（先节点内、再跨节点），替代全局 flat barrier。仅在 `--numa mirror`，或 `--numa distribute` + `GGML_NUMA_EP=1` 的块划分下生效。`ggml-cpu.c:1117` | 双路机上配合 EP/mirror 开启（实测浅层 TG +8.6%、深提示 +6.2%）；其他拓扑自行 A/B |
+| `GGML_NUMA_HIER_BARRIER` | **开**（2026-08 起默认开，设 `0` 回退 flat barrier） | 纯自旋两级 NUMA 分级 barrier（先节点内、再跨节点），替代全局 flat barrier。仅在 `--numa mirror`，或 `--numa distribute` + `GGML_NUMA_EP=1` 的块划分下生效。`=2` 追加节点内小组级（三级 barrier 脚手架，配合 `GGML_NUMA_BARRIER_GROUP`）。`ggml-cpu.c:1117,1206` | 双路机上配合 EP/mirror 开启（实测浅层 TG +8.6%、深提示 +6.2%）；其他拓扑自行 A/B；`=2` 见下行，已否决 |
+| `GGML_NUMA_BARRIER_GROUP` | `8` | 三级 barrier（`GGML_NUMA_HIER_BARRIER=2`）下节点内每小组的线程数；<2 忽略。`ggml-cpu.c:1222` | **否决留档**（Slice 10，commit 35aa515b9）：无净收益，保持两级 |
+| `GGML_NUMA_PIN_CORE` | 关 | `=1` 把每个线程钉到按 mesh 中心性排序的单核（置换表来自 Ice Lake SP 实测 c2c 矩阵，仅 38 物理核/节点的布局生效，否则回退节点 cpuset）。`ggml-cpu.c:3135` | **否决留档**（Slice 10）：实测无净收益，仅实验复现用 |
 | `GGML_NUMA_THP` | 关 | `=collapse` 时对 NUMA EP/mirror 放置的权重大区间做 `MADV_COLLAPSE` 同步折叠成 2 MiB 大页。`src/llama-model.cpp:1305,1571` | **实测零收益**（碎片导致全部 EAGAIN），保留但别用 |
 | `GGML_KV_THP` | 关 | `=collapse` 时对 ≥2 MiB 的 host KV buffer 做 THP 折叠；`=1` 只在分配时 `MADV_HUGEPAGE`。`src/llama-kv-cache.cpp:311`、`ggml/src/ggml-backend.cpp:3001` | **实测负收益**（TG -6%/PP -55%），别用 |
 | `GGML_NUMA_MIRROR_THREADS` | `hardware_concurrency()`（上限 32） | `--numa mirror` 加载期节点间权重复制的线程数。`src/llama-model.cpp:1264` | 加载太慢时调大；一般默认即可 |
@@ -57,6 +62,26 @@
 | `GGML_REPACK_GEMV_PREFETCH` | **开**（2026-08 起默认开，设 `0` 关闭） | repack MXFP4 GEMV 内核的权重流软件预取（约 2 KB 提前量，8 个 block 迭代）。非空且非 `0` 即开。`ggml/src/ggml-cpu/arch/x86/repack.cpp:1915` | AVX-512 机器上 decode 提速（生产配置开启）；AVX2 机器无此内核、无效 |
 | `GGML_REPACK_MXFP4_AVX512_GEMV` | 开 | MXFP4 GEMV 使用 AVX-512 内核；`=0` 回退 AVX2 实现。`arch/x86/repack.cpp:2018` | 仅 A/B 诊断用，生产保持默认 |
 | `GGML_CPU_DISABLE_FUSION` | 关（上游已有） | `=1` 禁用 CPU op fusion 框架。`ggml-cpu.c:5448` | 调试用 |
+| `GGML_REPACK_MMID_GEMM_TILE` | `32` | MoE `mul_mat_id` 每次 GEMM 调用 staging 的 src1 行数上限；仅接受 4/8/16/32，其他值回落 32。`repack.cpp:6254` | 扫参/A/B 专用 |
+| `GGML_CPU_FP16_INTERMEDIATE` | 关 | `=1` MoE 块内激活走 f16 中间态（优先于 q8 边界）。`src/llama-graph.cpp:2501`、`repack.cpp:41` | 实验岛，默认关 |
+| `GGML_CPU_INT8_INTERMEDIATE` | 关 | `=1` MoE 块内激活走 q8_0 中间态；与 FP16 同设时 INT8 赢。`src/llama-graph.cpp:2508`、`ops.cpp:664` | **否决留档**：比 FP16 差一个量级（HANDOVER:1227 ②），别用 |
+| `GGML_MOE_HOT_STATS` | 关 | `=1` 经 gate 投影的 mmid ids 统计每层每专家命中数（每个 (token, expert) 选中计一次），退出时 atexit 落盘 TSV；上限 128 层 × 1024 专家。`repack.cpp:81` | 采集热专家画像；产出即 Slice 12 `GGML_HOT_EXPERT_TABLE` 的输入格式（§4.4） |
+| `GGML_MOE_HOT_STATS_PATH` | `/tmp/expert-hot.tsv` | 上者 TSV 的落盘路径。`repack.cpp:60` | 配合上者 |
+
+#### 1.3.1 repack 格式开关（读取点集中在 `repack.cpp:7646-7846`，均为 A/B 旋钮，生产保持默认）
+
+| 变量 | 默认 | 作用 |
+|---|---|---|
+| `GGML_REPACK_Q2_K` | AVX512-VNNI 机器**关**（该平台上成熟 row-major vec-dot 更快），其他架构开 | Q2_K 8x8 repack 内核；`=1` 强制开、`=0` 强制关 |
+| `GGML_REPACK_IQ2_XXS` | 开 | IQ2_XXS 8x8 内核（需 AVX512+VNNI+VBMI）；`=0` 回退 |
+| `GGML_REPACK_IQ4_XS` | **关** | IQ4_XS x8 LUT 布局（无原生内核，x86 上比 vec_dot 慢）；`=1` 仅为原生内核开发留门 |
+| `GGML_REPACK_Q3_R` | 开 | Q3_R repack（恒等 memcpy，热内核需 VNNI+VBMI+BW）；`=0` 强制 row-major vec_dot 回退 |
+| `GGML_REPACK_UDNL_W4` | 开 | UDNL_W4 NR16xK4 panel 重排（需 AVX512F+BW+VNNI）；`=0` 回退标量 vec_dot |
+| `GGML_REPACK_UDNL_MX` | 开 | UDNL_MX panel 重排 + 16 行共享 mode word 折叠（需 F+BW+VNNI+VBMI）；`=0` 回退 |
+| `GGML_REPACK_E4A` | 开 | E4A NR16xK4 panel 重排（需 AVX512F+BW+VNNI）；`=0` 回退 |
+| `GGML_REPACK_Q3_R_GEMV_INT` | 开 | Q3_R GEMV 整数 scale 变体；`=0`（或空串）回落 bit-exact 变体。**每次调用读取**（非 static），测试可动态切换。`arch/x86/repack.cpp:2482` |
+| `GGML_REPACK_Q3_R_GEMM_MR` | `8` | Q3_R GEMM 行分块；`=4` 恢复旧分块。`arch/x86/repack.cpp:5994` |
+| `GGML_REPACK_Q3_R_GEMM_MADD` | 开 | Q3_R GEMM maddubs+madd 整数 tile（仅 nc≥8 启用）；`=0` 强制 fp32-finalize tile。`arch/x86/repack.cpp:6002` |
 
 ---
 
@@ -176,6 +201,10 @@ worker CLI 参数见 §7.3。
 | `GGML_CUDA_MOE_PP_EP_OWNER_EXPERTS` | `n_expert/2` | rank0 持有的专家数（覆盖 50/50 拆分）。`src/llama-layer-major.cpp:32` | 双卡算力不均时调 |
 | `GGML_CUDA_MMQ_MOE_J` | `0`（自动） | 强制 MoE MMQ tile 宽度 J（8..128 步进 8）；自动模式按每专家典型行数选择。`ggml/src/ggml-cuda/mmq.cuh:1486` | 仅 A/B 测量 |
 | `GGML_CUDA_P2P` | 关 | 允许双卡 backend 用 peer/NVLink copy。`ggml-cuda.cu:400` | 有 NVLink/P2P 时开；无能力勿设 |
+| `GGML_CUDA_MOE_PP_RESERVE_MB` | `2048` | MoE 预取 staging 槽扩容时必须保留的显存余量（MB），不足则槽不增长。`ggml-cuda.cu:2527` | 显存紧张时调 |
+| `GGML_CUDA_ALLREDUCE` | 平台默认（Linux 尝试 NCCL，未编译 NCCL 时回退） | 多卡 TP AllReduce 实现选择：`nccl` / `internal`（自研 P2P 流水线，`allreduce.cu`）/ `none`；未知值 warning + none。`ggml-cuda.cu:1277` | **实验级**：Slice 11 二轮 TP tg +49%（13.6→20.3）仍低于 layer 模式 25.9；生产保持 layer split |
+| `GGML_CUDA_AR_P2P` | 开（有 P2P 授权时） | internal AllReduce 的 P2P direct-read 路径；`=0` 退出。前置：`GGML_CUDA_P2P` 已设（或编译 NCCL）且双卡双向 peer 可达。`allreduce.cu:714` | 仅 A/B 诊断 |
+| `GGML_SCHED_ASYNC_READBACK` | **开**（设 `0` 关闭） | scheduler 对跨 backend split 的结果用异步 D2H readback（Slice 4a）。`ggml-backend.cpp:2559` | 生产默认；`=0` 仅 A/B 回归 |
 
 ### 4.2 attention / top-k / KV（CUDA 内核）
 
@@ -184,7 +213,7 @@ worker CLI 参数见 §7.3。
 | `GGML_CUDA_BATCHED_TOPK` | **开**（2026-08 起默认开，设 `0` 关闭；`k==512` 门限仍在） | `k=512, nrows>=32` 时用每行一个 block 的 stable batched radix top-k（边界 ties 按较低索引稳定选择）。`ggml/src/ggml-cuda/top-k.cu:190` | DSV4 Lightning Indexer launch storm 场景：16K PP +8%；生产配置开启 |
 | `GGML_CUDA_DSV4_KV_REUSE` | **开**（2026-08 起默认开，设 `0` 关闭；仅命中 DSV4 形状门） | 对 DSV4 `K=V` alias、512 维、64 列 FA specialization 保留完整 K shared tile 供 V 相位复用（约 100 KB dynamic shared memory）。`ggml/src/ggml-cuda/fattn-mma-f16.cuh:2186` | 16K prefill +3.9%，logits 逐位一致；生产配置开启 |
 | `GGML_CUDA_DSV4_SPARSE_RAW_COMPACT` | `0`（关） | sparse FA 内仅保留每组有效 raw span（≤512 行）再追加 compressed union；要求同时开 sparse FA 且 query batch ≥256。`ggml/src/ggml-cuda/fattn-common.cuh:1492` | 16K sparse 596→754 tok/s；`=2` 仅强制小形状单测，生产勿用 |
-| `GGML_CUDA_DSV4_Q1_HEADS` | 见源码 | q1 FA 的 head 分组覆盖。`ggml/src/ggml-cuda/fattn.cu:201` | 仅实验 |
+| `GGML_CUDA_DSV4_Q1_HEADS` | `0`（自动：Ampere MMA 且 K 行数 ≥1024 用 32，否则 8） | q1 FA 的 head 分组覆盖（>0 生效，要求 Q/K head 比整除分组）。`ggml/src/ggml-cuda/fattn.cu:201` | 仅实验 |
 | `LLAMA_DSV4_SPARSE_FA` | `0`（关） | 8-query union 组装 sparse physical rows + 逐 query mask；只在 query batch ≥256 建图，q1 自动 dense。**改变浮点归约分组，非 bit-exact**。`src/models/deepseek4.cpp:1050` | 长上下文 PP 实验 |
 | `LLAMA_DSV4_FUSED_INDEXED_FA` | `0`（关） | raw/compressed 两段 KV 不经全宽 concat 直接进 sparse kernel。仅 F16 KV。`=1` decode+prefill，`=2` 仅 q1 decode，`=3/4` 追加多流 decode。`deepseek4.cpp:314` | 16K 实测 q1 sparse 输 dense MMA（TG64 -12%），暂不默认开；长上下文再评估 |
 | `LLAMA_DSV4_Q8_SPARSE_FA` | `1`（开） | 量化 KV（如 q8_0）q1 decode 走 compact gather：只物化选中 compressed 行。`=0` 回落全扫，`=2` 追加多流 decode。`deepseek4.cpp:330` | Q8 KV 的默认最快 q1 路径，保持开 |
@@ -205,6 +234,20 @@ server 侧资格门：全新单序列 prompt、token 数 ≥ 阈值、无 cache 
 | `LLAMA_LAYER_MAJOR_SCHED_COPIES` | `0`（关） | layer-major 请求 scheduler pipeline copies；仅在 `n_ubatch ≤ 512` 时生效，否则打 warning 禁用。`src/llama-context.cpp:451` | 短 prefill 实验 |
 | `LLAMA_LAYER_MAJOR_RING_COMPAT` | `1`（开） | 紧凑环形 raw SWA cache 的 replay 兼容（按首趟逐 tile n_kv 回放，图输入逐字节一致）；`=0` 恢复旧行为：紧凑环上拒绝 layer-major。`src/llama-layer-major.cpp:710` | 仅诊断/回归对比 |
 
+### 4.4 热专家 GPU 驻留（Slice 12，**in flux**，接口未定型）
+
+源码：`src/llama-hot-expert.{h,cpp}`（env 清单 `llama-hot-expert.h:25-31`，解析 `llama-hot-expert.cpp:339-371`）。机制：按 `GGML_MOE_HOT_STATS`（§1.3）画像把每层 top-K 专家以紧凑 MXFP4 常驻一张 GPU；decode（小 n_tokens）时 MoE 块在图内 fork/join——custom op 把 router ids 重映射进紧凑 slot 空间（冷 slot 权重置零），GPU 异步算热专家 FFN，CPU 链只算冷 slot，merge op 等 backend event 后加回 GPU 部分。冷侧（CPU）部分与基线链 bit-identical；热侧走 CUDA 内核，与 CPU repack 内核非 bit-exact（同 `-ot` 卸载的数值差类别）。**Slice 12 进行中，env 名与默认值收官前可能变动，以源码为准。**
+
+| 变量 | 默认 | 作用 |
+|---|---|---|
+| `GGML_HOT_EXPERT` | 关 | 总开关（`=1` 开启） |
+| `GGML_HOT_EXPERT_TABLE` | 空（开启时**必填**，缺失报错） | 热专家 TSV 路径（`GGML_MOE_HOT_STATS` 产出格式） |
+| `GGML_HOT_EXPERT_GGUF` | 空（开启时**必填**） | 模型 GGUF 路径（读取热专家权重来源） |
+| `GGML_HOT_EXPERT_K` | `16` | 每层钉驻的热专家数 |
+| `GGML_HOT_EXPERT_DEV` | `CUDA1` | 热专家驻留设备 |
+| `GGML_HOT_EXPERT_LAYERS` | `all` | 生效层：逗号表/区间（如 `42`、`30-42`） |
+| `GGML_HOT_EXPERT_MAX_TOKENS` | `1` | GPU fork 处理的最大 n_tokens（TG 路径） |
+
 ---
 
 ## 5. 调度器（dspark / server 调度）
@@ -218,6 +261,7 @@ dspark（DSpark sidecar draft 投机解码）通过通用 speculative CLI 配置
 | `--spec-draft-p-min P` | `0.0`（`common/common.h:330`） | 贪婪接受的最小投机概率。`common/arg.cpp:4134` | 生产值 `0` |
 | `--spec-draft-device DEV` | — | draft 模型放置设备。与 `-dev/-sm/-ts` 配合做双卡布局 | 双卡：target 层 + target KV 在 CUDA0，dspark 主体与 draft KV 在 CUDA1 |
 | `LLAMA_DSPARK_CONF_PROFILE` | 关 | 设置即开：dspark 接受率/置信度画像日志。`common/speculative.cpp:942` | 调 n-max/p-min 时观测 |
+| `LLAMA_SPC_PROF` | 关 | 设置（任意值）即开：speculative 流水线各阶段逐次计时，stderr 打 `SPC_PROF kind=<proc|draft> t_us=.. dur_us=.. n_tokens=..`。`common/speculative.cpp:2625` | 投机管线分段耗时观测 |
 | `LLAMA_SERVER_PREFILL_CHUNK_SIZE` | `0`（adaptive） | server prefill 调度器固定 chunk 大小；0 = 自适应。`tools/server/server-context.cpp:1298` | 一般保持自适应 |
 
 跨机 EP 的动态调度（dealer、端点、热点副本）变量全部在 §2.2（`GGML_REMOTE_EP_SCHED_*`）。
@@ -247,6 +291,14 @@ dspark（DSpark sidecar draft 投机解码）通过通用 speculative CLI 配置
 | `LLAMA_TRACE` | 关 | server/loader 详细 trace | `tools/server/server-context.cpp:1281` |
 | `LLAMA_SERVER_SLOTS_DEBUG` | 关 | server slot 调度调试 | `server-context.cpp:1290` |
 | `LLAMA_DSPARK_CONF_PROFILE` | 关 | dspark 置信度画像（见 §5） | `common/speculative.cpp:942` |
+| `LLAMA_SPC_PROF` | 关 | 投机流水线分段计时（见 §5） | `common/speculative.cpp:2625` |
+| `GGML_MOE_HOT_STATS` | 关 | 专家命中画像（见 §1.3） | `repack.cpp:81` |
+| `GGML_OFFLOAD_TRACE` | 关 | 设置即开：`_exps` 张量 offload 决策与 layer-major 路由 trace（`[lm-trace]` engaged/decline 原因、rollback 等） | `src/llama-model-loader.cpp:1236`、`src/llama-layer-major.cpp:766`、`src/llama-graph.cpp:2232` |
+| `LLAMA_LAYER_MAJOR_PROFILE` | 关 | `=1` layer-major 执行器逐调用分段计时（store/sync/rewind/tile 计数） | `src/llama-layer-major.cpp:852` |
+| `LLAMA_LAYER_MAJOR_DEBUG_SUM` | `0` | 逐层 hc checksum 定位非确定性漂移；`=2` 追加逐 tile checksum，`=3` 再 dump 层 1/tile 0 交接处原始 float | `src/llama-layer-major.cpp:906` |
+| `LLAMA_DSV4_INPUT_PROFILE` | 关 | `=1` DSV4 `set_input` 各阶段（plan/raw 等）计时 | `src/llama-graph.cpp:1001` |
+| `LLAMA_DSV4_COMPRESS_DEBUG` | 关 | `=1` 打印 DSV4 compressed KV plan 的 state 持久化/写入位置 | `src/llama-graph.cpp:841`、`src/llama-kv-cache-dsv4.cpp:692` |
+| `GGML_CUDA_TOPK_OVERLAP_PROFILE` | 关 | `=1` 起 3×256 诊断 kernel 统计 batched top-k 结果在 8 行组间的重叠度 | `ggml/src/ggml-cuda/top-k.cu:302` |
 
 ---
 
@@ -315,7 +367,7 @@ llama-epd -m model.gguf --selftest [--selftest-layer N] [--selftest-tokens N]
 | `GGML_NUMA_FAKE_NODES` | 测试 only | 单节点机伪造 NUMA 拓扑 |
 | `LLAMA_DSV4_2KV=old` | 调试 only | 旧 2kv 对比路径，CUDA 上已坏 |
 
-## 8. AMX 加速路径（Sapphire Rapids+，Ice Lake 不可用）
+## 9. AMX 加速路径（Sapphire Rapids+，Ice Lake 不可用）
 
 构建（默认 OFF）：`-DGGML_AMX_TILE=ON -DGGML_AMX_INT8=ON -DGGML_AMX_BF16=ON`，需同时显式开 AVX512 家族（非 NATIVE 构建时）：`-DGGML_NATIVE=OFF -DGGML_AVX512=ON -DGGML_AVX512_VNNI=ON -DGGML_AVX512_VBMI=ON -DGGML_AVX512_BF16=ON -DCMAKE_CXX_FLAGS="-mavx512vpopcntdq -mgfni" -DCMAKE_C_FLAGS="-mavx512vpopcntdq -mgfni"`。
 
@@ -326,3 +378,26 @@ llama-epd -m model.gguf --selftest [--selftest-layer N] [--selftest-tokens N]
 - gemv/gemm 分流：M==1 自动走 AVX512-VNNI 内核（decode 带宽受限，AMX 无收益），M>1 走 tile gemm；无需手工阈值。
 - 验证手段（无 AMX 硬件）：Intel SDE `sde64 -spr` 下 bit-exact/tol 对比，harness 参考 `test-amx-smoke.cpp` 模式。
 - 未接：NUMA EP 行窗（GGML_NUMA_EP）对接 AMX buft（代码内有 TODO 对接点；128 行窗与 AMX 32 行块对齐已确认兼容）。
+
+---
+
+## 10. 附录：L3 实验/否决留档
+
+集中留档**实验脚手架与已否决方向**（对应硬化方案 PROJECTHARDENING-PLAN §1.3 处置表）。约定：无特殊说明时代码保留、default-off，仅诊断/复现用，生产不开；标注「H3 删除」的项在硬化 H3 slice 移除。
+
+| 项 | 状态 | 证据与结论 |
+|---|---|---|
+| `GGML_CUDA_MOE_PP_DUAL` | **死参数**（代码无读取点），H3 删除引用 | 仅存在于旧脚本/旧文档（§4.1、§8 已标注） |
+| `GGML_REMOTE_EP_SCHED_DEAL` | 名义参数 | `static`/`balance` 是同一个确定性 dealer，无实际差异（§2.2） |
+| `GGML_NUMA_THP` / `GGML_KV_THP` | **否决**，H3 删除代码 | MADV_COLLAPSE 全 EINVAL 零收益；KV THP TG -6%/PP -55%（HANDOVER Slice2.7；§8） |
+| `GGML_NUMA_EP_PLACE=block` + collapse 链路 | 否决留档，default-off | THP 修通但端到端零收益（HANDOVER:1377-1383，commit 752c435fd；§1.1） |
+| 三级 barrier（`HIER_BARRIER=2`）+ `GGML_NUMA_PIN_CORE` + `GGML_NUMA_BARRIER_GROUP` | 否决留档，default-off | Slice 10 否决（commit 35aa515b9，HANDOVER:1491-1497；§1.2） |
+| `pocs/udnl-grid-mmid.cpp` | 否决留档 | Slice 6 的 32 核网格 GEMM 原型，胜率 0（HANDOVER:1395-1400） |
+| `GGML_CPU_INT8_INTERMEDIATE`（INT8 激活岛） | 否决留档，default-off | 比 FP16 差一个量级（HANDOVER:1227 ②；§1.3） |
+| `GGML_CUDA_FA_PV_Q8` | 否决留档，default-off | q8_0 V 的替代 P*V 路径，负结果（HANDOVER:1227 ④；`fattn-common.cuh:1692`） |
+| `GGML_REMOTE_EP_PIPELINE(+_CHUNK)` | 留档，default-off | 净收益仅 +0.7~1.4%（§2.3） |
+| `LLAMA_LAYER_MAJOR_SPECULATIVE` | 留档，default-off，**生产禁开** | 远程 EP 下负收益（§4.3） |
+| `GGML_REMOTE_EP_SCHED_REPEAT_ACCOUNTING` | 留档，default-off | 单 slot -1.45%（§2.2） |
+| `GGML_CUDA_ALLREDUCE=internal`（TP AllReduce） | 实验级保留 | 二轮 TP tg +49%（13.6→20.3）仍低于 layer 模式 25.9；联合 graph 捕获已否决（天花板 +3，HANDOVER:1503；§4.1） |
+| 整层 `-ot` 跨设备钉卡 | 否决，无代码残留 | Slice 9：跨设备 -10%（HOT-EXPERT-GPU.md §4） |
+| dspark 流水线化 / 半确定预取 / e144 / MXFP4 NR5..8 / signed-bias dealer / GLU-down fusion | 各 Slice 否决，代码已回退 | 无残留，仅留档 |

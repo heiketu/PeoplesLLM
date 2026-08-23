@@ -1,87 +1,180 @@
 # PeoplesLLM
 
-> **[中文 README →](README.md)**
+> **[中文 README](README.md)**
 
-**Run 200B–3T-parameter MoE models locally on cheap hardware — fast.**
-A specialized llama.cpp fork for dual/multi-socket CPU servers plus consumer GPUs, with four self-developed optimization tracks: CPU compute kernels, the NUMA subsystem, GPU long-context prefill, and cross-machine expert parallelism.
+**Run 200B-3T MoE models on local servers while making multiple CPU sockets, consumer GPUs, and remote memory contribute to one inference job.**
 
-![Headline speedups](docs/benchmarks/headline_speedups.png)
+PeoplesLLM is a llama.cpp fork for heterogeneous local inference. It evolves along three connected tracks: a multi-NUMA/multi-device execution architecture, AVX512 and GPU kernels, and compute-oriented GGUF weight formats. The standalone `tools/epd/` runtime provides expert parallelism across machines.
 
-## About
+## Scope
 
-The author comes from a hardware background; all design, coding, testing and tuning in this project were done by AI (Kimi K3 + Kimi Code CLI) — the author only picks the technical directions (EP, GEMM kernels, AVX512/VNNI/VBMI, NUMA, etc.). The code may not be pretty and may contain bugs; it is only guaranteed on the author's own rig (dual Xeon 8360Y + 2× RTX 3090). Main tuning targets: **DeepSeek-V4 / DSV4-Flash** and **GLM-5.2**. Issues welcome.
+The main model's attention, dense layers, router, and KV cache can stay on the GPU while routed MoE experts run on a dual-socket CPU or remote NUMA workers. The goal is not to run one model replica or one slot per node: multiple NUMA nodes cooperate on **the expert work of one layer for one slot**.
 
-Test platform: dual Xeon 8360Y (Ice Lake, 152 threads, 251G RAM) + 2× RTX 3090 24G (NVLink) + a ConnectX-5 100G direct-linked slave (dual Ice Lake ES, 188G). Baseline = upstream llama.cpp, same machine, same methodology A/B.
+The author chooses the architecture and hardware direction; implementation, testing, and tuning are AI-assisted. Every public performance claim below comes from a measured, matched comparison. This is still a research and engineering project, so production use requires output and capacity validation on the target system.
 
-## Features
+Primary test system: dual Intel Ice Lake-SP sockets (152 logical threads, 251 GiB DDR4-3200), 2 x RTX 3090 24 GiB with NVLink P2P, and a dual-socket Ice Lake-SP worker connected through ConnectX-5 100 GbE/RoCEv2. The main tuning targets are DeepSeek-V4 / DSV4-Flash and GLM-5.2.
 
-### CPU inference
+## Verified results
 
-| Feature | When to use | Impact |
-|---|---|---|
-| **AVX512/VNNI/VBMI 8×8 repack kernels** (Q2_K–Q6_K, Q8_0, MXFP4, IQ1_S/IQ1_M/IQ2_XXS) | All CPU compute; biggest win on long-prompt batches | prefill gemm up to **4.9×** (micro-bench); GLM-5.2 end-to-end **PP 4.1×** |
-| **IQ2_XXS AVX512 repack gemv/gemm kernel** (x8 layout) | CPU inference of IQ2_XXS-weight models | gemv micro-bench **17×**; full-model A/B still flat (bottleneck is the uncovered expert mul_mat_id) — model-level gains pending extension |
-| **NUMA mirror** (`--numa mirror`) | Dual-socket servers with RAM to spare | Best TG (**+9%** vs upstream), zero cross-socket UPI traffic |
-| **NUMA row-window EP** (`GGML_NUMA_EP=1`) | RAM-constrained, loading oversized models; also works inside EPD workers spanning NUMA nodes | **Half the expert memory**, TG matches mirror, single-writer dst rows with zero merge; ABAB-measured hybrid tg512 **+49%**, pure-CPU tg128 **+61%** (incl. load-degradation resistance), pp +6~12% |
-| **Hierarchical barrier** (`GGML_NUMA_HIER_BARRIER=1`) | Multi-NUMA-node inference | +0.9% (noise-level but free) — recommended always-on |
-| **repack gemv software prefetch** (`GGML_REPACK_GEMV_PREFETCH=1`) | repack-kernel decode | TG **+2.6%** — recommended always-on |
-| **Fused ops** (hyper-connection HC, MoE router, RMS_NORM absorption, DSA Lightning Indexer) | DSV4 / GLM everywhere | Eliminates decomposed paths and intermediate activation traffic |
-| **MTP speculative decoding** | DSV4 decode | Further TG gains (all numbers here are without MTP) |
+Each row below is an independent benchmark scope. Percentages from different rows must not be multiplied together.
 
-### GPU inference (long context)
+| Track | Matched baseline | Current result | Change |
+|---|---:|---:|---:|
+| DSV4 pp2048, MXFP4 -> UDNL_MX | 307.58 tok/s | **384.87 tok/s** | **+25.1%** |
+| DSV4 pp2048, quality-equivalent MXFP4 -> E4A | 315.7 tok/s | **370.0 tok/s** | **+17.2%** |
+| DSV4 DSpark decode, n2/p0 | 23.9 tok/s | **30.1 tok/s** | **+26%** |
+| DSV4 raw decode, matched hot-expert A/B | 26.0 tok/s | **28.5 tok/s** | **+9.7%** |
+| DSV4 16K GPU MoE prefill | 213 tok/s | **334.5 tok/s** | **+57%** |
+| GLM-5.2 pp512, true EP on 2 -> 4 NUMA workers | 24.13 tok/s | **40.59 tok/s** | **+68.2%** |
+| DSV4 GGUF size, MXFP4 -> UDNL_MX | 145.3 GiB | **116.1 GiB** | **-20.1%** |
 
-| Feature | When to use | Impact |
-|---|---|---|
-| **Layer-major long prefill** (`llama_decode_layer_major()`, layer weights resident in CUDA slots) | 4K–1M long prompts | 16K PP 161→**604 tok/s** (**752** with sparse compact opt-in), 4.7× |
-| **Streaming MoE prefill + 3-slot dual-GPU prefetch** | Hybrid inference with expert weights in host RAM | Each layer's weights uploaded once, reused across tiles |
-| **True dual-GPU same-layer expert-axis EP** (`GGML_CUDA_MOE_PP_EP`, opt-in) | Dual-GPU prefill | 2K PP **+63%** (277→452 tok/s), bit-identical output |
-| **Batched top-k** (`GGML_CUDA_BATCHED_TOPK`) | DSA sparse-attention models, long context | top-k kernel **21.6×**, e2e PP +8.2% |
-| **q1 32-head FA + raw-SWA decode ring** (ring on by default; `LLAMA_DSV4_COMPACT_DECODE_SWA=0` to disable) | Long-context decode | q1 decode graph width decoupled from prompt length: fixed TG64 8.89→**12.09** (+33~36%), TG512 +4~8%; automatic fallback for multi-slot |
-| **q8 compact sparse FA** (on by default, q8_0 KV) | Long-context decode with q8 KV | q1 decode materializes only top-k selected rows: TG64 9.75→**10.69** (+10%) — fastest q1 decode path (beats f16 dense); f16 fused sparse stays opt-in (16K measured -12%) |
-| **Multi-stream (small-q) sparse FA** (`LLAMA_DSV4_FUSED_INDEXED_FA=3/4`, `LLAMA_DSV4_Q8_SPARSE_FA=2`, opt-in) | Multi-slot concurrent decode | Correctness verified three-way byte-identical; parity at ≤16K (weight-bandwidth bound), payoff targeted at 256K+ context |
-| **GPU streaming prefill** (plan A, server integration) | Long prompts in llama-server | Full-tile path PP 63→**127.6 tok/s** (2×); falls back to chunked via eligibility gate under compact ring SWA cache, `--swa-full` to enable |
-| **GPU expert offload** (`-ot blk.N.ffn_*_exps=CUDA0/1`) | Spare VRAM | ~+1% TG per offloaded layer |
+![Milestones across three performance tracks](docs/img/evolution-staircase.png)
 
-### Cross-machine distributed EP (`tools/epd/`)
+## Architecture evolution
 
-| Feature | When to use | Impact |
-|---|---|---|
-| **Cross-machine expert parallelism** (activation dispatch, KB-scale traffic — not weight transfer) | Model doesn't fit in one machine's RAM | DSV4 two-machine matches single-machine speed with **26% less** master RAM |
-| **RoCEv2 RDMA transport** (`GGML_REMOTE_EP_RDMA=1`, automatic TCP fallback) | IB/RoCE NICs; plain gigabit falls back seamlessly | RTT 42-74µs→**10-13µs**; after the large-frame fix, PP1020 33.4→**76.1 tok/s (2.3×)** |
-| **MAX-EFFORT layer mirroring** (`GGML_REMOTE_EP_MIRROR=1`) | Spare master RAM, decode-heavy workloads | Remote segment leaves the critical path, TG **+9~11%** |
-| **True four-NUMA, single-slot EP** (`SCHED_KLOCAL=0` + hot-expert replicas) | Two dual-socket machines compute one request together | GLM-5.2 PP512: 2 NUMA **24.13**→4 NUMA **40.59 tok/s (1.682×)**; byte-identical output across 75 layers |
-| **EP planner** (`tools/epd/ep-plan.py`) | Pre-deployment layer-split decisions | Recommends splits from measured bandwidth/latency, calibration error ≤1.5% |
+### 1. NUMA collapse: start with measurement
 
-### Model support
+Naive interleaving on a dual-socket machine sends a large fraction of weight reads over UPI while every thread waits for the slowest participant at a barrier. Measured streaming bandwidth is **122 GB/s with interleaving versus 313.5 GB/s with local pages and local thread binding**, a 2.57 x gap. MoE decode consists of short, low-arithmetic-intensity bursts, so adding threads cannot solve this placement problem.
 
-DeepSeek-V4 / DSV4-Flash (incl. native MXFP4), GLM-5.2 (DSA), MiniMax-M3; plus a byte-level GGUF repair toolchain (quant-block corruption scan + patch — fixed 138 corrupted blocks in the official GLM-5.2 file that caused garbled output).
+### 2. Mirror: eliminate remote reads first
 
-## Quick start
+`--numa mirror` keeps one complete weight replica per socket and binds pages and threads to the same node. It removes cross-UPI expert traffic and reaches 30.35 tok/s on DSV4 tg512, about 8%-13% above the same-machine upstream distribute result of 26.9-28.0 tok/s. The cost is 2 x expert-weight memory.
+
+### 3. NUMA EP: half the memory, but static ownership is too coarse
+
+The next design stores each expert on only one node. Expert memory is halved and pp512 roughly matches mirror (343-348 versus 338-347 tok/s). At batch=1, however, one expert is one indivisible GEMV. Statically placing eight active experts into two nodes leaves a long-tail bubble and reaches only 23.9-24.2 tok/s on tg512. This stage established the central constraint: **placement must preserve fine-grained parallelism and scheduling freedom.**
+
+### 4. NUMA row-window TP + DME
+
+The final layout alternates 128-row windows of every expert plane across the two nodes; execution dynamically claims work in 64-row quanta. Both sockets stream every expert, each output row has one writer, and no cross-node reduction is needed. The environment variable remains `GGML_NUMA_EP=1`, but the execution semantics are expert-internal row-window tensor parallelism.
+
+![NUMA row-window TP on/off](docs/img/numa-tp-onoff.png)
+
+| Workload | Off | On | Change |
+|---|---:|---:|---:|
+| hybrid tg512 | 16.59 | **25.01** | **+51%** |
+| hybrid pp2048 | 267.05 | **298.98** | +12% |
+| pure-CPU tg128 | 7.23 | **11.65** | **+61%** |
+| pure-CPU pp512 | 101.41 | **107.91** | +6.4% |
+
+On top of row-window TP, DME (Dynamic Matrix Execution) handles irregular MoE shapes inside each node:
+
+- the claim quantum grows from 16 to 64 rows, raising microbenchmark bandwidth from 145 to 165-179 GB/s;
+- `nrows` and batch shape select GEMV versus GEMM, while 2-8 UDNL tail rows for the same expert are batched;
+- correcting a mismatch between core binding and row ownership cuts `MUL_MAT_ID` from 155.7 to 88.4 us/call;
+- a two-level NUMA barrier and repeat-aware scheduling reduce tail waits.
+
+### 5. Hybrid GPU execution
+
+In the production-style hybrid path, the GPU runs attention, dense layers, the router, and KV; the CPU runs routed experts. Three complementary mechanisms target different phases:
+
+- **Hot-expert residency**: the corrected trace shows that the top 16 experts per layer cover 49.1% of selections; compact MXFP4 weights for all 43 layers use about 8.8 GiB. An in-graph GPU hot branch forks against the CPU cold branch and joins before the residual. Matched tg512 runs improve from 26.1/25.9 to 28.4/28.6 tok/s, or 9.7% on the means.
+- **NVLink P2P TP**: capture-safe P2P allreduce and asynchronous D2H readback improve the TP path itself from 13.6 to 20.3 tok/s (+49%) and reduce `cudaStreamSynchronize` from about 690 to 150 calls per token. This is an internal TP-path A/B, not a comparison against the best layer-placement path.
+- **Streaming MoE prefill**: expert weights remain in pinned host memory. Long prompts upload them once per layer, reuse them across tiles, and overlap H2D with dual-GPU expert-axis EP and three-slot prefetch.
+
+![GPU streaming MoE prefill](docs/img/gpu-prefill-streaming.png)
+
+| 16K prompt | tok/s |
+|---|---:|
+| chunked token-major | 213 |
+| layer-major + pipe + device-HC | 248.5 |
+| + dual-GPU EP + `PREFETCH=2` | **334.5** |
+
+### 6. Multi-machine EP: several NUMA workers, one slot
+
+`tools/epd/` transfers KB-scale activations and results, not expert weights during a request. Every NUMA node on the master and worker machine can be an independent worker. In strict pure EP mode (`SCHED_KLOCAL=0`), the master does not need a complete routed-expert replica. The runtime builds a holder map with hot replicas from real router frequencies and dispatches according to in-flight work.
+
+![Multi-machine expert parallelism](docs/img/remote-ep.png)
+
+| Test | Before | After | Change |
+|---|---:|---:|---:|
+| GLM-5.2 MoE pp512, 2 -> 4 workers | 24.13 | **40.59** | **1.682 x** |
+| DSV4 16K PP, UB64 -> UB256 | 235.37 | **269.36** | +14.4% |
+| 64 B RPC RTT, TCP -> RoCEv2 | 42-74 us | **10-13 us** | about 4-6 x lower |
+
+GLM dense layers and attention remain on the GPU; the first row scales only CPU MoE. Aggregate decode time for 75 MoE layers falls from 86.71 to 69.58 ms/token (1.246 x), with byte-identical 128-token output. Fixed-acceptance DSV4 pure EP over four workers and RDMA reaches 37.921 tok/s on average and 38.423 tok/s at peak, with the same output SHA256 as the single-machine reference.
+
+## Kernel evolution
+
+### AVX512 repack: route every MoE shape into a batch kernel
+
+The early audit found that several `mul_mat_id` branches still called `vec_dot` one row at a time, so large batches never reached GEMM. Buffer-type ordering in CUDA builds could also place CPU weights in a pinned buffer without repack support. The fork fills in 8 x 8 repack traits, load-time conversion, GEMV/GEMM dispatch, and the EPD worker path for Q2_K-Q6_K, Q8_0, MXFP4, and IQ formats.
+
+### arec panel-stationary: stream weights from DRAM once
+
+An arec (activation record) precomputes the Q8 activation and scale once. Weight panels then remain in L1/L2 and are reused across eight-row tiles. End-to-end pp2048 improves as follows:
+
+- UDNL_W4: 263.33 -> **366.58 tok/s (+39%)**;
+- UDNL_MX: 223.02 -> **384.87 tok/s (+73%)**.
+
+### Fusion and asynchronous boundaries
+
+- the five-kernel DSV4 router chain becomes one single-warp kernel, and small-row indexer top-k becomes one radix kernel; GPU busy time falls from 18.76 to 18.23 ms/token and tg rises from 25.15 to 25.91;
+- pinned staging plus event draining cuts CPU input readback from 13 to 4.6 ms/token;
+- MXFP4 repack GEMV software prefetch adds 2.6% TG;
+- 64-row claims and UDNL tail batching improve DSpark n2/p0 from 26.50 to 30.10 tok/s without changing acceptance or output.
+
+## Format evolution
+
+### The “why is Q2_K slower than expected?” starting point
+
+An initial 90.9 GiB model named `Q2_K` reached only 223.60 pp2048 and 22.87 tg512. Its TG was below the larger Q3_R at 25.30 tok/s, although its PP was above the not-yet-optimized Q3_R GEMM path at 174.60 tok/s. GGUF metadata then revealed that it was actually IQ2_XXS at 2.0625 bpw, not Q2_K. The apparent “Q2_K < Q3_K” result therefore separated into a labeling problem and a kernel-efficiency problem: codebook lookup, scale expansion, dequantization-chain length, and access to batch GEMM can dominate nominal bpw.
+
+The format work therefore moves from “fewest bits” to storage layouts that follow the kernel access order:
+
+- **UDNL_W4** uses fixed-size blocks whose codebook output feeds AVX512 VNNI directly;
+- **UDNL_MX** uses an importance matrix to allocate W2/W3/W4 blocks and reuses the same arec panel kernel;
+- **E4A** preserves MXFP4 values bit-exactly and aligns row-block nibble pairing with the NR16 kernel. Loading performs arithmetic-free byte-only panelization, with no decoding or requantization.
+
+![MoE weight size, speed, and quality](docs/img/quant-formats.png)
+
+| Format | Size | pp2048 | tg512 | WikiText-2 PPL | Role |
+|---|---:|---:|---:|---:|---|
+| MXFP4 | 145.3 GiB | 307.58 | 26.26 | 3.5830 | quality baseline |
+| **UDNL_W4 + arec** | 146.4 GiB | 366.58 | 24.99 | 3.7997 | fixed 4-bit compute-oriented layout |
+| **UDNL_MX + arec** | **116.1 GiB** | **384.87** | 26.38 | 4.6274 | smallest size and highest PP |
+| **E4A** | about 147.2 GiB | **370.0** | 26.37 | approximately MXFP4 | bit-exact MXFP4 values; load about 22 -> 11 s |
+| Q3_R (MoE) | 114.1 GiB | 174.60 | 25.30 | 4.7636 | small-format reference |
+| IQ2_XXS (file named Q2_K) | 90.9 GiB | 223.60 | 22.87 | 6.6338 | dequantization-cost reference |
+
+Choose UDNL_MX when capacity and PP matter most; choose E4A when MXFP4 values and quality must be preserved. The fixed format harness covers the main rows, while E4A quality was rechecked with a five-chunk PPL run; see [BENCHMARKS](docs/BENCHMARKS.md) for the exact scopes.
+
+## Build and run
 
 ```bash
-# CUDA build (single-machine hybrid inference)
-cmake -B build-cuda -DGGML_CUDA=ON && cmake --build build-cuda -j
+# CUDA hybrid build
+cmake -B build-cuda -DGGML_CUDA=ON
+cmake --build build-cuda -j
 
-# Production recipe: DSV4-Flash mxfp4, dual-socket NUMA EP + GPU offload
-GGML_NUMA_EP=1 GGML_NUMA_HIER_BARRIER=1 GGML_REPACK_GEMV_PREFETCH=1 \
-  build-cuda/bin/llama-server -m model.gguf -ngl 99 -ncmoe 99 -t 72 \
-  --numa distribute -fa 1 -b 4096 -ub 1024
+# CPU-only build
+cmake -B build-cpu -DGGML_CUDA=OFF
+cmake --build build-cpu -j
+
+# DSV4 single-machine hybrid: GPU dense/attention/KV, dual-socket CPU routed experts
+GGML_NUMA_EP=1 build-cuda/bin/llama-server \
+  -m /path/to/model.gguf -ngl 99 -ncmoe 99 \
+  -t 72 --threads-batch 72 --numa distribute -fa on -b 4096 -ub 1024
 ```
 
-Two-machine EP, pure-CPU and AVX2-only builds, and full deployment details: **[docs/QUICKSTART.md](docs/QUICKSTART.md)** (Chinese).
+`tools/peoplesllm-run.sh` provides `dsv4-prod`, `dsv4-dual`, `glm-dual`, and `cpu-pure` profiles. See the [quick start](docs/QUICKSTART.md), [parameter reference](docs/PARAMETERS.md), and [EPD guide](tools/epd/README.md) for remote workers, RDMA/TCP fallback, expert maps, and all options. Thread and ubatch settings must be recalibrated for the target CPU, memory channels, VRAM, and prompt length.
 
-## Docs
+## Measurement and correctness
 
-- **[docs/QUICKSTART.md](docs/QUICKSTART.md)** — build, recommended single-/dual-machine configs, common pitfalls
-- **[docs/PARAMETERS.md](docs/PARAMETERS.md)** — full env/CLI parameter manual and production recipes
-- **[docs/BENCHMARKS.md](docs/BENCHMARKS.md)** — complete measured data and iteration history (same-machine A/B vs upstream)
-- **[docs/CHANGES.md](docs/CHANGES.md)** — technical changelog (NUMA, CPU kernels, fused ops, distributed EP)
-- **[tools/epd/README.md](tools/epd/README.md)** — two-machine EP quick start
+- Performance A/B uses the same model, prompt, thread count, and offload setup. Important results use ABBA/reverse-order repeats to control the measured run-order effect of about 25%.
+- Paths that preserve reduction order use fixed-seed greedy decode with byte-for-byte or SHA256 comparisons.
+- Cross-device reductions can flip one token at near-tied logits because floating-point addition order changes. Those paths use run-to-run determinism and acceptance checks instead and are not described as bit-exact.
+- `pp` and `tg` are llama.cpp benchmark metrics; they are not an SLA for arbitrary concurrency, context length, or hardware.
 
-## Status
+See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for full measurements and scopes, and [docs/CHANGES.md](docs/CHANGES.md) for the technical change list.
 
-Early development. Validate output hashes, slot contexts and VRAM headroom yourself before production use. Upstream sync target: llama.cpp `4df29be4f` (2026-08-15, 96 commits merged; AVX2/AVX512 dual-build regression passed (tg flat, pp -5.4% attributed to upstream changes, see BENCHMARKS)). Ongoing: GPU prefill throughput, CPU/GPU cooperative pipelining, unified weight representation.
+## Documentation
 
-## License & Copyright
+- [Quick start](docs/QUICKSTART.md): builds, single/dual-machine recipes, and common issues
+- [Parameter reference](docs/PARAMETERS.md): environment variables, CLI options, and profiles
+- [Benchmark archive](docs/BENCHMARKS.md): detailed A/B data and charts
+- [Change list](docs/CHANGES.md): NUMA, kernel, GPU, and EP changes
+- [Dual-machine EP](tools/epd/README.md): workers, transport, and deployment
 
-This project is a fork of [llama.cpp](https://github.com/ggml-org/llama.cpp). **Copyright of the original project belongs to ggml-org and all llama.cpp contributors**, released under the MIT license. All changes in this fork are likewise released under the MIT license, preserving the original copyright notices and license text (see [LICENSE](LICENSE)).
+## License
+
+This project is a fork of [llama.cpp](https://github.com/ggml-org/llama.cpp). The original project is copyrighted by ggml-org and llama.cpp contributors and released under the MIT license. Changes in this fork use the same license and preserve the original notices and [LICENSE](LICENSE).

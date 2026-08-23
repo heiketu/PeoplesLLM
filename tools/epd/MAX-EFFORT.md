@@ -1,5 +1,7 @@
 # MAX-EFFORT：空闲内存换均衡——EP 层的感知式额外镜像设计
 
+> **状态标注（H0, 2026-08-23）：implemented**（P0 拓扑工具链、P3 路线 A `GGML_REMOTE_EP_MIRROR=1` 已双机实测，注意小档 PP ≤256 token 回归需关闭）；**experimental**（其余路线未落地）。
+
 状态：P0 工具已落地（ep-topo-probe / ep-topo-run.sh / ep-plan.py / ep-topo-profile.json）；
 **P3 路线 A（层内专家级静态比例拆分）已实现并双机实测**（2026-07-30，commit 115622070，
 `GGML_REMOTE_EP_MIRROR=1`，见 README "层镜像 + 专家 slot 拆分" 节）

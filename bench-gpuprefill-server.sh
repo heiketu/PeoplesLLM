@@ -2,10 +2,11 @@
 # P1 server 集成验证（需安静窗口，严禁与生产 llama-server 同时跑）：
 # 资格门路由（合格/不合格请求）、PP 提升、并发 slot TG 抖动、门限扫参。
 # 用法: ./bench-gpuprefill-server.sh [MIN_TOKENS=4096]
+# H2 修复（2026-08-23）：WT 原指向 ../llama-gpuprefill worktree（已不存在），改指本仓库根。
 set -x
 LOCK=/tmp/xllama-bench.lock
 MODEL_MX=/media/heiketu/2922DB6548C1F185/DeepSeek-V4-Flash-Q4-mxfp4-0731.gguf
-WT=/home/heiketu/x-llama.cpp/llama-gpuprefill
+WT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 OUT=/tmp/gpuprefill-server
 MIN_TOKENS=${1:-4096}
 PORT=8090

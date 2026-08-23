@@ -113,10 +113,18 @@ static constexpr int GGML_CUDA_AR_KERNEL_BLOCKS = 8;
 // kernel schedule keeps runs deterministic.
 //
 // Flags live in device memory (cudaMalloc, peer-accessible), written only
-// by the local device and read over P2P.  Tokens increase monotonically per
-// call so flags never need resetting.  Scratch is per-device and touched
-// only by the local kernel, and successive launches on the same stream are
-// ordered, so a single scratch buffer per device suffices.
+// by the local device and read over P2P.  Each kernel launch takes the next
+// handshake site (GGML_CUDA_AR_P2P_SITES-deep round-robin); a site's token
+// is derived on-device as old_flag_value + 1, so flags never need resetting
+// and the protocol survives CUDA graph capture/replay (a captured node's
+// host-side arguments would otherwise freeze the token).  The two-phase
+// arrive/done handshake bounds how far either device can race ahead: the
+// done spin of node N cannot complete before the peer's node N arrive spin
+// has observed the expected token, so a same-site write of token+1 always
+// happens strictly after the peer finished polling for token -- no missed
+// wakeup across site reuse.  Scratch is per-device and touched only by the
+// local kernel, and successive launches on the same stream are ordered, so
+// a single scratch buffer per device suffices.
 // ---------------------------------------------------------------------------
 template <typename T>
 static __global__ void ggml_cuda_ar_p2p_kernel(
@@ -125,8 +133,12 @@ static __global__ void ggml_cuda_ar_p2p_kernel(
         T * __restrict__ scratch,
         int count,
         int * arrive_mine, const int * arrive_peer,
-        int * done_mine,   const int * done_peer,
-        int token) {
+        int * done_mine,   const int * done_peer) {
+    // Capture-safe handshake token: instead of a host-baked call counter
+    // (which freezes under CUDA graph capture/replay), derive the token from
+    // the device-resident flag itself: each execution of this node expects
+    // old_value + 1.  Flags are never reset; both devices derive the same
+    // sequence because they execute the same node order per replay.
 
     constexpr int ELEMS_PER_VEC = ggml_cuda_get_max_cpy_bytes() / sizeof(T);
     constexpr int ARRIVAL_INTS  = (int)(GGML_CUDA_AR_ARRIVAL_STRIDE / sizeof(int));
@@ -143,6 +155,7 @@ static __global__ void ggml_cuda_ar_p2p_kernel(
         int       * my_arr   = arrive_mine + bid * ARRIVAL_INTS;
         const int * peer_arr = arrive_peer + bid * ARRIVAL_INTS;
 
+        const int token = ggml_cuda_ar_signal_get(my_arr) + 1;
         ggml_cuda_ar_signal_set(my_arr, token);
         __threadfence_system(); // make our signal visible to the peer
 
@@ -175,6 +188,7 @@ static __global__ void ggml_cuda_ar_p2p_kernel(
         int       * my_d   = done_mine + bid * ARRIVAL_INTS;
         const int * peer_d = done_peer + bid * ARRIVAL_INTS;
 
+        const int token = ggml_cuda_ar_signal_get(my_d) + 1;
         ggml_cuda_ar_signal_set(my_d, token);
         __threadfence_system();
 
@@ -432,6 +446,13 @@ struct ggml_cuda_ar_host_mapping {
 // reductions are chunked over the scratch buffer.
 static constexpr size_t GGML_CUDA_AR_P2P_MAX_BYTES = 32 * 1024 * 1024; // 32 MB
 
+// Number of independent P2P handshake sites.  Each AR kernel launch takes the
+// next site round-robin; a site owns its own arrive/done flag arrays whose
+// values self-increment per use (see the kernel).  This makes the handshake
+// correct both in eager mode and inside a captured CUDA graph, where every AR
+// node must have flags independent of the other nodes in the same graph.
+static constexpr int GGML_CUDA_AR_P2P_SITES = 256;
+
 struct ggml_cuda_ar_pipeline {
     int      n_devices;
     int      devices[GGML_CUDA_MAX_DEVICES];
@@ -446,8 +467,8 @@ struct ggml_cuda_ar_pipeline {
     bool     p2p_enabled;
     size_t   p2p_scratch_bytes;                         // bytes per device in p2p_scratch[]
     char *   p2p_scratch[GGML_CUDA_MAX_DEVICES];        // local landing zone for the peer's stripe
-    int *    p2p_flags[GGML_CUDA_MAX_DEVICES];          // [blocks arrive ints][blocks done ints], 64B-spaced
-    uint64_t p2p_call_count;
+    int *    p2p_flags[GGML_CUDA_MAX_DEVICES];          // [site][arrive/done][blocks] ints, 64B-spaced
+    uint64_t p2p_call_count;                            // kernel-launch counter, selects the handshake site
 
     // Per-device resources.
     ggml_cuda_ar_host_mapping host_buf[GGML_CUDA_MAX_DEVICES];   // pinned staging (chunked kernel)
@@ -484,13 +505,14 @@ static int * ggml_cuda_ar_arrival_ptr(const ggml_cuda_ar_pipeline * p, int slot,
     return reinterpret_cast<int *>(p->arrival.dev + offset);
 }
 
-// Base pointers for the P2P arrive/done flag arrays of device `rank`.
+// Base pointers for the P2P arrive/done flag arrays of (site, rank).
 // The kernel adds blockIdx.x * (ARRIVAL_STRIDE/sizeof(int)) internally.
-static int * ggml_cuda_ar_p2p_arrive_ptr(const ggml_cuda_ar_pipeline * p, int rank) {
-    return p->p2p_flags[rank];
-}
-static int * ggml_cuda_ar_p2p_done_ptr(const ggml_cuda_ar_pipeline * p, int rank) {
+static int * ggml_cuda_ar_p2p_arrive_ptr(const ggml_cuda_ar_pipeline * p, int site, int rank) {
     return p->p2p_flags[rank] +
+           site * 2 * GGML_CUDA_AR_KERNEL_BLOCKS * (int)(GGML_CUDA_AR_ARRIVAL_STRIDE / sizeof(int));
+}
+static int * ggml_cuda_ar_p2p_done_ptr(const ggml_cuda_ar_pipeline * p, int site, int rank) {
+    return ggml_cuda_ar_p2p_arrive_ptr(p, site, rank) +
            GGML_CUDA_AR_KERNEL_BLOCKS * (int)(GGML_CUDA_AR_ARRIVAL_STRIDE / sizeof(int));
 }
 
@@ -714,7 +736,7 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
     if (p->p2p_enabled) {
         p->p2p_scratch_bytes = GGML_CUDA_AR_P2P_MAX_BYTES;
         const size_t p2p_flags_bytes =
-            2 * GGML_CUDA_AR_KERNEL_BLOCKS * GGML_CUDA_AR_ARRIVAL_STRIDE;
+            (size_t) GGML_CUDA_AR_P2P_SITES * 2 * GGML_CUDA_AR_KERNEL_BLOCKS * GGML_CUDA_AR_ARRIVAL_STRIDE;
         for (size_t i = 0; i < n_devices && p->p2p_enabled; ++i) {
             ggml_cuda_set_device(p->devices[i]);
             if (cudaMalloc(reinterpret_cast<void **>(&p->p2p_scratch[i]), p->p2p_scratch_bytes) != cudaSuccess ||
@@ -1016,7 +1038,11 @@ bool ggml_cuda_ar_allreduce(
             const size_t remaining_elems = (size_t) (ne - chunk_start);
             const size_t chunk_elems = remaining_elems < max_chunk_elems ? remaining_elems : max_chunk_elems;
 
-            const int token = (int) ++p->p2p_call_count;
+            // One handshake site per kernel launch, round-robin.  Matching
+            // launches on the two devices always see the same site because the
+            // cursor is host-global; a site's self-incrementing flags make the
+            // handshake replay-safe under CUDA graph capture.
+            const int site = (int) (p->p2p_call_count++ % GGML_CUDA_AR_P2P_SITES);
 
             for (int i = 0; i < n; ++i) {
                 const int peer = 1 - i;  // valid for n == 2 only
@@ -1034,11 +1060,10 @@ bool ggml_cuda_ar_allreduce(
                     reinterpret_cast<const T *>(data_peer), \
                     reinterpret_cast<T *>(p->p2p_scratch[i]), \
                     static_cast<int>(chunk_elems), \
-                    ggml_cuda_ar_p2p_arrive_ptr(p, i), \
-                    ggml_cuda_ar_p2p_arrive_ptr(p, peer), \
-                    ggml_cuda_ar_p2p_done_ptr(p, i), \
-                    ggml_cuda_ar_p2p_done_ptr(p, peer), \
-                    token)
+                    ggml_cuda_ar_p2p_arrive_ptr(p, site, i), \
+                    ggml_cuda_ar_p2p_arrive_ptr(p, site, peer), \
+                    ggml_cuda_ar_p2p_done_ptr(p, site, i), \
+                    ggml_cuda_ar_p2p_done_ptr(p, site, peer))
 
                 switch (input_type) {
                     case GGML_TYPE_F32:  LAUNCH_AR_P2P_KERNEL(float);       break;

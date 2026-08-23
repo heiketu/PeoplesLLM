@@ -430,7 +430,7 @@ bool test_type(const kernel_fns & fn, int nc, int k, const std::vector<int> & ge
     // ---- gemm: native vs generic vs legacy vec_dot ----
     for (int nr : gemm_nrs) {
         std::vector<float> x  = make_random_f32((int64_t) nr * k, 999 + nr);
-        std::vector<char>  q8 = fn.type == GGML_TYPE_Q3_R || fn.type == GGML_TYPE_UDNL_W4 || fn.type == GGML_TYPE_UDNL_MX
+        std::vector<char>  q8 = fn.type == GGML_TYPE_Q3_R || fn.type == GGML_TYPE_UDNL_W4 || fn.type == GGML_TYPE_UDNL_MX || fn.type == GGML_TYPE_E4A
                               ? quantize_act_rows(x, nr, k, fn.act_type)
                               : quantize_acts_4x8(x, nr, k, fn.act_type);
         std::vector<float> s_nat((size_t) nr * nc, 0.0f), s_gen((size_t) nr * nc, 0.0f);
@@ -613,7 +613,7 @@ void perf_type(const kernel_fns & fn, int nc, int k, int nr, int nthreads, int n
             printf("  [MXFP4] one-call vs chunks-4 nr=%-3d: %.2fx\n", nr, t_split4 / t_shared);
         }
     } else {
-        std::vector<char> q8 = fn.type == GGML_TYPE_Q3_R || fn.type == GGML_TYPE_UDNL_W4 || fn.type == GGML_TYPE_UDNL_MX
+        std::vector<char> q8 = fn.type == GGML_TYPE_Q3_R || fn.type == GGML_TYPE_UDNL_W4 || fn.type == GGML_TYPE_UDNL_MX || fn.type == GGML_TYPE_E4A
                              ? quantize_act_rows(x, nr, k, fn.act_type)
                              : quantize_acts_4x8(x, nr, k, fn.act_type);
         const double t = time_it(("repack gemm nr=" + std::to_string(nr)).c_str(), [&](int c0, int ncols) {
@@ -877,6 +877,279 @@ bool test_mmid_prequantized_q8_k() {
     ggml_backend_free(backend);
     ggml_threadpool_free(threadpool);
     free_repacked(rw);
+    return ok;
+}
+
+// E4A exponent edge cases on the panel kernels. Real DSV4 experts carry
+// e==0/e==1 dead groups inside otherwise-live, routed rows
+// (quant-sweep/scan-e4a-exponents.py: ~0.4% of all groups, 68% of rows in a
+// gate tensor sample). The AVX512 panel kernel must use the full e8m0-half
+// construction there: the bare (e-1)<<23 turns e==0 into 0xFF800000 = -inf,
+// and the (exactly zero) group dot then NaNs the whole accumulator via
+// 0 x -inf — this was the production NaN/garbage bug. 0xFF groups are crafted
+// with zeroed payloads (raw==0), matching how they occur in the wild; kernel
+// (2^127) and reference (0.0) both yield exactly 0 then.
+bool test_e4a_exponent_edges() {
+    constexpr int nc = 16;              // one full panel
+    constexpr int k  = 2048;            // 8 super-blocks x 8 groups = 64 groups/row
+    const size_t row_bytes = ggml_row_size(GGML_TYPE_E4A, k);   // nb*136
+    const int nb = k / 256;
+
+    std::mt19937 rng(777);
+    std::uniform_int_distribution<int> byte_dist(0, 255);
+
+    // raw row blocks, written without block_e4a (layout: per super-block
+    // e[8] at [b*136 + g], payload at [b*136 + 8 + 16*g + v])
+    std::vector<char> raw(row_bytes * nc);
+    for (int r = 0; r < nc; ++r) {
+        char * row = raw.data() + row_bytes * r;
+        for (int b = 0; b < nb; ++b) {
+            for (int g = 0; g < 8; ++g) {
+                const int gi = b * 8 + g;
+                uint8_t e = (uint8_t) (118 + (gi + r) % 7);      // normal range
+                bool zero_qs = false;
+                switch ((gi + 16 * r) % 16) {
+                    case 3:  e = 0;                 break;       // dead group, random payload
+                    case 7:  e = 1;                 break;       // denormal e, random payload
+                    case 11: e = 0xff; zero_qs = true; break;    // OCP NaN encoding, zero payload
+                    case 15: e = 0;    zero_qs = true; break;    // dead group, zero payload
+                    default: break;
+                }
+                row[b * 136 + g] = (char) e;
+                for (int v = 0; v < 16; ++v) {
+                    row[b * 136 + 8 + 16 * g + v] = zero_qs ? 0 : (char) byte_dist(rng);
+                }
+            }
+        }
+    }
+
+    // repack through the real buffer path (set_tensor runs the byte gather)
+    repacked_weights rw;
+    {
+        struct ggml_init_params params = { 1 * 1024 * 1024, nullptr, true };
+        rw.ctx = ggml_init(params);
+        rw.raw = raw;
+        rw.tensor = rw.ctx ? ggml_new_tensor_2d(rw.ctx, GGML_TYPE_E4A, k, nc) : nullptr;
+        rw.nbytes = rw.tensor ? ggml_nbytes(rw.tensor) : 0;
+        rw.buffer = rw.tensor ? ggml_backend_buft_alloc_buffer(
+            ggml_backend_cpu_repack_buffer_type(), rw.nbytes) : nullptr;
+        if (rw.buffer == nullptr) {
+            printf("[E4A edges] FAILED: buffer allocation\n");
+            free_repacked(rw);
+            return false;
+        }
+        ggml_backend_tensor_alloc(rw.buffer, rw.tensor, ggml_backend_buffer_get_base(rw.buffer));
+        if (rw.tensor->extra == nullptr) {
+            printf("[E4A edges] SKIPPED: E4A repack unavailable\n");
+            free_repacked(rw);
+            return true;
+        }
+        ggml_backend_tensor_set(rw.tensor, rw.raw.data(), 0, rw.raw.size());
+        rw.data = rw.tensor->data;
+    }
+
+    constexpr int nr = 4;
+    const std::vector<float> x = make_random_f32((int64_t) nr * k, 888);
+    const std::vector<char> q8 = quantize_act_rows(x, nr, k, GGML_TYPE_Q8_0);
+    const size_t qrow = ggml_row_size(GGML_TYPE_Q8_0, k);
+
+    // fp64 reference: dequantized E4A rows x dequantized q8_0 activations
+    const ggml_type_traits * e4a_traits = ggml_get_type_traits(GGML_TYPE_E4A);
+    std::vector<double> expected((size_t) nr * nc, 0.0);
+    {
+        std::vector<float> wrow(k);
+        std::vector<double> a_deq((size_t) nr * k);
+        for (int r = 0; r < nr; ++r) {
+            const block_q8_0 * qb = (const block_q8_0 *) (q8.data() + r * qrow);
+            for (int j = 0; j < k / QK8_0; ++j) {
+                const float d = ggml_fp16_to_fp32(qb[j].d);
+                for (int v = 0; v < QK8_0; ++v) {
+                    a_deq[(size_t) r * k + j * QK8_0 + v] = d * qb[j].qs[v];
+                }
+            }
+        }
+        for (int c = 0; c < nc; ++c) {
+            e4a_traits->to_float(raw.data() + row_bytes * c, wrow.data(), k);
+            for (int r = 0; r < nr; ++r) {
+                double acc = 0.0;
+                for (int i = 0; i < k; ++i) {
+                    acc += wrow[i] * a_deq[(size_t) r * k + i];
+                }
+                expected[(size_t) r * nc + c] = acc;
+            }
+        }
+    }
+
+    std::vector<float> s_nat((size_t) nr * nc, 0.0f), s_gen((size_t) nr * nc, 0.0f);
+    ggml_gemv_e4a_1x16_q8_0(k, s_nat.data(), nc, rw.data, q8.data(), nr, nc);
+    ggml_gemv_e4a_1x16_q8_0_generic(k, s_gen.data(), nc, rw.data, q8.data(), nr, nc);
+
+    bool ok = true;
+    diff_stats st_nat, st_gen, st_row;
+    for (int r = 0; r < nr; ++r) {
+        for (int c = 0; c < nc; ++c) {
+            float ref = 0.0f;
+            ggml_vec_dot_e4a_q8_0(k, &ref, 0, raw.data() + row_bytes * c, 0, q8.data() + r * qrow, 0, 1);
+            const double b = expected[(size_t) r * nc + c];
+            if (!std::isfinite(s_nat[(size_t) r * nc + c]) || !std::isfinite(s_gen[(size_t) r * nc + c]) ||
+                !std::isfinite(ref)) {
+                ok = false;
+            }
+            diff_update(st_nat, s_nat[(size_t) r * nc + c], b, 2e-3);
+            diff_update(st_gen, s_gen[(size_t) r * nc + c], b, 2e-3);
+            diff_update(st_row, ref, b, 2e-3);
+        }
+    }
+    ok = ok && st_nat.n_bad == 0 && st_gen.n_bad == 0 && st_row.n_bad == 0;
+    printf("[E4A edges] e=0/1/0xFF groups: native %s (max_abs=%.3g bad=%d) | generic %s (bad=%d) | scalar %s (bad=%d)\n",
+           st_nat.n_bad == 0 ? "ok" : "FAILED", st_nat.max_abs, st_nat.n_bad,
+           st_gen.n_bad == 0 ? "ok" : "FAILED", st_gen.n_bad,
+           st_row.n_bad == 0 ? "ok" : "FAILED", st_row.n_bad);
+
+    free_repacked(rw);
+    return ok;
+}
+
+// E4A mul_mat_id correctness through the full repack CPU path. Row counts per
+// expert cover the three production branches: 40 rows (gemm arec main loop),
+// 5 rows (batched arec gemv tail), 1 row (per-row arec gemv), 2 rows. A second
+// leg runs the same graph in a plain (non-repack) buffer, exercising the
+// legacy ggml_vec_dot_e4a_q8_0 fallback. Both legs are compared against an
+// fp64 reference: dequantized E4A rows dotted with q8_0-quantized activations.
+// With GGML_TEST_E4A_EP=1 (and GGML_NUMA_EP=1 in the environment from process
+// start, so the cached flag picks it up) the test initializes NUMA distribute
+// mode first, routing mul_mat_id through the two-phase EP row-claim protocol
+// (n_tokens > GGML_NUMA_EP_STEAL_MIN_TOKENS enables the steal phase).
+bool test_mmid_e4a() {
+    const bool want_ep = getenv("GGML_TEST_E4A_EP") != nullptr;
+    if (want_ep) {
+        ggml_numa_init(GGML_NUMA_STRATEGY_DISTRIBUTE);
+    }
+    constexpr int nc = 2048;
+    constexpr int k = 6144;
+    constexpr int n_experts = 4;
+    constexpr int n_tokens = 48;
+    const int32_t id_data[n_tokens] = {
+        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, // 40 rows: gemm arec
+        1,1,1,1,1,                               // 5 rows: batched arec tail
+        2,                                       // 1 row: per-row arec gemv
+        3,3,                                     // 2 rows: batched arec tail
+    };
+
+    repacked_weights gate;
+    ggml_tensor * up_tensor = nullptr;
+    if (!make_expert_weight_pair(GGML_TYPE_E4A, nc, k, n_experts, true, gate, up_tensor)) {
+        printf("[MMID E4A] SKIPPED: E4A repack unavailable\n");
+        return true;
+    }
+    repacked_weights plain;
+    if (!make_expert_weights(GGML_TYPE_E4A, nc, k, n_experts, false, plain)) {
+        printf("[MMID E4A] FAILED: plain buffer allocation\n");
+        free_repacked(gate);
+        return false;
+    }
+
+    // fp64 reference from the raw quantized plane (all experts share it)
+    const size_t row_bytes = ggml_row_size(GGML_TYPE_E4A, k);
+    const ggml_type_traits * e4a_traits = ggml_get_type_traits(GGML_TYPE_E4A);
+    std::vector<double> w_deq((size_t) nc * k);
+    {
+        std::vector<float> row(k);
+        for (int c = 0; c < nc; ++c) {
+            e4a_traits->to_float(gate.raw.data() + row_bytes * c, row.data(), k);
+            for (int i = 0; i < k; ++i) {
+                w_deq[(size_t) c * k + i] = row[i];
+            }
+        }
+    }
+    const std::vector<float> hidden_data = make_random_f32((int64_t) n_tokens * k, 4242);
+    const size_t act_row = ggml_row_size(GGML_TYPE_Q8_0, k);
+    std::vector<char> act_q8((size_t) n_tokens * act_row);
+    std::vector<double> a_deq((size_t) n_tokens * k);
+    for (int t = 0; t < n_tokens; ++t) {
+        quantize_row_q8_0(hidden_data.data() + (size_t) t * k,
+                          act_q8.data() + t * act_row, k);
+        const block_q8_0 * qb = (const block_q8_0 *) (act_q8.data() + t * act_row);
+        for (int j = 0; j < k / QK8_0; ++j) {
+            const float d = ggml_fp16_to_fp32(qb[j].d);
+            for (int v = 0; v < QK8_0; ++v) {
+                a_deq[(size_t) t * k + j * QK8_0 + v] = d * qb[j].qs[v];
+            }
+        }
+    }
+    std::vector<double> expected((size_t) nc * n_tokens);
+    for (int t = 0; t < n_tokens; ++t) {
+        for (int c = 0; c < nc; ++c) {
+            double acc = 0.0;
+            for (int i = 0; i < k; ++i) {
+                acc += w_deq[(size_t) c * k + i] * a_deq[(size_t) t * k + i];
+            }
+            expected[(size_t) t * nc + c] = acc;
+        }
+    }
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    constexpr int nthreads = 8;
+    ggml_threadpool_params tpp = ggml_threadpool_params_default(nthreads);
+    ggml_threadpool_t threadpool = ggml_threadpool_new(&tpp);
+    bool ok = backend != nullptr && threadpool != nullptr;
+    if (ok) {
+        ggml_backend_cpu_set_n_threads(backend, nthreads);
+        ggml_backend_cpu_set_threadpool(backend, threadpool);
+    }
+
+    auto run_leg = [&](ggml_tensor * w0, ggml_tensor * w1, ggml_context * ctx,
+                       const char * name, double scale, diff_stats & st, bool prequantized) {
+        ggml_tensor * hidden = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, n_tokens);
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n_tokens);
+        ggml_set_input(hidden);
+        ggml_set_input(ids);
+        // The classic (non-repack) mul_mat_id only accepts F32 src1; the
+        // prequantized shared-Q8 input is a repack-path feature.
+        ggml_tensor * act = prequantized ? ggml_cast(ctx, hidden, GGML_TYPE_Q8_0) : hidden;
+        ggml_tensor * out = ggml_mul_mat_id(ctx, w0, act, ids);
+        if (w1 != nullptr) {
+            out = ggml_add(ctx, out, ggml_mul_mat_id(ctx, w1, act, ids));
+        }
+        ggml_cgraph * graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, out);
+        ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
+        bool leg_ok = alloc != nullptr && ggml_gallocr_alloc_graph(alloc, graph);
+        std::vector<float> actual((size_t) nc * n_tokens);
+        if (leg_ok) {
+            ggml_backend_tensor_set(hidden, hidden_data.data(), 0, hidden_data.size() * sizeof(float));
+            ggml_backend_tensor_set(ids, id_data, 0, sizeof(id_data));
+            leg_ok = ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
+        }
+        if (leg_ok) {
+            ggml_backend_tensor_get(out, actual.data(), 0, actual.size() * sizeof(float));
+            for (size_t i = 0; i < actual.size(); ++i) {
+                if (!std::isfinite(actual[i])) {
+                    leg_ok = false;
+                }
+                diff_update(st, actual[i], scale * expected[i], 2e-3);
+            }
+            leg_ok = leg_ok && st.n_bad == 0;
+        }
+        if (alloc) ggml_gallocr_free(alloc);
+        printf("[MMID E4A] %s: %s (max_abs=%.3g max_rel=%.3g bad=%d)\n",
+               name, leg_ok ? "ok" : "FAILED", st.max_abs, st.max_rel, st.n_bad);
+        return leg_ok;
+    };
+
+    diff_stats st_repack, st_plain;
+    // repack leg: gate+up pair (identical weights) -> scale 2
+    printf("[MMID E4A] repack leg with NUMA EP %s (nodes=%d)\n",
+           want_ep ? "requested" : "off", ggml_numa_node_count());
+    ok &= run_leg(gate.tensor, up_tensor, gate.ctx, "repack gemm/arec path", 2.0, st_repack, true);
+    // plain leg: legacy vec_dot fallback (F32 src1; classic mmid quantizes internally) -> scale 1
+    ok &= run_leg(plain.tensor, nullptr, plain.ctx, "plain vec_dot fallback", 1.0, st_plain, false);
+
+    if (threadpool) ggml_threadpool_free(threadpool);
+    if (backend) ggml_backend_free(backend);
+    free_repacked(gate);
+    free_repacked(plain);
     return ok;
 }
 
@@ -1354,6 +1627,11 @@ int main(int argc, char ** argv) {
         // of 16; the nc=8/nc=520 shapes are skipped below.
         { GGML_TYPE_UDNL_MX, "UDNL_MX", ggml_vec_dot_udnl_mx_q8_0, ggml_gemv_udnl_mx_1x16_q8_0, ggml_gemv_udnl_mx_1x16_q8_0_generic,
           ggml_gemm_udnl_mx_1x16_q8_0, ggml_gemm_udnl_mx_1x16_q8_0_generic, GGML_TYPE_Q8_0 },
+        // E4A is an INTER_SIZE == 1 NR16xK4 panel repack like UDNL_W4 (E2M1x2
+        // grid + per-group E8M0 instead of NL grid + d/srel). nc must be a
+        // multiple of 16; the nc=8/nc=520 shapes are skipped below.
+        { GGML_TYPE_E4A, "E4A", ggml_vec_dot_e4a_q8_0, ggml_gemv_e4a_1x16_q8_0, ggml_gemv_e4a_1x16_q8_0_generic,
+          ggml_gemm_e4a_1x16_q8_0, ggml_gemm_e4a_1x16_q8_0_generic, GGML_TYPE_Q8_0 },
         // Q8_0 has no generic 8x8 kernels; native-vs-generic checks are skipped for it
         { GGML_TYPE_Q8_0, "Q8_0", ggml_vec_dot_q8_0_q8_0, ggml_gemv_q8_0_8x8_q8_0, nullptr,
           ggml_gemm_q8_0_8x8_q8_0, nullptr, GGML_TYPE_Q8_0 },
@@ -1595,7 +1873,7 @@ int main(int argc, char ** argv) {
         }
         printf("[%s] nc=512 k=2048 (main paths)\n", fn.name);
         ok &= test_type(fn, 512, 2048, gemm_nrs, false);
-        if (fn.type == GGML_TYPE_UDNL_W4 || fn.type == GGML_TYPE_UDNL_MX) {
+        if (fn.type == GGML_TYPE_UDNL_W4 || fn.type == GGML_TYPE_UDNL_MX || fn.type == GGML_TYPE_E4A) {
             // UDNL panels are 16 columns wide; nc=8 and nc=520 cannot be
             // repacked (the registration rejects them, row vec_dot covers them)
             printf("[%s] nc=8/nc=520 shapes skipped (require nc %% 16 == 0)\n", fn.name);
@@ -1612,6 +1890,8 @@ int main(int argc, char ** argv) {
     }
 
     ok &= test_mmid_prequantized_q8_k();
+    ok &= test_e4a_exponent_edges();
+    ok &= test_mmid_e4a();
 
     printf("[MXFP4] unrepack (inverse transform) bit-exact roundtrips\n");
     ok &= test_unrepack_layout(8, 128, 512, false);   // k=4096 gate/up row
