@@ -90,15 +90,12 @@ def formats():
     rows = [
         ("UD-IQ1_S",                         76.9, 256.86, 27.94),
         ("UD-IQ1_M",                         80.9, 242.84, 26.44),
-        ("mix-IQ2XS-exp",                    81.9, 269.43, 27.32),
         ("UD-IQ2_XXS",                       84.6, 251.75, 27.17),
         ("UD-IQ2_M",                         84.7, 244.99, 26.60),
         ("UD-Q2_K_XL",                       90.2, 236.31, 26.56),
         ("UD-IQ3_XXS",                       97.1, 209.67, 24.77),
-        ("mix-IQ3XXS-exp",                  106.1, 177.84, 24.11),
         ("UD-IQ3_S",                        108.1, 265.20, 22.97),
         ("mix-IQ2XS/IQ3XXS/MXFP4",         112.1, 233.71, 25.14),
-        ("mix-IQ3S-exp",                    118.1, 203.01, 18.80),
         ("UD-Q3_K_M",                       119.3, 209.77, 24.05),
         ("UD-Q3_K_XL",                      119.4, 209.62, 23.92),
         ("UD-IQ4_XS",                       127.3, 226.92, 21.05),
@@ -125,12 +122,18 @@ def formats():
     counter_tg = smaller_but_slower(3)
 
     fig, axes = plt.subplots(2, 1, figsize=(11.5, 8.7), sharex=True)
-    close_size_label_dx = {4: -10, 5: 10, 12: -10, 13: 10, 14: -10, 15: 10, 18: -10, 19: 10}
-    for ax, values, counter, color, ylabel in (
-        (axes[0], pp, counter_pp, GREEN, "pp2048 (tok/s)"),
-        (axes[1], tg, counter_tg, BLUE, "tg512 (tok/s)"),
+    close_size_label_dx = {3: -10, 4: 10, 9: -10, 10: 10, 11: -10, 12: 10, 15: -10, 16: 10}
+    for ax, values, counter, color, ylabel, trend_x_pos, trend_ha in (
+        (axes[0], pp, counter_pp, GREEN, "pp2048 (tok/s)", 0.015, "left"),
+        (axes[1], tg, counter_tg, BLUE, "tg512 (tok/s)", 0.985, "right"),
     ):
-        ax.plot(sizes, values, color=color, linewidth=1.8, alpha=0.75, zorder=1)
+        trend_coeff = np.polyfit(sizes, values, 1)
+        trend_x = np.linspace(sizes.min(), sizes.max(), 200)
+        fitted = np.polyval(trend_coeff, sizes)
+        residual = np.sum((values - fitted) ** 2)
+        total = np.sum((values - values.mean()) ** 2)
+        r_squared = 1.0 - residual / total
+        ax.plot(trend_x, np.polyval(trend_coeff, trend_x), color=color, linewidth=2.0, linestyle="--", alpha=0.8, zorder=1)
         for index, (size, speed, is_counterexample) in enumerate(zip(sizes, values, counter), 1):
             point_color = "#d62728" if is_counterexample else color
             marker = "D" if is_counterexample else "o"
@@ -139,18 +142,20 @@ def formats():
             ax.annotate(str(index), (size, speed), xytext=(label_dx, 7), textcoords="offset points", ha="center", fontsize=7.5)
         ax.set_ylabel(ylabel)
         ax.grid(alpha=0.25)
+        ax.text(trend_x_pos, 0.94, f"linear trend: {trend_coeff[0]:+.3f} tok/s/GiB, R²={r_squared:.2f}",
+                transform=ax.transAxes, ha=trend_ha, va="top", color=color, fontsize=9, fontweight="bold")
 
     axes[0].set_ylim(160, 335)
     axes[1].set_ylim(17.5, 29.5)
     axes[1].set_xlim(73, 154)
-    axes[1].set_xlabel("Model size (GiB), connected from smaller to larger")
+    axes[1].set_xlabel("Model size (GiB)")
     axes[0].set_title(
-        "DSV4-Flash full-format matrix: size is not a monotonic predictor of speed\n"
+        "DSV4-Flash format scatter and least-squares trend: size alone does not explain speed\n"
         "red diamond = a smaller format is at least 3% slower than a larger format"
     )
 
     entries = [f"{index:>2}  {name} ({size:.1f}G)" for index, (name, size, _, _) in enumerate(rows, 1)]
-    columns = 3
+    columns = 2
     rows_per_column = (len(entries) + columns - 1) // columns
     legend_lines = []
     for row_index in range(rows_per_column):
