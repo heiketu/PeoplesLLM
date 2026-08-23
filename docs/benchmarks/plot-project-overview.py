@@ -86,39 +86,81 @@ def numa_tp():
 
 
 def formats():
+    # Full-format matrix measured on 2026-08-21 with one hybrid setup.
     rows = [
-        ("MXFP4", 145.3, 307.58, 3.5830),
-        ("UDNL_W4 + arec", 146.4, 366.58, 3.7997),
-        ("UDNL_MX + arec", 116.1, 384.87, 4.6274),
-        ("E4A", 147.2, 370.0, 3.5830),
-        ("Q3_R (MoE)", 114.1, 174.60, 4.7636),
-        ("IQ2_XXS (file named Q2_K)", 90.9, 223.60, 6.6338),
+        ("UD-IQ1_S",                         76.9, 256.86, 27.94),
+        ("UD-IQ1_M",                         80.9, 242.84, 26.44),
+        ("mix-IQ2XS-exp",                    81.9, 269.43, 27.32),
+        ("UD-IQ2_XXS",                       84.6, 251.75, 27.17),
+        ("UD-IQ2_M",                         84.7, 244.99, 26.60),
+        ("UD-Q2_K_XL",                       90.2, 236.31, 26.56),
+        ("UD-IQ3_XXS",                       97.1, 209.67, 24.77),
+        ("mix-IQ3XXS-exp",                  106.1, 177.84, 24.11),
+        ("UD-IQ3_S",                        108.1, 265.20, 22.97),
+        ("mix-IQ2XS/IQ3XXS/MXFP4",         112.1, 233.71, 25.14),
+        ("mix-IQ3S-exp",                    118.1, 203.01, 18.80),
+        ("UD-Q3_K_M",                       119.3, 209.77, 24.05),
+        ("UD-Q3_K_XL",                      119.4, 209.62, 23.92),
+        ("UD-IQ4_XS",                       127.3, 226.92, 21.05),
+        ("UD-IQ4_NL",                       127.3, 229.91, 20.74),
+        ("UD-Q4_K_XL",                      144.4, 318.49, 25.17),
+        ("mix-MXFP4-MoE/Q8",                145.6, 313.28, 24.49),
+        ("UD-Q8_K_XL",                      150.8, 307.48, 20.78),
+        ("mix-MXFP4-MoE/BF16",              150.8, 306.81, 20.59),
     ]
-    fig, ax = plt.subplots(figsize=(8.7, 5.1))
-    sizes = [row[1] for row in rows]
-    speeds = [row[2] for row in rows]
-    ppls = [row[3] for row in rows]
-    scatter = ax.scatter(sizes, speeds, c=ppls, s=170, cmap="RdYlGn_r", edgecolor="black", vmin=3.4, vmax=6.8, zorder=3)
-    offsets = {
-        "MXFP4": (-10, -24),
-        "UDNL_W4 + arec": (-12, 14),
-        "UDNL_MX + arec": (0, 12),
-        "E4A": (-10, -24),
-        "Q3_R (MoE)": (0, -24),
-        "IQ2_XXS (file named Q2_K)": (10, 12),
-    }
-    for name, size, speed, ppl in rows:
-        dx, dy = offsets[name]
-        ha = "right" if dx < 0 else ("left" if dx > 0 else "center")
-        ax.annotate(f"{name}\n{size:.1f} GiB, PPL {ppl:.2f}", (size, speed), xytext=(dx, dy), textcoords="offset points", ha=ha, fontsize=9)
-    ax.set_xlim(80, 160)
-    ax.set_ylim(120, 430)
-    ax.set_xlabel("Model size (GiB)")
-    ax.set_ylabel("pp2048 (tok/s)")
-    ax.grid(alpha=0.25)
-    colorbar = fig.colorbar(scatter, ax=ax)
-    colorbar.set_label("Perplexity (lower is better)")
-    ax.set_title("MoE weight formats: size, prefill speed, and quality\nsmaller files are not automatically faster")
+    rows.sort(key=lambda row: (row[1], row[0]))
+
+    def smaller_but_slower(metric):
+        result = []
+        for index, row in enumerate(rows):
+            size = row[1]
+            speed = row[metric]
+            result.append(any(other[1] > size + 0.05 and other[metric] > speed * 1.03 for other in rows[index + 1:]))
+        return result
+
+    sizes = np.array([row[1] for row in rows])
+    pp = np.array([row[2] for row in rows])
+    tg = np.array([row[3] for row in rows])
+    counter_pp = smaller_but_slower(2)
+    counter_tg = smaller_but_slower(3)
+
+    fig, axes = plt.subplots(2, 1, figsize=(11.5, 8.7), sharex=True)
+    close_size_label_dx = {4: -10, 5: 10, 12: -10, 13: 10, 14: -10, 15: 10, 18: -10, 19: 10}
+    for ax, values, counter, color, ylabel in (
+        (axes[0], pp, counter_pp, GREEN, "pp2048 (tok/s)"),
+        (axes[1], tg, counter_tg, BLUE, "tg512 (tok/s)"),
+    ):
+        ax.plot(sizes, values, color=color, linewidth=1.8, alpha=0.75, zorder=1)
+        for index, (size, speed, is_counterexample) in enumerate(zip(sizes, values, counter), 1):
+            point_color = "#d62728" if is_counterexample else color
+            marker = "D" if is_counterexample else "o"
+            ax.scatter(size, speed, s=70, marker=marker, color=point_color, edgecolor="black", linewidth=0.7, zorder=3)
+            label_dx = close_size_label_dx.get(index, 0)
+            ax.annotate(str(index), (size, speed), xytext=(label_dx, 7), textcoords="offset points", ha="center", fontsize=7.5)
+        ax.set_ylabel(ylabel)
+        ax.grid(alpha=0.25)
+
+    axes[0].set_ylim(160, 335)
+    axes[1].set_ylim(17.5, 29.5)
+    axes[1].set_xlim(73, 154)
+    axes[1].set_xlabel("Model size (GiB), connected from smaller to larger")
+    axes[0].set_title(
+        "DSV4-Flash full-format matrix: size is not a monotonic predictor of speed\n"
+        "red diamond = a smaller format is at least 3% slower than a larger format"
+    )
+
+    entries = [f"{index:>2}  {name} ({size:.1f}G)" for index, (name, size, _, _) in enumerate(rows, 1)]
+    columns = 3
+    rows_per_column = (len(entries) + columns - 1) // columns
+    legend_lines = []
+    for row_index in range(rows_per_column):
+        cells = []
+        for column in range(columns):
+            entry_index = column * rows_per_column + row_index
+            cells.append(entries[entry_index] if entry_index < len(entries) else "")
+        legend_lines.append("    ".join(f"{cell:<39}" for cell in cells))
+    fig.text(0.5, 0.005, "\n".join(legend_lines), ha="center", va="bottom", family="monospace", fontsize=7.3)
+    fig.tight_layout(rect=(0, 0.145, 1, 1))
     finish(fig, "quant-formats.png")
 
 

@@ -126,7 +126,9 @@ The format work therefore moves from “fewest bits” to storage layouts that f
 - **UDNL_MX** uses an importance matrix to allocate W2/W3/W4 blocks and reuses the same arec panel kernel;
 - **E4A** preserves MXFP4 values bit-exactly and aligns row-block nibble pairing with the NR16 kernel. Loading performs arithmetic-free byte-only panelization, with no decoding or requantization.
 
-![MoE weight size, speed, and quality](docs/img/quant-formats.png)
+![Full MoE format matrix by model size and PP/TG speed](docs/img/quant-formats.png)
+
+The chart connects 19 formats from the matched 2026-08-21 matrix in ascending size order. A red diamond marks a smaller format that is at least 3% slower than some larger format. Repeated reversals in both PP and TG show that this workload is not controlled by DRAM bytes alone: codebook expansion, scale handling, storage-to-kernel layout, and access to batch kernels also matter. The table below lists representative Pareto points after later kernel work and must not be mixed point-by-point with the earlier matrix.
 
 | Format | Size | pp2048 | tg512 | WikiText-2 PPL | Role |
 |---|---:|---:|---:|---:|---|
@@ -170,6 +172,7 @@ See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for full measurements and scopes, a
 ## Documentation
 
 - [Quick start](docs/QUICKSTART.md): builds, single/dual-machine recipes, and common issues
+- [Developer architecture](docs/ARCHITECTURE.md): module boundaries, TG/PP/remote-EP data flows, and validation gates
 - [Parameter reference](docs/PARAMETERS.md): environment variables, CLI options, and profiles
 - [Benchmark archive](docs/BENCHMARKS.md): detailed A/B data and charts
 - [Change list](docs/CHANGES.md): NUMA, kernel, GPU, and EP changes

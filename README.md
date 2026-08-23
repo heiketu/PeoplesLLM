@@ -126,7 +126,9 @@ arec（activation record）把 Q8 激活和 scale 预计算一次，随后让权
 - **UDNL_MX**：用 imatrix 在 W2/W3/W4 之间混合分配，再复用同一 arec panel 内核；
 - **E4A**：保持 MXFP4 数值 bit-exact，并让 row-block 的 nibble pairing 对齐 NR16 内核；加载时只做无算术的 byte-only panelization，不解码或重新量化。
 
-![MoE 权重格式的体积、速度和质量](docs/img/quant-formats.png)
+![MoE 全格式体积与 PP/TG 速度矩阵](docs/img/quant-formats.png)
+
+上图按体积从小到大连接 2026-08-21 同配置测得的 19 个格式。红色菱形表示该格式虽然更小，却被至少一个更大的格式以 3% 以上速度反超。PP/TG 曲线的多次反转说明这里不是单一 DRAM 字节数问题；码本展开、scale 处理、磁盘/计算布局以及能否进入批量内核同样决定速度。下表另列后续内核优化后的代表性 Pareto 点，不能与上图逐点混算。
 
 | 格式 | 体积 | pp2048 | tg512 | WikiText-2 PPL | 定位 |
 |---|---:|---:|---:|---:|---|
@@ -170,6 +172,7 @@ GGML_NUMA_EP=1 build-cuda/bin/llama-server \
 ## 文档
 
 - [快速开始](docs/QUICKSTART.md)：构建、单机/双机配方与常见问题
+- [开发者架构](docs/ARCHITECTURE.md)：模块边界、TG/PP/远程 EP 数据流与验证门禁
 - [参数手册](docs/PARAMETERS.md)：环境变量、CLI 参数和 profile
 - [性能档案](docs/BENCHMARKS.md)：详细 A/B 数据和图表
 - [改动清单](docs/CHANGES.md)：NUMA、内核、GPU 与 EP 改动
