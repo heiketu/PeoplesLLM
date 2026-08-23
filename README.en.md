@@ -128,7 +128,7 @@ The format work therefore moves from “fewest bits” to storage layouts that f
 
 ![Full MoE format matrix by model size and PP/TG speed](docs/img/quant-formats.png)
 
-The chart shows a scatter and least-squares trend for 16 production-format points from the matched 2026-08-21 matrix. Temporary models whose names contain `exp` are excluded until they can be rerun under one performance-frequency setup. A red diamond marks a smaller format that is at least 3% slower than some larger format. The weak trend and many counterexamples show that this workload is not controlled by DRAM bytes alone: codebook expansion, scale handling, storage-to-kernel layout, and access to batch kernels also matter. The table below lists representative Pareto points after later kernel work and must not be mixed point-by-point with the earlier matrix.
+The chart is a historical scatter and least-squares trend for 16 production-format points measured under `powersave` on 2026-08-21. It is retained only to show that smaller files are not necessarily faster, not as a current performance ranking. The entire matrix is being rerun with one `performance` frequency policy, binary, and parameter set; the three abandoned models whose names contain `exp` will not return. A red diamond marks a smaller format that is at least 3% slower than some larger format. The weak trend and many counterexamples show that this workload is not controlled by DRAM bytes alone: codebook expansion, scale handling, storage-to-kernel layout, and access to batch kernels also matter. The table below lists representative Pareto points after later kernel work and must not be mixed point-by-point with the earlier matrix.
 
 | Format | Size | pp2048 | tg512 | WikiText-2 PPL | Role |
 |---|---:|---:|---:|---:|---|

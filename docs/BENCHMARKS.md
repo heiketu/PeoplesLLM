@@ -2,7 +2,7 @@
 
 > 本文档收录详细 benchmark 数据与迭代进展。项目优势与特色概览见 [README.md](../README.md)；复现口径见 [CHANGES.md](CHANGES.md) 与 [benchmarks/](benchmarks/)。
 
-## DSV4-Flash 全格式矩阵（2026-08-21）
+## DSV4-Flash 全格式历史矩阵（2026-08-21，`powersave`）
 
 同一单机混合配置：双 RTX 3090 执行 attention/KV，双路 Ice Lake CPU 执行全部 routed experts，`-t 72 -fa 1 -b 4096 -ub 1024 --load-mode none`，测试 `pp2048/tg512`。下列行均采集于 CPU governor 切换前；绝对值不能与后续 UDNL/E4A 内核优化结果直接混算。
 
@@ -25,7 +25,7 @@
 | UD-Q8_K_XL | 150.8 | 307.48 | 20.78 | 3.4440 |
 | mix-MXFP4-MoE/BF16 | 150.8 | 306.81 | 20.59 | 3.4440 |
 
-README 的全格式图对上述 16 个正式格式绘制散点和最小二乘趋势线；名称含 `exp` 的三个临时试验模型不进入公开趋势，等待统一 performance 频率后补测。红色菱形定义为：该格式比某个更大的格式至少慢 3%。大量反例说明有效速度还受码本展开、scale 处理、存储到内核的布局转换以及 GEMV/GEMM dispatch 影响，不能只用模型字节数或理论 DRAM 带宽解释。
+README 的全格式图对上述 16 个正式格式绘制散点和最小二乘趋势线。这是 `powersave` 下的历史数据，只用于观察格式异常；所有正式格式正在统一 `performance` 频率、二进制和参数下重测。名称含 `exp` 的三个已放弃试验模型已移出矩阵。红色菱形定义为：该格式比某个更大的格式至少慢 3%。大量反例说明有效速度还受码本展开、scale 处理、存储到内核的布局转换以及 GEMV/GEMM dispatch 影响，不能只用模型字节数或理论 DRAM 带宽解释。
 
 ## 最新进展（2026-08-06~13）
 
