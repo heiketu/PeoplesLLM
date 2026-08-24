@@ -20,13 +20,12 @@ PeoplesLLM 是面向异构本地推理的 llama.cpp 分支。项目围绕三条�
 
 | 路线 | 配对基线 | 当前结果 | 变化 |
 |---|---:|---:|---:|
-| DSV4 pp2048，MXFP4 -> UDNL_MX | 312.48 tok/s | **415.56 tok/s** | **+33.0%** |
 | DSV4 pp2048，同质量 MXFP4 -> E4A | 312.48 tok/s | **362.92 tok/s** | **+16.1%** |
 | DSV4 DSpark decode，n2/p0 | 23.9 tok/s | **30.1 tok/s** | **+26%** |
-| DSV4 raw decode，热专家分流配对 A/B | 26.0 tok/s | **28.5 tok/s** | **+9.7%** |
+| DSV4 E4A decode，strict 热专家 12 轮 A/B | 25.02 tok/s | **30.23 tok/s** | **+20.85%** |
 | DSV4 16K GPU MoE prefill | 213 tok/s | **334.5 tok/s** | **+57%** |
+| DSV4 单 slot pure EP，2 -> 4 NUMA worker | 22.1 tok/s | **25.2 tok/s** | **+14.03%** |
 | GLM-5.2 pp512，2 -> 4 NUMA worker 真 EP | 24.13 tok/s | **40.59 tok/s** | **+68.2%** |
-| DSV4 GGUF 体积，MXFP4 -> UDNL_MX | 145.3 GiB | **116.1 GiB** | **-20.1%** |
 
 ![三条性能路线的阶段结果](docs/img/evolution-staircase.png)
 
@@ -68,7 +67,7 @@ PeoplesLLM 是面向异构本地推理的 llama.cpp 分支。项目围绕三条�
 
 在生产型混合路径中，GPU 处理 attention、dense、router 和 KV，CPU 处理 routed experts。针对不同阶段形成了三种互补机制：
 
-- **热专家驻留**：重新采样后的 top-16 专家/层覆盖 49.1% 的选择，43 层紧凑 MXFP4 权重约 8.8 GiB。GPU 热分支与 CPU 冷分支在图内 fork/join，配对 tg512 从 26.1/25.9 提升到 28.4/28.6 tok/s，均值提升 9.7%。
+- **热专家驻留**：top-24 专家/层覆盖约 57.6% 的选择，43 层紧凑 MXFP4 权重为 12.85 GiB。GPU 热分支与 CPU 冷分支在图内 fork/join；GPU 回传逐 router-slot 结果，CPU 按 slot 0..5 恢复基线左折叠，AVX512 只跨 hidden rows 向量化。12 轮 tg512 从 25.0167 提升到 30.2333 tok/s（+20.85%）；PP2048 为 361.47 tok/s，5-chunk PPL 从 2.7758 改善到 2.7548。
 - **NVLink P2P TP**：捕获安全的 P2P allreduce 和异步 D2H 回读把 TP 路径自身从 13.6 提升到 20.3 tok/s（+49%），每 token 的 `cudaStreamSynchronize` 约从 690 次降到 150 次。该数字是 TP 路径内部 A/B，不等于单卡最优路径。
 - **MoE 流式 prefill**：专家权重保留在 host pinned memory，长 prompt 时按层上传、跨 tile 复用，并用双卡 expert-axis EP 和 3-slot 预取隐藏 H2D。
 
@@ -89,10 +88,13 @@ PeoplesLLM 是面向异构本地推理的 llama.cpp 分支。项目围绕三条�
 | 测试 | 之前 | 之后 | 变化 |
 |---|---:|---:|---:|
 | GLM-5.2 MoE pp512，2 -> 4 worker | 24.13 | **40.59** | **1.682 x** |
+| DSV4 MXFP4 TG512，2 -> 4 worker | 22.1 | **25.2** | **1.140 x** |
 | DSV4 16K PP，UB64 -> UB256 | 235.37 | **269.36** | +14.4% |
 | 64 B RPC RTT，TCP -> RoCEv2 | 42-74 us | **10-13 us** | 约 4-6 x 降低 |
 
 GLM 的 dense/attention 仍在 GPU；上表第一行只扩展 CPU MoE。75 层 MoE decode 合计由 86.71 降到 69.58 ms/token（1.246 x），128-token 输出逐字节一致。DSV4 四 worker pure EP + RDMA 的固定验收均值为 37.921 tok/s，峰值 38.423 tok/s，输出 SHA256 与单机参考一致。
+
+新增的 DSV4 行是单 slot、同 master、同模型和同命令的 matched single run：两路本地 worker 各持有 128 个专家，四路跨机 worker 各持有 64 个专家；master 在 `KLOCAL=0` 下跳过全部 routed-expert 权重。两种拓扑的生成正文 SHA256 相同。该系统级结果受两台机器核数不同和网络延迟影响，不代表理想 2 x 扩展。
 
 ## 内核发展路线
 
@@ -105,7 +107,7 @@ GLM 的 dense/attention 仍在 GPU；上表第一行只扩展 CPU MoE。75 层 M
 arec（activation record）把 Q8 激活和 scale 预计算一次，随后让权重 panel 驻留 L1/L2，并跨 8 行 tile 复用。端到端 pp2048：
 
 - UDNL_W4：263.33 -> **366.58 tok/s（+39%）**；
-- UDNL_MX：223.02 -> **384.87 tok/s（+73%）**。
+- 修复 imatrix 契约并重新量化后的 UDNL_MX 达到 **418.95±3.50 tok/s**。
 
 ### 融合和异步边界
 
@@ -128,20 +130,24 @@ arec（activation record）把 Q8 激活和 scale 预计算一次，随后让权
 
 ![MoE 全格式体积与 PP/TG 速度矩阵](docs/img/quant-formats.png)
 
-上图与下表使用 2026-08-24 的统一 `performance` 口径，共 17 个格式点。固定参数为 `-ngl 99 -ncmoe 99 -fa 1 -dev CUDA0 -sm layer -t 72 --numa distribute -b 4096 -ub 1024 --load-mode none -p 2048 -n 512 -r 3`；152/152 CPU governor 均为 `performance`，EPP 均为 `performance`，turbo 开启，`numa_balancing=1` 已记录。这是单 slot 原始推理结果，未启用 DSpark 或热专家。普通 UD 格式画为圆点，MXFP4 是锚点，自研 UDNL_W4、UDNL_MX、E4A 画为大星，红色空心菱形表示“体积更小但被更大格式反超至少 3%”的异常点。趋势线只拟合普通 UD 点与 MXFP4 锚点，自研格式不参与拟合。
+上图与下表使用 2026-08-24 的统一 `performance` 配方，共 17 个格式点；其中 16 个原矩阵点来自同一二进制，UDNL_MX corrected 在修复后用同硬件、参数和配方补测并替换旧行。固定参数为 `-ngl 99 -ncmoe 99 -fa 1 -dev CUDA0 -sm layer -t 72 --numa distribute -b 4096 -ub 1024 --load-mode none -p 2048 -n 512 -r 3`；152/152 CPU governor 均为 `performance`，EPP 均为 `performance`，turbo 开启，`numa_balancing=1` 已记录。这是单 slot 原始推理结果，未启用 DSpark 或热专家。普通 UD 格式画为圆点，MXFP4 是锚点，自研 UDNL_W4、UDNL_MX、E4A 画为大星，红色空心菱形表示“体积更小但被更大格式反超至少 3%”的异常点。趋势线只拟合普通 UD 点与 MXFP4 锚点，自研格式不参与拟合。
 
-PPL 沿用同一权重此前的质量测量，CPU 频率不会改变 PPL，因此本轮没有重复计算。`UD-IQ4_XS` 的 PP/TG 是原 3 轮 219.09/21.62 与补充 5 轮 214.03/20.78 按重复次数加权后的 215.93/21.10。`UD-Q4_K_XL` 在当前 loader 中实际被识别为 MXFP4 MoE，不能作为纯 Q4 专家端点。完整 17 点和原始历史口径见 [BENCHMARKS](docs/BENCHMARKS.md)。
+UDNL_MX 已从确认的源重新量化并用相同 `performance` 配方复测，替换图表中的旧污染行；其 PPL 使用 20×512 WikiText-2 历史口径。其余 PPL 沿用同一权重此前的质量测量；CPU 频率不会改变 PPL。`UD-IQ4_XS` 的 PP/TG 是原 3 轮 219.09/21.62 与补充 5 轮 214.03/20.78 按重复次数加权后的 215.93/21.10。`UD-Q4_K_XL` 在当前 loader 中实际被识别为 MXFP4 MoE，不能作为纯 Q4 专家端点。完整 17 点和原始历史口径见 [BENCHMARKS](docs/BENCHMARKS.md)。
 
 | 格式 | 体积 | pp2048 | tg512 | WikiText-2 PPL | 定位 |
 |---|---:|---:|---:|---:|---|
 | MXFP4 | 145.26 GiB | 312.48 | 26.87 | 3.5830 | 质量与速度锚点 |
 | **UDNL_W4 + arec** | 146.36 GiB | 370.87 | 25.10 | 3.7997 | 固定 4-bit 计算亲和布局 |
-| **UDNL_MX + arec** | **116.13 GiB** | **415.56** | 25.91 | 4.6274 | 最小体积和最高 PP |
+| **UDNL_MX + arec（corrected）** | **116.13 GiB** | **418.95±3.50** | **26.90±0.25** | 4.6047 | 容量/PP 研究点；质量比 Q3_K_XL 差 14.6% |
 | **E4A** | 145.26 GiB | **362.92** | 24.83 | 3.5830 | MXFP4 数值 bit-exact |
 | UD-Q3_K_M | 119.28 GiB | 207.20 | 25.49 | 4.0242 | 标准 UD 对照 |
 | UD-Q3_K_XL | 119.40 GiB | 207.69 | 25.34 | 4.0189 | 标准 UD 对照 |
 
-如果优先容量和 PP，选择 UDNL_MX；如果要求保持 MXFP4 数值与质量，选择 E4A。所有性能行来自同一个 2026-08-24 固定 harness，PPL 则沿用同权重质量测量。
+UDNL_MX corrected 以比 Q3_K_XL 小约 2.7% 的体积换来约 2.0× PP 和 +6.2% TG，但 PPL 高 14.6%，因此**不推荐作为 Q3_K_XL 的替代品**。当前通过质量门的主线仍是 E4A strict-hot；UDNL_W4 是固定 4-bit 内核研究线。新 Q2/Q3/Q4 混合格式仍在验证，未完成的模型不进入表格，也不预填性能或质量数字。
+
+UDNL_MX corrected 的 K24 strict-hot pilot 将 TG 从 26.9 提升到 31.3 tok/s（+16.36%），同命令 5-chunk PPL 从 3.5614 改善到 3.5218；但 cold GGUF 与 12.8496 GiB 热权重合计约 **128.978 GiB**，比 Q3_K_XL 大 8.02%，且尚无同命令 Q3 20-chunk 对照。这只是速度/负面质量消融，不是同质量 headline 或推荐配置。
+
+![UDNL_MX corrected 的体积、速度与质量权衡](docs/img/udnl-mx-tradeoff.png)
 
 ## 构建与使用
 

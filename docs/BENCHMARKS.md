@@ -4,7 +4,7 @@
 
 ## DSV4-Flash 全格式统一矩阵（2026-08-24，`performance`）
 
-17 个格式点使用同一二进制、单机混合配置和固定命令：`-ngl 99 -ncmoe 99 -fa 1 -dev CUDA0 -sm layer -t 72 --numa distribute -b 4096 -ub 1024 --load-mode none -p 2048 -n 512 -r 3`。运行时 152/152 CPU 的 governor/EPP 均为 `performance`，turbo 开启，`numa_balancing=1` 已记录。这是单 slot raw 口径，未启用 DSpark 或热专家。
+表中 16 个原矩阵点使用同一二进制、单机混合配置和固定命令；UDNL_MX corrected 在修复后用同硬件、参数和 `performance` 配方补测，替换旧污染行。固定参数为 `-ngl 99 -ncmoe 99 -fa 1 -dev CUDA0 -sm layer -t 72 --numa distribute -b 4096 -ub 1024 --load-mode none -p 2048 -n 512 -r 3`。运行时 152/152 CPU 的 governor/EPP 均为 `performance`，turbo 开启，`numa_balancing=1` 已记录。这是单 slot raw 口径，未启用 DSpark 或热专家。
 
 | 格式 | 体积 GiB | pp2048 | tg512 | WikiText-2 PPL |
 |---|---:|---:|---:|---:|
@@ -15,7 +15,7 @@
 | UD-Q2_K_XL | 90.18 | 232.22 | 28.03 | 5.4675 |
 | UD-IQ3_XXS | 97.05 | 208.96 | 26.74 | 4.7101 |
 | UD-IQ3_S | 108.10 | 254.48 | 23.99 | 4.5707 |
-| **UDNL_MX** | **116.13** | **415.56** | 25.91 | 4.6274 |
+| **UDNL_MX corrected**[^udnl-mx-corrected] | **116.13** | **418.95±3.50** | **26.90±0.25** | 4.6047±0.1782 |
 | UD-Q3_K_M | 119.28 | 207.20 | 25.49 | 4.0242 |
 | UD-Q3_K_XL | 119.40 | 207.69 | 25.34 | 4.0189 |
 | UD-IQ4_XS | 127.28 | 215.93 | 21.10 | 3.8633 |
@@ -26,11 +26,64 @@
 | **UDNL_W4** | 146.36 | **370.87** | 25.10 | 3.7997 |
 | UD-Q8_K_XL | 150.75 | 306.17 | 21.39 | 3.4440 |
 
-PPL 沿用同一权重此前的质量测量；CPU 频率不会影响 PPL，因此本轮没有重复计算。`UD-IQ4_XS` 的正式值按重复次数合并：原 3 轮为 219.09/21.62，补充 5 轮为 214.03/20.78，加权后 PP/TG 为 **215.93/21.10**。表内其余性能数字均由当次逐格式 JSON 原始记录汇总。
+UDNL_MX corrected 在修复 imatrix 契约后从确认的源重新量化，随后用完全相同的 `performance` 配方补测三轮 PP/TG；PPL 使用 20×512 WikiText-2 历史口径。其余 PPL 沿用同一权重此前的质量测量；CPU 频率不会影响 PPL。`UD-IQ4_XS` 的正式值按重复次数合并：原 3 轮为 219.09/21.62，补充 5 轮为 214.03/20.78，加权后 PP/TG 为 **215.93/21.10**。
 
-公开图中，普通 UD 点用圆形，MXFP4 用作锚点，自研 UDNL_W4、UDNL_MX、E4A 用大星；红色空心菱形表示该格式虽然更小，却被至少一个更大格式以 3% 以上速度反超。趋势线只拟合普通 UD 点与 MXFP4 锚点，不用三种自研格式参与拟合。较低的趋势解释力和反例说明性能不只由文件体积或理论 DRAM 带宽决定，还取决于码本展开、scale 处理、磁盘/计算布局以及能否进入批量内核。
+公开图中，普通 UD 点用圆形，MXFP4 用作锚点，自研 UDNL_W4、UDNL_MX corrected、E4A 用大星。红色空心菱形表示该格式虽然更小，却被至少一个更大格式以 3% 以上速度反超。趋势线只拟合普通 UD 点与 MXFP4 锚点，不用自研格式参与拟合。单独的 tradeoff 图把 UDNL_MX 与 Q3_K_XL 的体积、PP、TG 和 PPL 并列，避免只看速度隐藏质量代价。
 
 [^q4-loader]: 当前 loader 实际把 `UD-Q4_K_XL` 的 routed MoE tensor 识别为 MXFP4；该点保留为实测文件结果，但不能作为纯 Q4 专家端点。
+[^udnl-mx-corrected]: 旧 UDNL_MX 文件由错误的 imatrix 路径生成，其质量与 mode 分布已永久撤回。当前行来自修复后重新量化的新文件；完整 raw 结果为 116.1284 GiB、PP2048 418.95±3.50、TG512 26.90±0.25、PPL 4.6047±0.17815。
+
+## 2026-08-24 strict hot-expert 与量化路线收口
+
+### UDNL_MX corrected raw endpoint
+
+| 对比 | 体积 | PP2048 | TG512 | PPL |
+|---|---:|---:|---:|---:|
+| UDNL_MX corrected | **116.13 GiB** | **418.95±3.50** | **26.90±0.25** | 4.6047±0.1782 |
+| UD-Q3_K_XL | 119.40 GiB | 207.69 | 25.34 | **4.0189** |
+
+UDNL_MX corrected 比 Q3_K_XL 小约 2.7%，PP 约 2.0×、TG 高约 6.2%，但 PPL 高 **14.6%**。因此它是容量与 PP 的研究点，**不是推荐的 Q3_K_XL 替代格式**。
+
+![UDNL_MX corrected 与 Q3_K_XL 的权衡](img/udnl-mx-tradeoff.png)
+
+### UDNL_MX corrected + MXFP4 K24 strict-hot pilot
+
+| 指标 | UDNL_MX no-hot | UDNL_MX + K24 hot | 变化 |
+|---|---:|---:|---:|
+| TG512（单组 paired pilot） | 26.9 tok/s | **31.3 tok/s** | **+16.36%** |
+| PPL（同命令 b1/ub1，5 chunks） | 3.5614 | **3.5218** | -1.1119% |
+| 权重驻留 | 116.1284 GiB | **128.9780 GiB** | +12.8496 GiB hot weights |
+
+strict-hot 改善了 UDNL_MX 自身的 paired PPL 和 TG，但没有证明追平 Q3。Q3_K_XL 的旧 20-chunk PPL 为 4.0189，其中 checkpoint `[5]=3.0808`；它与本次 b1/ub1 paired 命令不同，不能直接作为质量门。即使仅作提示，hot B=3.5218 仍比该旧 `[5]` 高 14.31%，而组合权重驻留又比 Q3_K_XL 大 8.02%。因此该结果只作为速度/负面质量消融，不进入 quality headline；需要同命令的 Q3 20-chunk 对照才能重新判断。
+
+### E4A + MXFP4 K24 hot-expert（单 slot）
+
+最终 strict 路径让 GPU 回传六个 router-slot 输出，CPU 按 slot 0→5 恢复 baseline 左折叠；AVX512 合并保持逐 slot 独立乘加、不使用 FMA。12 次 TG 使用 3 组 ABBA，PP 为同条件 A/B，PPL 为 batch=1、5 chunks；43 层 marker、GPU 轨迹与固定 seed 响应重复性全部通过。
+
+| 指标 | E4A no-hot | E4A + K24 hot | 变化 | 判定 |
+|---|---:|---:|---:|---|
+| TG512（6 轮均值） | 25.02 tok/s | **30.23 tok/s** | **+20.85%** | ≥27.70，通过 |
+| PP2048 | **366.85 tok/s** | 361.47 tok/s | -1.47% | ≥98% A 且 ≥350，通过 |
+| WikiText-2 PPL（batch=1，5 chunks） | 2.7758 | **2.7548** | -0.76% | ≤1.003×A，通过 |
+
+这组结果证明的是同一 E4A cold 模型在单 slot 下的 strict hybrid 路径；不能外推到多 slot，因为当前 hot staging/event 是每层单份状态。
+
+UDNL_W4 + MXFP4 K24 只完成一组负面 pilot：TG 23.5→30.5 tok/s，但 PPL 2.9559→2.9719（+0.54%），超过 0.5% 门。W4 hot 会把命中的 UDNL_W4 专家替换为数值不同的 MXFP4 权重，因此该结果仅作为质量负面消融，不升级为正式配置或里程碑。
+
+### DSV4 matched 2→4 pure EP
+
+同一 MXFP4 模型、master 命令、CUDA placement、prompt 和 512-token 输出下，master 设置 `KLOCAL=0`，CPU routed experts 由 worker 做互斥 modulo cover；这是一个 slot 的 expert parallelism，不是四份模型或四个 slot。
+
+| topology | 31-token prompt throughput | TG512 | 2→4 变化 |
+|---|---:|---:|---:|
+| 单机 2 NUMA worker | 64.3 tok/s | 22.1 tok/s | — |
+| 双机 4 NUMA worker | **75.6 tok/s** | **25.2 tok/s** | prompt +17.57%，TG +14.03% |
+
+两种拓扑的完整生成响应一致。该数据是一次 matched topology 对比，不声称理想 2×，也不与下文 GLM-5.2 的 PP512 workload 混算。
+
+### Q2/Q4 proxy 预算状态
+
+新 Q2/Q3/Q4 混合路线仍在验证。`68×Q2_K + 61×Q4_K` 的 tensor-level 计划虽然有体积代理，但扩大 8× 的 sensitivity 抽样 coverage 只有 0.840844，低于 0.87 硬门，所以**没有物化 GGUF，也没有 PPL/PP/TG**。代理预算不能作为已完成格式或性能点；在 held-out replay、全模型 PPL 和性能验收完成前，不公布占位数字。
 
 <details>
 <summary>历史矩阵：2026-08-21，<code>powersave</code>（仅供追溯）</summary>

@@ -20,13 +20,12 @@ Each row below is an independent benchmark scope. Percentages from different row
 
 | Track | Matched baseline | Current result | Change |
 |---|---:|---:|---:|
-| DSV4 pp2048, MXFP4 -> UDNL_MX | 312.48 tok/s | **415.56 tok/s** | **+33.0%** |
 | DSV4 pp2048, quality-equivalent MXFP4 -> E4A | 312.48 tok/s | **362.92 tok/s** | **+16.1%** |
 | DSV4 DSpark decode, n2/p0 | 23.9 tok/s | **30.1 tok/s** | **+26%** |
-| DSV4 raw decode, matched hot-expert A/B | 26.0 tok/s | **28.5 tok/s** | **+9.7%** |
+| DSV4 E4A decode, strict hot experts, 12-run A/B | 25.02 tok/s | **30.23 tok/s** | **+20.85%** |
 | DSV4 16K GPU MoE prefill | 213 tok/s | **334.5 tok/s** | **+57%** |
+| DSV4 single-slot pure EP, 2 -> 4 NUMA workers | 22.1 tok/s | **25.2 tok/s** | **+14.03%** |
 | GLM-5.2 pp512, true EP on 2 -> 4 NUMA workers | 24.13 tok/s | **40.59 tok/s** | **+68.2%** |
-| DSV4 GGUF size, MXFP4 -> UDNL_MX | 145.3 GiB | **116.1 GiB** | **-20.1%** |
 
 ![Milestones across three performance tracks](docs/img/evolution-staircase.png)
 
@@ -68,7 +67,7 @@ On top of row-window TP, DME (Dynamic Matrix Execution) handles irregular MoE sh
 
 In the production-style hybrid path, the GPU runs attention, dense layers, the router, and KV; the CPU runs routed experts. Three complementary mechanisms target different phases:
 
-- **Hot-expert residency**: the corrected trace shows that the top 16 experts per layer cover 49.1% of selections; compact MXFP4 weights for all 43 layers use about 8.8 GiB. An in-graph GPU hot branch forks against the CPU cold branch and joins before the residual. Matched tg512 runs improve from 26.1/25.9 to 28.4/28.6 tok/s, or 9.7% on the means.
+- **Hot-expert residency**: the top 24 experts per layer cover about 57.6% of selections; compact MXFP4 weights for all 43 layers use 12.85 GiB. The GPU hot branch and CPU cold branch fork and join inside the graph. The GPU returns per-router-slot values, the CPU restores the baseline slot 0..5 left fold, and AVX512 vectorizes only across hidden rows. Twelve tg512 runs improve from 25.0167 to 30.2333 tok/s (+20.85%); PP2048 is 361.47 tok/s and five-chunk PPL improves from 2.7758 to 2.7548.
 - **NVLink P2P TP**: capture-safe P2P allreduce and asynchronous D2H readback improve the TP path itself from 13.6 to 20.3 tok/s (+49%) and reduce `cudaStreamSynchronize` from about 690 to 150 calls per token. This is an internal TP-path A/B, not a comparison against the best layer-placement path.
 - **Streaming MoE prefill**: expert weights remain in pinned host memory. Long prompts upload them once per layer, reuse them across tiles, and overlap H2D with dual-GPU expert-axis EP and three-slot prefetch.
 
@@ -89,10 +88,13 @@ In the production-style hybrid path, the GPU runs attention, dense layers, the r
 | Test | Before | After | Change |
 |---|---:|---:|---:|
 | GLM-5.2 MoE pp512, 2 -> 4 workers | 24.13 | **40.59** | **1.682 x** |
+| DSV4 MXFP4 TG512, 2 -> 4 workers | 22.1 | **25.2** | **1.140 x** |
 | DSV4 16K PP, UB64 -> UB256 | 235.37 | **269.36** | +14.4% |
 | 64 B RPC RTT, TCP -> RoCEv2 | 42-74 us | **10-13 us** | about 4-6 x lower |
 
 GLM dense layers and attention remain on the GPU; the first row scales only CPU MoE. Aggregate decode time for 75 MoE layers falls from 86.71 to 69.58 ms/token (1.246 x), with byte-identical 128-token output. Fixed-acceptance DSV4 pure EP over four workers and RDMA reaches 37.921 tok/s on average and 38.423 tok/s at peak, with the same output SHA256 as the single-machine reference.
+
+The new DSV4 row is a matched single run with one slot, one master, one model, and one command. Two local workers own 128 experts each; four cross-machine workers own 64 each, while `KLOCAL=0` makes the master skip all routed-expert weights. Generated-response SHA256 is identical across the two topologies. The hosts have different core counts and network latency, so this system result is not an ideal 2 x scaling claim.
 
 ## Kernel evolution
 
@@ -105,7 +107,7 @@ The early audit found that several `mul_mat_id` branches still called `vec_dot` 
 An arec (activation record) precomputes the Q8 activation and scale once. Weight panels then remain in L1/L2 and are reused across eight-row tiles. End-to-end pp2048 improves as follows:
 
 - UDNL_W4: 263.33 -> **366.58 tok/s (+39%)**;
-- UDNL_MX: 223.02 -> **384.87 tok/s (+73%)**.
+- corrected UDNL_MX, regenerated after the imatrix-contract fix, reaches **418.95±3.50 tok/s**.
 
 ### Fusion and asynchronous boundaries
 
@@ -128,20 +130,24 @@ The format work therefore moves from “fewest bits” to storage layouts that f
 
 ![Full MoE format matrix by model size and PP/TG speed](docs/img/quant-formats.png)
 
-The figure and table use the unified 2026-08-24 `performance` run with 17 format points. The fixed arguments are `-ngl 99 -ncmoe 99 -fa 1 -dev CUDA0 -sm layer -t 72 --numa distribute -b 4096 -ub 1024 --load-mode none -p 2048 -n 512 -r 3`; all 152/152 CPU governors and EPP settings were `performance`, turbo was enabled, and `numa_balancing=1` was recorded. These are raw single-slot results with neither DSpark nor hot experts. Standard UD formats are ordinary circles, MXFP4 is the anchor, the in-house UDNL_W4/UDNL_MX/E4A formats are large stars, and red hollow diamonds flag points that are smaller yet at least 3% slower than a larger format. Trend lines are fitted only to standard UD points plus the MXFP4 anchor; the three in-house formats are excluded from the fit.
+The figure and table use one 2026-08-24 `performance` recipe for 17 format points. Sixteen original matrix points share one binary; corrected UDNL_MX was rerun after the fix with the same hardware, arguments, and recipe, replacing its old row. The fixed arguments are `-ngl 99 -ncmoe 99 -fa 1 -dev CUDA0 -sm layer -t 72 --numa distribute -b 4096 -ub 1024 --load-mode none -p 2048 -n 512 -r 3`; all 152/152 CPU governors and EPP settings were `performance`, turbo was enabled, and `numa_balancing=1` was recorded. These are raw single-slot results with neither DSpark nor hot experts. Standard UD formats are ordinary circles, MXFP4 is the anchor, the in-house UDNL_W4/UDNL_MX/E4A formats are large stars, and red hollow diamonds flag points that are smaller yet at least 3% slower than a larger format. Trend lines are fitted only to standard UD points plus the MXFP4 anchor; the three in-house formats are excluded from the fit.
 
-PPL is reused from the prior quality measurement of the same weights: CPU frequency does not change PPL, so it was not recomputed in this run. The PP/TG value for `UD-IQ4_XS`, 215.93/21.10, is weighted by repeat count from the original three runs at 219.09/21.62 and five supplemental runs at 214.03/20.78. The current loader identifies the routed MoE tensors in `UD-Q4_K_XL` as MXFP4, so that row is not a pure-Q4 expert endpoint. See [BENCHMARKS](docs/BENCHMARKS.md) for all 17 points and the historical scope.
+UDNL_MX was regenerated from the verified source and rerun with the same `performance` recipe, replacing the old tainted row in the chart; its PPL uses the historical 20×512 WikiText-2 scope. Other PPL values are reused from prior measurements of the same weights because CPU frequency does not affect PPL. The PP/TG value for `UD-IQ4_XS`, 215.93/21.10, is weighted by repeat count from the original three runs at 219.09/21.62 and five supplemental runs at 214.03/20.78. The current loader identifies the routed MoE tensors in `UD-Q4_K_XL` as MXFP4, so that row is not a pure-Q4 expert endpoint. See [BENCHMARKS](docs/BENCHMARKS.md) for all 17 points and the historical scope.
 
 | Format | Size | pp2048 | tg512 | WikiText-2 PPL | Role |
 |---|---:|---:|---:|---:|---|
 | MXFP4 | 145.26 GiB | 312.48 | 26.87 | 3.5830 | quality and speed anchor |
 | **UDNL_W4 + arec** | 146.36 GiB | 370.87 | 25.10 | 3.7997 | fixed 4-bit compute-oriented layout |
-| **UDNL_MX + arec** | **116.13 GiB** | **415.56** | 25.91 | 4.6274 | smallest size and highest PP |
+| **UDNL_MX + arec (corrected)** | **116.13 GiB** | **418.95±3.50** | **26.90±0.25** | 4.6047 | capacity/PP research point; 14.6% worse quality than Q3_K_XL |
 | **E4A** | 145.26 GiB | **362.92** | 24.83 | 3.5830 | bit-exact MXFP4 values |
 | UD-Q3_K_M | 119.28 GiB | 207.20 | 25.49 | 4.0242 | standard UD reference |
 | UD-Q3_K_XL | 119.40 GiB | 207.69 | 25.34 | 4.0189 | standard UD reference |
 
-Choose UDNL_MX when capacity and PP matter most; choose E4A when MXFP4 values and quality must be preserved. Every performance row comes from the same fixed 2026-08-24 harness, while PPL is reused from the matching-weight quality measurement.
+Corrected UDNL_MX is about 2.7% smaller than Q3_K_XL while delivering about 2.0× PP and +6.2% TG, but its PPL is 14.6% worse. It is therefore **not recommended as a Q3_K_XL replacement**. E4A strict-hot remains the quality-gated path, while UDNL_W4 is the fixed 4-bit kernel research line. New Q2/Q3/Q4 mixtures remain under validation; unfinished models receive no placeholder performance or quality claims.
+
+A K24 strict-hot pilot on corrected UDNL_MX raises TG from 26.9 to 31.3 tok/s (+16.36%) and improves same-command five-chunk PPL from 3.5614 to 3.5218. However, the cold GGUF plus 12.8496 GiB of hot weights total about **128.978 GiB**, 8.02% larger than Q3_K_XL, and no same-command 20-chunk Q3 comparison exists. This is a speed/negative-quality ablation, not a same-quality headline or recommended configuration.
+
+![Size, speed, and quality tradeoff of corrected UDNL_MX](docs/img/udnl-mx-tradeoff.png)
 
 ## Build and run
 

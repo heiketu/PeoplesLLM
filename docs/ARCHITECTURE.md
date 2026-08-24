@@ -63,11 +63,13 @@ The hot-expert path is an optional fork inside the MoE graph:
 
 ```text
 router output
-  -> GPU resident hot experts -----+
-  -> CPU cold experts -------------+-> ordered merge
+  -> GPU resident hot experts -> six router-slot partials --+
+  -> CPU cold experts --------------------------------------+-> slot 0..5 left-fold merge
 ```
 
-The hot path is restricted by model type, tensor format, token count, and device capacity. Unsupported shapes use the ordinary CPU path.
+The hot path is restricted by model type, tensor format, token count, and device capacity. Unsupported shapes use the ordinary CPU path. The production single-token path does not merge one aggregate GPU partial with one aggregate CPU partial: it returns one vector per router slot, then restores the baseline slot order on the CPU. AVX512 may vectorize across hidden rows, but never across the six-slot dependency chain. This distinction is required for the path's numerical contract.
+
+The current staging buffers and completion events are process-global and have been validated only for one active slot. A multi-slot implementation must make this state context/slot-owned before enabling concurrent hot forks; it must not reuse the single-slot path speculatively.
 
 Speculative decoding wraps the target decode loop. DSpark drafts candidate tokens on its configured device, then the target model verifies them as a small batch. Draft acceptance changes the target `MUL_MAT_ID` shape, so decode kernel dispatch must remain workload-aware.
 
@@ -167,7 +169,7 @@ A result must state which contract applies. Run-to-run determinism does not prov
 | Remote EP | dealer, topology, credit, session, protocol, expert-map tests and `llama-epd --selftest` |
 | Layer-major or prefill scheduler | `test-layer-major`, `test-server-prefill-scheduler`, KV eligibility and fallback tests |
 | CUDA op or collective | CUDA backend-op test, deterministic output check, single-device fallback, and matched A/B |
-| Hot-expert path | resident-set initialization, hot/cold hash comparison, capacity check, fallback with the feature disabled |
+| Hot-expert path | resident-set initialization, 64-mask scalar/AVX slot-order comparison, fixed-seed repeatability, paired PPL, capacity check, disabled-feature fallback, and single-slot ownership gate |
 | Speculative decoding | target output comparison, draft/accepted counts, and NMAX sweep under one prompt |
 
 The current build and test commands are maintained in [DEVELOPMENT.md](DEVELOPMENT.md).

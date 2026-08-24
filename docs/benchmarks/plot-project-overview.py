@@ -31,13 +31,13 @@ def evolution():
         "Baseline\nMXFP4",
         "Spec-decode\ntune (n2/p0)",
         "Op fusion +\nasync readback",
-        "arec GEMM\n(UDNL_MX)",
+        "E4A native\nlayout",
         "64-row claim +\ntail batching",
-        "Hot-expert GPU\nresidency",
+        "Strict K24\nhot-expert",
     ]
     x = np.arange(len(stages))
-    pp = [309, 309, 309, 385, 385, 385]
-    raw = [24.9, 24.9, 25.9, 25.9, 26.4, 28.5]
+    pp = [309, 309, 309, 363, 367, 361.47]
+    raw = [24.9, 24.9, 25.9, 24.83, 25.02, 30.23]
     spec = [23.9, 26.8, 26.8, 26.8, 30.1, 30.1]
 
     fig, left = plt.subplots(figsize=(10, 4.8))
@@ -53,10 +53,10 @@ def evolution():
     left.grid(alpha=0.25)
     lines = left.lines + right.lines
     left.legend(lines, [line.get_label() for line in lines], loc="upper left")
-    left.set_title("DSV4-Flash performance milestones (2 x Xeon ICX-SP + 2 x RTX 3090)\nindependent measured tracks; values are not multiplicative")
-    for px, py, label, offset in [(0, 309, "309", (-12, 10)), (3, 385, "385", (0, 10))]:
+    left.set_title("DSV4-Flash performance milestones (2 x Xeon ICX-SP + 2 x RTX 3090)\nstrict E4A K24 final: PPL 2.7758 -> 2.7548; tracks are not multiplicative")
+    for px, py, label, offset in [(0, 309, "309", (-12, 10)), (3, 363, "363", (0, 10)), (5, 361.47, "361.47", (12, -16))]:
         left.annotate(label, (px, py), xytext=offset, textcoords="offset points", ha="center", color=GREEN, fontweight="bold")
-    for px, py, label, offset in [(0, 24.9, "24.9", (0, -18)), (2, 25.9, "25.9", (0, -16)), (4, 26.4, "26.4", (0, -16)), (5, 28.5, "28.5", (0, -16))]:
+    for px, py, label, offset in [(0, 24.9, "24.9", (0, -18)), (2, 25.9, "25.9", (0, -16)), (4, 25.02, "25.02", (-12, -16)), (5, 30.23, "30.23", (0, -16))]:
         right.annotate(label, (px, py), xytext=offset, textcoords="offset points", ha="center", color=BLUE, fontweight="bold")
     for px, py, label in [(0, 23.9, "23.9"), (1, 26.8, "26.8"), (4, 30.1, "30.1")]:
         right.annotate(label, (px, py), xytext=(0, 10), textcoords="offset points", ha="center", color=ORANGE, fontweight="bold")
@@ -97,6 +97,7 @@ def formats():
         ("UD-Q2_K_XL",    90.18230098485947, 232.22, 28.03, "ud"),
         ("UD-IQ3_XXS",    97.05112132430077, 208.96, 26.74, "ud"),
         ("UD-IQ3_S",     108.09799629449844, 254.48, 23.99, "ud"),
+        ("UDNL_MX",       116.12836688756943, 418.95, 26.90, "xllama"),
         ("UD-Q3_K_M",    119.28238350152970, 207.20, 25.49, "ud"),
         ("UD-Q3_K_XL",   119.40182167291641, 207.69, 25.34, "ud"),
         # Weighted across the 3-run formal batch and the 5-run confirmation batch.
@@ -106,7 +107,6 @@ def formats():
         ("UD-Q8_K_XL",   150.75282707810402, 306.17, 21.39, "ud"),
         ("MXFP4",        145.26439723372460, 312.48, 26.87, "baseline"),
         ("UDNL_W4",      146.36274161934853, 370.87, 25.10, "xllama"),
-        ("UDNL_MX",      116.12836688756943, 415.56, 25.91, "xllama"),
         ("E4A",          145.26439723372460, 362.92, 24.83, "xllama"),
     ]
     rows.sort(key=lambda row: (row[1], row[0]))
@@ -130,7 +130,8 @@ def formats():
         "UD-IQ1_S": (-8, 14), "UD-IQ1_M": (-18, -19),
         "UD-IQ2_XXS": (27, 13), "UD-IQ2_M": (28, -18),
         "UD-Q2_K_XL": (0, 10), "UD-IQ3_XXS": (0, -17),
-        "UD-IQ3_S": (-8, 10), "UDNL_MX": (2, 11),
+        "UD-IQ3_S": (-8, 10),
+        "UDNL_MX": (7, 10),
         "UD-Q3_K_M": (-46, -18), "UD-Q3_K_XL": (11, 9),
         "UD-IQ4_XS": (-49, -18), "UD-IQ4_NL": (10, 9),
         "UD-Q4_K_XL": (-58, -18), "MXFP4": (-26, 10),
@@ -140,7 +141,8 @@ def formats():
         "UD-IQ1_S": (-6, 13), "UD-IQ1_M": (-24, -19),
         "UD-IQ2_XXS": (27, -13), "UD-IQ2_M": (28, 13),
         "UD-Q2_K_XL": (0, 10), "UD-IQ3_XXS": (-3, -17),
-        "UD-IQ3_S": (-10, -17), "UDNL_MX": (-8, 11),
+        "UD-IQ3_S": (-10, -17),
+        "UDNL_MX": (-8, 10),
         "UD-Q3_K_M": (-46, 10), "UD-Q3_K_XL": (10, -17),
         "UD-IQ4_XS": (-48, -17), "UD-IQ4_NL": (11, 9),
         "UD-Q4_K_XL": (-58, -18), "MXFP4": (-24, 10),
@@ -185,12 +187,12 @@ def formats():
         ax.text(trend_label_x, 0.95, f"UD + MXFP4 OLS: {trend_coeff[0]:+.3f} tok/s/GiB, R²={r_squared:.2f}",
                 transform=ax.transAxes, ha=trend_ha, va="top", color="#555b63", fontsize=8.8, fontweight="bold")
 
-    axes[0].set_ylim(185, 440)
+    axes[0].set_ylim(185, 445)
     axes[1].set_ylim(19.8, 30.3)
     axes[1].set_xlim(73.5, 154.0)
     axes[1].set_xlabel("Model size (GiB)")
     fig.suptitle(
-        "DSV4-Flash formal format sweep (performance governor, unified binary and recipe)\n"
+        "DSV4-Flash formal format sweep (matched performance recipe; corrected UDNL_MX rerun)\n"
         "red open diamond: a smaller format is at least 3% slower than a larger format",
         y=0.995,
     )
@@ -202,10 +204,45 @@ def formats():
         Line2D([0], [0], color=GRAY, linestyle="--", linewidth=1.8, label="OLS on UD + MXFP4 only"),
     ]
     fig.legend(handles=legend, ncol=5, loc="upper center", bbox_to_anchor=(0.5, 0.948), fontsize=8, framealpha=0.94)
-    fig.text(0.5, 0.008, "UD-IQ4_XS combines the 3-run formal batch and 5-run confirmation batch by repeat count: pp 215.93, tg 21.10.",
+    fig.text(0.5, 0.008, "UDNL_MX is the corrected imatrix build: 116.13 GiB, pp 418.95, tg 26.90. Its PPL 4.6047 is shown separately. UD-IQ4_XS is repeat-weighted.",
              ha="center", va="bottom", fontsize=8, color="#555b63")
     fig.tight_layout(rect=(0, 0.035, 1, 0.905))
     finish(fig, "quant-formats.png")
+
+
+def udnl_mx_tradeoff():
+    labels = ["Q3_K_XL", "UDNL_MX\ncorrected"]
+    colors = [BLUE, ORANGE]
+    metrics = [
+        ("Model size", [119.40, 116.13], [0, 0], "GiB", "lower is better", False),
+        ("PP2048", [207.69, 418.95], [0, 3.50], "tok/s", "2.02 x faster", True),
+        ("TG512", [25.34, 26.90], [0, 0.25], "tok/s", "+6.2%", True),
+        ("WikiText-2 PPL", [4.0189, 4.6047], [0, 0.1782], "PPL", "+14.6% worse", False),
+    ]
+    fig, axes = plt.subplots(1, 4, figsize=(13.2, 3.9))
+    for ax, (title, values, errors, unit, callout, higher_is_better) in zip(axes, metrics):
+        bars = ax.bar(labels, values, color=colors, width=0.58)
+        if errors[1] > 0:
+            ax.errorbar([1], [values[1]], yerr=[errors[1]], fmt="none", ecolor="black", capsize=4, linewidth=1.0)
+        ax.set_title(title)
+        ax.set_ylabel(unit)
+        ax.set_ylim(0, max(values) * 1.23)
+        ax.grid(axis="y", alpha=0.25)
+        for index, (bar, value) in enumerate(zip(bars, values)):
+            digits = 4 if title.endswith("PPL") else 2
+            label_y = value + errors[index] + max(values)*0.025
+            ax.text(bar.get_x() + bar.get_width() / 2, label_y, f"{value:.{digits}f}",
+                    ha="center", fontsize=9, fontweight="bold")
+        callout_color = GREEN if (higher_is_better or title == "Model size") and "worse" not in callout else ORANGE
+        ax.text(0.5, 0.94, callout, transform=ax.transAxes, ha="center", va="top",
+                fontsize=9, color=callout_color, fontweight="bold")
+    fig.suptitle(
+        "Corrected raw UDNL_MX trades a small size reduction and much higher PP for worse quality\n"
+        "not recommended as a Q3_K_XL replacement",
+        y=1.03,
+    )
+    fig.tight_layout()
+    finish(fig, "udnl-mx-tradeoff.png")
 
 
 def gpu_prefill():
@@ -235,8 +272,8 @@ def gpu_prefill():
 def remote_ep():
     fig, axes = plt.subplots(1, 3, figsize=(12, 4.1))
     pairs = [
-        ([24.13, 40.59], ["1 machine\n2 NUMA workers", "2 machines\n4 NUMA workers"], "GLM-5.2 MoE pp512\ntrue expert parallelism", "tok/s"),
-        ([235.37, 269.36], ["UB64", "UB256"], "DSV4-Flash 16K prefill\n4-worker RDMA EP", "tok/s"),
+        ([22.1, 25.2], ["1 machine\n2 NUMA workers", "2 machines\n4 NUMA workers"], "DSV4-Flash TG512\nmatched pure EP", "tok/s"),
+        ([64.3, 75.6], ["1 machine\n2 NUMA workers", "2 machines\n4 NUMA workers"], "DSV4-Flash 31-token prompt\nmatched pure EP", "tok/s"),
         ([58.0, 11.5], ["TCP", "RDMA\nRoCEv2"], "Cross-machine RPC RTT\n64 B message", "us"),
     ]
     for ax, (values, labels, title, ylabel) in zip(axes, pairs):
@@ -247,10 +284,10 @@ def remote_ep():
         ax.grid(axis="y", alpha=0.25)
         for bar, value in zip(bars, values):
             ax.text(bar.get_x() + bar.get_width() / 2, value * 1.03, f"{value:g}", ha="center", fontweight="bold")
-    axes[0].text(0.5, 0.68, "1.682 x", transform=axes[0].transAxes, ha="center", color=PURPLE, fontsize=13, fontweight="bold")
-    axes[1].text(0.5, 0.74, "+14.4%", transform=axes[1].transAxes, ha="center", color=PURPLE, fontsize=13, fontweight="bold")
+    axes[0].text(0.5, 0.68, "+14.03%", transform=axes[0].transAxes, ha="center", color=PURPLE, fontsize=13, fontweight="bold")
+    axes[1].text(0.5, 0.68, "+17.57%", transform=axes[1].transAxes, ha="center", color=PURPLE, fontsize=13, fontweight="bold")
     fig.subplots_adjust(top=0.72, wspace=0.35)
-    fig.suptitle("Multi-machine expert parallelism over a 100 GbE direct link (TCP fallback available)", y=0.98)
+    fig.suptitle("DSV4-Flash single-slot expert parallelism over a 100 GbE direct link\nmatched command and identical generated response", y=0.99)
     finish(fig, "remote-ep.png")
 
 
@@ -258,5 +295,6 @@ if __name__ == "__main__":
     evolution()
     numa_tp()
     formats()
+    udnl_mx_tradeoff()
     gpu_prefill()
     remote_ep()
