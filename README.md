@@ -151,7 +151,9 @@ UDNL_MX 已从确认的源重新量化并用相同 `performance` 配方复测，
 
 UDNL_MX corrected 以比 Q3_K_XL 小约 2.7% 的体积换来约 2.0× PP 和 +6.2% raw/no-DSpark TG，但 PPL 高 14.6%，因此**不推荐作为 Q3_K_XL 的替代品**。当前通过质量门的主线仍是 E4A strict-hot；UDNL_W4 是固定 4-bit 内核研究线。
 
-新 Q2/Q3/Q4 首模尚未生成。Phase A v1 计划为 `Q2_K/Q3_K/Q4_K = 61/58/10`，dry-run **108.4046 GiB**、proxy loss **0.898640× all-Q3**、expert traffic **0.903594× all-Q3**；但物化在 `blk.21` 异常 MXFP4 gate/up 源数据使 Q3 fp16 scale 变为 `inf` 时被门禁拒绝，没有输出模型。全量只读扫描确认只有这两个 gate/up tensor 不适合转换。v2 将完整 gate/up 原子对保留为 MXFP4，分布为 `Q2_K/Q3_K/Q4_K/MXFP4 = 61/56/10/2`，dry-run **108.8109 GiB**；它尚未开始完整转换，因此仍无 PPL、raw TG 或 DSpark TG，不在表中预填数字。
+Q2/Q3/Q4 Phase A v1 计划为 `61/58/10`，dry-run **108.4046 GiB**、proxy loss **0.898640× all-Q3**，但物化在 `blk.21` 异常 MXFP4 gate/up 源数据使 Q3 fp16 scale 变为 `inf` 时被门禁拒绝。v2 不 clamp 或静默修改数值，而是将完整 gate/up 原子对保留为 MXFP4。该模型已完整生成为 **108.8159 GiB**，129/129 个专家张量的 `Q2_K/Q3_K/Q4_K/MXFP4 = 61/56/10/2` 与 SHA256 均通过验证。不过 reconstruction/traffic proxy 不是质量证据；PPL、raw TG/PP 仍在验收，因此不在主表中预填性能或宣称它优于 Q3。
+
+在相同 CLI/DSO、MXFP4 DSpark draft、prompt/seed、CUDA 布局和 `NMAX=2,p_min=0` 下，Q3_K_XL -> corrected UDNL_MX 再反序复测得到 Q3 **29.37/29.17**、UDNL **33.11/33.64 tok/s**，均值 29.270 对 **33.375 tok/s（+14.02%）**。两格式各自的生成 hash 和接受数跨顺序稳定；UDNL 接受率反而较低（63.556% 对 68.056%）。这是 DSpark 指定配置证据，不是同质量结论：两者既有 PPL 4.6047 对 4.0189 的差异，也生成不同文本。
 
 UDNL_MX corrected 的 K24 strict-hot raw/no-DSpark pilot 将 TG 从 26.9 提升到 31.3 tok/s（+16.36%），同命令 5-chunk PPL 从 3.5614 改善到 3.5218；但 cold GGUF 与 12.8496 GiB 热权重合计约 **128.978 GiB**，比 Q3_K_XL 大 8.02%，且尚无同命令 Q3 20-chunk 对照。这只是速度/负面质量消融，不是同质量 headline 或推荐配置。
 

@@ -110,16 +110,27 @@ TG512 顺序为 ABBA 后接 BAAB：
 
 ### Q2/Q3/Q4 proxy 与物化门禁状态
 
-新 Q2/Q3/Q4 首模尚未生成，因而没有 PPL、raw TG 或 DSpark TG。Phase A v1 的 129-tensor gate/up 原子计划为 `Q2_K/Q3_K/Q4_K = 61/58/10`，dry-run **108.4046 GiB**、large-scan proxy loss **0.898640× all-Q3**、expert traffic **0.903594× all-Q3**。完整物化在 `blk.21.ffn_gate_exps.weight` 的 Q3 fp16 super-scale 变为 `inf` 时被验证门拒绝，没有输出模型；这不是 PPL 失败。
+Q2/Q3/Q4 Phase A v1 的 129-tensor gate/up 原子计划为 `Q2_K/Q3_K/Q4_K = 61/58/10`，dry-run **108.4046 GiB**、large-scan proxy loss **0.898640× all-Q3**、expert traffic **0.903594× all-Q3**。完整物化在 `blk.21.ffn_gate_exps.weight` 的 Q3 fp16 super-scale 变为 `inf` 时被验证门拒绝，没有输出模型；这不是 PPL 失败。
 
 随后对 129 个 expert tensor 做全量只读 MXFP4 representability 扫描，只有 `blk.21` 的 gate/up 两个 tensor 含异常范围，可能让 Q2_K/Q3_K/Q4_K 的 fp16 super-scale 溢出。v2 不 clamp、不重解释源值，而是把完整 gate/up 原子对保留为 MXFP4；类型计数为 `Q2_K/Q3_K/Q4_K/MXFP4 = 61/56/10/2`：
 
 | 计划 | Q2_K / Q3_K / Q4_K / MXFP4 | dry-run | proxy loss / all-Q3 | expert traffic / all-Q3 | 状态 |
 |---|---:|---:|---:|---:|---|
 | v1 | 61 / 58 / 10 / 0 | 108.4046 GiB | 0.898640 | 0.903594 | 物化被 scale-inf 门拒绝，无模型 |
-| v2 | 61 / 56 / 10 / 2 | **108.8109 GiB** | 0.888917 | 0.907259 | dry-run 通过，尚未转换 |
+| v2 | 61 / 56 / 10 / 2 | **108.8159 GiB** | 0.888917 | 0.907259 | 物化完成；129/129 类型、大小与 SHA 通过 |
 
-这些仍只是 reconstruction/traffic 代理与 quantizer 容量结果，不是模型质量或速度。即使 v2 未来成功生成，也必须先通过 PPL、确定性和完整输出门，才能测 raw TG；DSpark 需另行测量。
+这些仍只是 reconstruction/traffic 代理与 quantizer 容量结果，不是模型质量或速度。v2 的完整产物为 116,840,147,392 bytes（108.8159 GiB），129/129 个专家张量与 `61/56/10/2` 类型计数已核验。它仍必须先通过 PPL、确定性和完整输出门，才能将 raw TG/PP 列入正式表；DSpark 需另行测量。
+
+### DSpark NMAX=2 的 Q3_K_XL / corrected UDNL_MX 双顺序对照
+
+两格式使用同一 CLI/DSO、MXFP4 DSpark draft、prompt、seed、CPU 线程和 CUDA 布局，配置为 `NMAX=2,p_min=0`。顺序为 Q3 -> UDNL，然后反序 UDNL -> Q3：
+
+| 格式 | 正序 TG | 反序 TG | 均值 | 样本标准差 | draft acceptance |
+|---|---:|---:|---:|---:|---:|
+| Q3_K_XL | 29.37 | 29.17 | 29.270 | 0.141 | 68.056% (294/432) |
+| corrected UDNL_MX | 33.11 | 33.64 | **33.375** | 0.375 | 63.556% (286/450) |
+
+UDNL 在该配置下高 **14.02%**。Q3 两轮的生成正文 hash 相同，UDNL 两轮也相同，接受数同样跨顺序稳定；两格式之间的正文 hash 不同。UDNL 接受率较低，所以其 TG 差异不是“接受了更多 draft”造成的；但 target verify、CPU MoE 格式/内核开销和不同生成轨迹仍然混合在一起。已知 PPL 为 Q3 4.0189、UDNL 4.6047，因此本表不支持同质量、纯格式 causal 或任意 prompt 的外推结论。
 
 <details>
 <summary>历史矩阵：2026-08-21，<code>powersave</code>（仅供追溯）</summary>
