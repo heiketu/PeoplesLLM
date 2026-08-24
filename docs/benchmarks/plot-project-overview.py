@@ -28,35 +28,35 @@ def finish(fig, name):
 
 def evolution():
     stages = [
-        "Baseline\nMXFP4",
-        "Spec-decode\ntune (n2/p0)",
-        "Op fusion +\nasync readback",
-        "E4A native\nlayout",
-        "64-row claim +\ntail batching",
-        "Strict K24\nhot-expert",
+        "MXFP4\nbaseline",
+        "DSpark\ntune (n2/p0)",
+        "Raw GPU\nop fusion",
+        "E4A raw\nnative layout",
+        "DSpark claim +\ntail batching",
+        "E4A raw\nstrict K24 hot",
     ]
     x = np.arange(len(stages))
-    pp = [309, 309, 309, 363, 367, 361.47]
-    raw = [24.9, 24.9, 25.9, 24.83, 25.02, 30.23]
-    spec = [23.9, 26.8, 26.8, 26.8, 30.1, 30.1]
+    pp = [309, np.nan, np.nan, 362.92, np.nan, 361.47]
+    raw = [24.9, np.nan, 25.9, 24.83, np.nan, 30.23]
+    spec = [23.9, 26.8, np.nan, np.nan, 30.1, np.nan]
 
     fig, left = plt.subplots(figsize=(10, 4.8))
     right = left.twinx()
-    left.step(x, pp, where="post", marker="o", color=GREEN, linewidth=2.2, label="pp2048 (tok/s, left)")
-    right.step(x, raw, where="post", marker="s", color=BLUE, linewidth=2.2, label="tg512 raw (tok/s, right)")
-    right.step(x, spec, where="post", marker="^", linestyle="--", color=ORANGE, linewidth=2.2, label="tg512 speculative (tok/s, right)")
+    left.plot(x, pp, marker="o", color=GREEN, linewidth=2.2, label="PP2048 (prefill, left)")
+    right.plot(x, raw, marker="s", color=BLUE, linewidth=2.2, label="TG512 raw/no-DSpark (right)")
+    right.plot(x, spec, marker="^", linestyle="--", color=ORANGE, linewidth=2.2, label="TG512 DSpark speculative (right)")
     left.set_ylim(250, 430)
     right.set_ylim(20, 33)
     left.set_ylabel("Prefill pp2048 (tok/s)", color=GREEN)
-    right.set_ylabel("Decode tg512 (tok/s)")
+    right.set_ylabel("Decode TG512 (raw/spec; see legend)")
     left.set_xticks(x, stages)
     left.grid(alpha=0.25)
     lines = left.lines + right.lines
     left.legend(lines, [line.get_label() for line in lines], loc="upper left")
-    left.set_title("DSV4-Flash performance milestones (2 x Xeon ICX-SP + 2 x RTX 3090)\nstrict E4A K24 final: PPL 2.7758 -> 2.7548; tracks are not multiplicative")
-    for px, py, label, offset in [(0, 309, "309", (-12, 10)), (3, 363, "363", (0, 10)), (5, 361.47, "361.47", (12, -16))]:
+    left.set_title("DSV4-Flash independently measured performance tracks (2 x Xeon ICX-SP + 2 x RTX 3090)\nblank points are untested cross-combinations; tracks must not be multiplied")
+    for px, py, label, offset in [(0, 309, "309", (-12, 10)), (3, 362.92, "362.92", (0, 10)), (5, 361.47, "361.47", (12, -16))]:
         left.annotate(label, (px, py), xytext=offset, textcoords="offset points", ha="center", color=GREEN, fontweight="bold")
-    for px, py, label, offset in [(0, 24.9, "24.9", (0, -18)), (2, 25.9, "25.9", (0, -16)), (4, 25.02, "25.02", (-12, -16)), (5, 30.23, "30.23", (0, -16))]:
+    for px, py, label, offset in [(0, 24.9, "24.9", (0, -18)), (2, 25.9, "25.9", (0, -16)), (3, 24.83, "24.83", (-12, -16)), (5, 30.23, "30.23", (0, -16))]:
         right.annotate(label, (px, py), xytext=offset, textcoords="offset points", ha="center", color=BLUE, fontweight="bold")
     for px, py, label in [(0, 23.9, "23.9"), (1, 26.8, "26.8"), (4, 30.1, "30.1")]:
         right.annotate(label, (px, py), xytext=(0, 10), textcoords="offset points", ha="center", color=ORANGE, fontweight="bold")
@@ -64,7 +64,7 @@ def evolution():
 
 
 def numa_tp():
-    labels = ["hybrid tg512", "hybrid pp2048", "pure-CPU tg128", "pure-CPU pp512"]
+    labels = ["hybrid raw TG512\n(no DSpark)", "hybrid PP2048", "pure-CPU raw TG128\n(no DSpark)", "pure-CPU PP512"]
     off = np.array([16.59, 267.05, 7.23, 101.41])
     on = np.array([25.01, 298.98, 11.65, 107.91])
     changes = ["+51%", "+12%", "+61%", "+6.4%"]
@@ -78,7 +78,7 @@ def numa_tp():
     ax.set_ylim(0, 345)
     ax.grid(axis="y", alpha=0.25)
     ax.legend(loc="upper right")
-    ax.set_title("Intra-device NUMA tensor parallelism, DSV4-Flash MXFP4 (ABAB verified)\nlocal+bound 313.5 GB/s vs interleave 122 GB/s (2.57 x)")
+    ax.set_title("Intra-device NUMA tensor parallelism, DSV4-Flash MXFP4 (ABAB verified)\nraw/no-DSpark decode; local+bound 313.5 GB/s vs interleave 122 GB/s (2.57 x)")
     for bar, value in zip(bars_off, off):
         ax.text(bar.get_x() + bar.get_width() / 2, value + 4, f"{value:.2f}", ha="center")
     for bar, value, change in zip(bars_on, on, changes):
@@ -153,7 +153,7 @@ def formats():
     trend_mask = kinds != "xllama"
     for ax, values, counter, ylabel, offsets, trend_label_x, trend_ha in (
         (axes[0], pp, counter_pp, "pp2048 (tok/s)", pp_offsets, 0.015, "left"),
-        (axes[1], tg, counter_tg, "tg512 (tok/s)", tg_offsets, 0.985, "right"),
+        (axes[1], tg, counter_tg, "tg512 raw/no-DSpark (tok/s)", tg_offsets, 0.985, "right"),
     ):
         trend_sizes = sizes[trend_mask]
         trend_values = values[trend_mask]
@@ -216,7 +216,7 @@ def udnl_mx_tradeoff():
     metrics = [
         ("Model size", [119.40, 116.13], [0, 0], "GiB", "lower is better", False),
         ("PP2048", [207.69, 418.95], [0, 3.50], "tok/s", "2.02 x faster", True),
-        ("TG512", [25.34, 26.90], [0, 0.25], "tok/s", "+6.2%", True),
+        ("TG512 raw\n(no DSpark)", [25.34, 26.90], [0, 0.25], "tok/s", "+6.2%", True),
         ("WikiText-2 PPL", [4.0189, 4.6047], [0, 0.1782], "PPL", "+14.6% worse", False),
     ]
     fig, axes = plt.subplots(1, 4, figsize=(13.2, 3.9))
@@ -270,9 +270,11 @@ def gpu_prefill():
 
 
 def remote_ep():
-    fig, axes = plt.subplots(1, 3, figsize=(12, 4.1))
+    fig, axes = plt.subplots(2, 2, figsize=(12, 7.8))
+    axes = axes.ravel()
     pairs = [
-        ([22.1, 25.2], ["1 machine\n2 NUMA workers", "2 machines\n4 NUMA workers"], "DSV4-Flash TG512\nmatched pure EP", "tok/s"),
+        ([22.1, 25.2], ["1 machine\n2 NUMA workers", "2 machines\n4 NUMA workers"], "DSV4-Flash raw TG512 (no DSpark)\nmatched pure EP", "tok/s"),
+        ([25.25, 28.85], ["4-worker\nremote-only (A)", "CUDA1 K24 hot\n+ remote cold (B)"], "DSV4-Flash raw TG512 (no DSpark)\nstrict hot + remote bridge", "tok/s"),
         ([64.3, 75.6], ["1 machine\n2 NUMA workers", "2 machines\n4 NUMA workers"], "DSV4-Flash 31-token prompt\nmatched pure EP", "tok/s"),
         ([58.0, 11.5], ["TCP", "RDMA\nRoCEv2"], "Cross-machine RPC RTT\n64 B message", "us"),
     ]
@@ -285,9 +287,15 @@ def remote_ep():
         for bar, value in zip(bars, values):
             ax.text(bar.get_x() + bar.get_width() / 2, value * 1.03, f"{value:g}", ha="center", fontweight="bold")
     axes[0].text(0.5, 0.68, "+14.03%", transform=axes[0].transAxes, ha="center", color=PURPLE, fontsize=13, fontweight="bold")
-    axes[1].text(0.5, 0.68, "+17.57%", transform=axes[1].transAxes, ha="center", color=PURPLE, fontsize=13, fontweight="bold")
-    fig.subplots_adjust(top=0.72, wspace=0.35)
-    fig.suptitle("DSV4-Flash single-slot expert parallelism over a 100 GbE direct link\nmatched command and identical generated response", y=0.99)
+    axes[1].text(0.5, 0.66, "+14.26%", transform=axes[1].transAxes, ha="center", color=PURPLE, fontsize=13, fontweight="bold")
+    axes[1].text(0.5, 0.54, "paired PPL -0.85%", transform=axes[1].transAxes, ha="center", color=ORANGE, fontsize=10, fontweight="bold")
+    axes[2].text(0.5, 0.68, "+17.57%", transform=axes[2].transAxes, ha="center", color=PURPLE, fontsize=13, fontweight="bold")
+    fig.subplots_adjust(top=0.84, wspace=0.28, hspace=0.52)
+    fig.suptitle(
+        "Independent DSV4-Flash single-slot EP comparisons over a 100 GbE direct link\n"
+        "combined hot + remote result is strict-cover REQ4, raw/no-DSpark, and not MAX_EFFORT",
+        y=0.985,
+    )
     finish(fig, "remote-ep.png")
 
 

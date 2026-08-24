@@ -16,15 +16,16 @@ PeoplesLLM 是面向异构本地推理的 llama.cpp 分支。项目围绕三条�
 
 ## 已验证结果
 
-下表中的每一行都是独立测试口径，不能将不同行的百分比直接相乘。
+下表中的每一行都是独立测试口径，不能将不同行的百分比直接相乘。Decode 数据统一显式标记为 `raw/no-DSpark` 或 `DSpark speculative`；PP 是 prefill，不包含 draft 接受收益。
 
 | 路线 | 配对基线 | 当前结果 | 变化 |
 |---|---:|---:|---:|
 | DSV4 pp2048，同质量 MXFP4 -> E4A | 312.48 tok/s | **362.92 tok/s** | **+16.1%** |
-| DSV4 DSpark decode，n2/p0 | 23.9 tok/s | **30.1 tok/s** | **+26%** |
-| DSV4 E4A decode，strict 热专家 12 轮 A/B | 25.02 tok/s | **30.23 tok/s** | **+20.85%** |
+| DSV4 DSpark speculative decode，n2/p0 | 23.9 tok/s | **30.1 tok/s** | **+26%** |
+| DSV4 E4A raw/no-DSpark decode，strict 热专家 12 轮 A/B | 25.02 tok/s | **30.23 tok/s** | **+20.85%** |
 | DSV4 16K GPU MoE prefill | 213 tok/s | **334.5 tok/s** | **+57%** |
-| DSV4 单 slot pure EP，2 -> 4 NUMA worker | 22.1 tok/s | **25.2 tok/s** | **+14.03%** |
+| DSV4 单 slot raw/no-DSpark pure EP，2 -> 4 NUMA worker | 22.1 tok/s | **25.2 tok/s** | **+14.03%** |
+| DSV4 单 slot raw/no-DSpark，四 worker strict remote-only -> GPU-hot + CPU-remote | 25.25 tok/s | **28.85 tok/s** | **+14.26%** |
 | GLM-5.2 pp512，2 -> 4 NUMA worker 真 EP | 24.13 tok/s | **40.59 tok/s** | **+68.2%** |
 
 ![三条性能路线的阶段结果](docs/img/evolution-staircase.png)
@@ -37,11 +38,11 @@ PeoplesLLM 是面向异构本地推理的 llama.cpp 分支。项目围绕三条�
 
 ### 2. Mirror：先消除跨路读取
 
-`--numa mirror` 让每个 socket 持有一份完整权重副本，并把线程和页面绑定到同一节点。它将跨 UPI 的专家权重流量降为零，DSV4 tg512 达到 30.35 tok/s，对同机上游 distribute 的 26.9-28.0 tok/s 提升约 8%-13%。代价是专家权重占用双倍内存。
+`--numa mirror` 让每个 socket 持有一份完整权重副本，并把线程和页面绑定到同一节点。它将跨 UPI 的专家权重流量降为零，DSV4 raw/no-DSpark tg512 达到 30.35 tok/s，对同机上游 distribute 的 26.9-28.0 tok/s 提升约 8%-13%。代价是专家权重占用双倍内存。
 
 ### 3. NUMA EP：内存减半，但静态专家归属不够
 
-下一步把每个专家只放在一个节点。专家权重内存减半，pp512 与 mirror 基本持平（343-348 对 338-347 tok/s）；但 batch=1 时，一个专家是一条不可继续切分的 GEMV，静态“8 个激活专家分进 2 个节点”会产生尾部气泡，tg512 只有 23.9-24.2 tok/s。这个阶段给出了关键约束：**专家放置必须保留细粒度并行和动态调度自由度。**
+下一步把每个专家只放在一个节点。专家权重内存减半，pp512 与 mirror 基本持平（343-348 对 338-347 tok/s）；但 batch=1 时，一个专家是一条不可继续切分的 GEMV，静态“8 个激活专家分进 2 个节点”会产生尾部气泡，raw/no-DSpark tg512 只有 23.9-24.2 tok/s。这个阶段给出了关键约束：**专家放置必须保留细粒度并行和动态调度自由度。**
 
 ### 4. NUMA 行窗 TP + DME
 
@@ -51,9 +52,9 @@ PeoplesLLM 是面向异构本地推理的 llama.cpp 分支。项目围绕三条�
 
 | 测试形态 | 关闭 | 开启 | 变化 |
 |---|---:|---:|---:|
-| 混合 tg512 | 16.59 | **25.01** | **+51%** |
+| 混合 raw/no-DSpark tg512 | 16.59 | **25.01** | **+51%** |
 | 混合 pp2048 | 267.05 | **298.98** | +12% |
-| 纯 CPU tg128 | 7.23 | **11.65** | **+61%** |
+| 纯 CPU raw/no-DSpark tg128 | 7.23 | **11.65** | **+61%** |
 | 纯 CPU pp512 | 101.41 | **107.91** | +6.4% |
 
 在行窗 TP 之上，DME（Dynamic Matrix Execution）继续处理节点内的不规则 MoE 形状：
@@ -67,8 +68,8 @@ PeoplesLLM 是面向异构本地推理的 llama.cpp 分支。项目围绕三条�
 
 在生产型混合路径中，GPU 处理 attention、dense、router 和 KV，CPU 处理 routed experts。针对不同阶段形成了三种互补机制：
 
-- **热专家驻留**：top-24 专家/层覆盖约 57.6% 的选择，43 层紧凑 MXFP4 权重为 12.85 GiB。GPU 热分支与 CPU 冷分支在图内 fork/join；GPU 回传逐 router-slot 结果，CPU 按 slot 0..5 恢复基线左折叠，AVX512 只跨 hidden rows 向量化。12 轮 tg512 从 25.0167 提升到 30.2333 tok/s（+20.85%）；PP2048 为 361.47 tok/s，5-chunk PPL 从 2.7758 改善到 2.7548。
-- **NVLink P2P TP**：捕获安全的 P2P allreduce 和异步 D2H 回读把 TP 路径自身从 13.6 提升到 20.3 tok/s（+49%），每 token 的 `cudaStreamSynchronize` 约从 690 次降到 150 次。该数字是 TP 路径内部 A/B，不等于单卡最优路径。
+- **热专家驻留**：top-24 专家/层覆盖约 57.6% 的选择，43 层紧凑 MXFP4 权重为 12.85 GiB。GPU 热分支与 CPU 冷分支在图内 fork/join；GPU 回传逐 router-slot 结果，CPU 按 slot 0..5 恢复基线左折叠，AVX512 只跨 hidden rows 向量化。12 轮 raw/no-DSpark tg512 从 25.0167 提升到 30.2333 tok/s（+20.85%）；PP2048 为 361.47 tok/s，5-chunk PPL 从 2.7758 改善到 2.7548。
+- **NVLink P2P TP**：捕获安全的 P2P allreduce 和异步 D2H 回读把 raw/no-DSpark TP 路径自身从 13.6 提升到 20.3 tok/s（+49%），每 token 的 `cudaStreamSynchronize` 约从 690 次降到 150 次。该数字是 TP 路径内部 A/B，不等于单卡最优路径。
 - **MoE 流式 prefill**：专家权重保留在 host pinned memory，长 prompt 时按层上传、跨 tile 复用，并用双卡 expert-axis EP 和 3-slot 预取隐藏 H2D。
 
 ![GPU 流式 MoE prefill](docs/img/gpu-prefill-streaming.png)
@@ -88,13 +89,18 @@ PeoplesLLM 是面向异构本地推理的 llama.cpp 分支。项目围绕三条�
 | 测试 | 之前 | 之后 | 变化 |
 |---|---:|---:|---:|
 | GLM-5.2 MoE pp512，2 -> 4 worker | 24.13 | **40.59** | **1.682 x** |
-| DSV4 MXFP4 TG512，2 -> 4 worker | 22.1 | **25.2** | **1.140 x** |
+| DSV4 MXFP4 raw/no-DSpark TG512，2 -> 4 worker | 22.1 | **25.2** | **1.140 x** |
+| DSV4 raw/no-DSpark TG512，四 worker strict remote-only -> GPU-hot + CPU-remote | 25.25 | **28.85** | **+14.26%** |
 | DSV4 16K PP，UB64 -> UB256 | 235.37 | **269.36** | +14.4% |
 | 64 B RPC RTT，TCP -> RoCEv2 | 42-74 us | **10-13 us** | 约 4-6 x 降低 |
 
-GLM 的 dense/attention 仍在 GPU；上表第一行只扩展 CPU MoE。75 层 MoE decode 合计由 86.71 降到 69.58 ms/token（1.246 x），128-token 输出逐字节一致。DSV4 四 worker pure EP + RDMA 的固定验收均值为 37.921 tok/s，峰值 38.423 tok/s，输出 SHA256 与单机参考一致。
+GLM 的 dense/attention 仍在 GPU；上表第一行只扩展 CPU MoE。75 层 raw/no-DSpark MoE decode 合计由 86.71 降到 69.58 ms/token（1.246 x），128-token 输出逐字节一致。另一组明确启用 DSpark speculative（NMAX=3）的 DSV4 四 worker pure EP + RDMA 验收均值为 37.921 tok/s、峰值 38.423 tok/s，输出 SHA256 与同口径单机参考一致；它不与上表 raw 25.2 tok/s 混算。
 
-新增的 DSV4 行是单 slot、同 master、同模型和同命令的 matched single run：两路本地 worker 各持有 128 个专家，四路跨机 worker 各持有 64 个专家；master 在 `KLOCAL=0` 下跳过全部 routed-expert 权重。两种拓扑的生成正文 SHA256 相同。该系统级结果受两台机器核数不同和网络延迟影响，不代表理想 2 x 扩展。
+2 -> 4 的 DSV4 行是单 slot、同 master、同模型和同命令的 matched single run：两路本地 worker 各持有 128 个专家，四路跨机 worker 各持有 64 个专家；master 在 `KLOCAL=0` 下跳过全部 routed-expert 权重。两种拓扑的生成正文 SHA256 相同。该系统级结果受两台机器核数不同和网络延迟影响，不代表理想 2 x 扩展。
+
+GPU-hot + CPU-remote-EP 现已在一个严格限定的端到端形态下通过：单 slot、raw/no-DSpark、四 worker modulo strict cover、同步 REQ4，未启用 MAX_EFFORT。TG512 的 ABBA+BAAB 八轮为 A(remote-only) `[24.9, 25.2, 25.5, 25.4]`、B(K24 hot + remote cold) `[29.6, 28.3, 28.6, 28.9]` tok/s，均值 25.25 -> **28.85 tok/s（+14.26%）**；同命令 b1/ub1、5-chunk PPL 为 2.7647 -> **2.7412（-0.85%）**。A、B 各自四轮输出 hash 稳定，但两模式 hash 不同，因此这不是跨 CPU/GPU kernel 的 bit-exact 声明。所有 B 轮均有 43/43 hot-fork 与 43/43 remote-bridge marker。
+
+八 token verbose 诊断只用于验证结构，不是性能样本：301 次单 token MoE 调用中，CPU assignment 从 1,806 降到 916（-49.28%），四端点累计为 239/220/213/244，全四路 fanout 从 117 降到 18 次，remote wait 均值从 0.444 降到 0.310 ms，mixed merge 均值为 0.0296 ms。上述结论不能外推到 DSpark、MAX_EFFORT 或多 slot，也不能与热专家或远程 EP 的独立百分比相乘。
 
 ## 内核发展路线
 
@@ -111,16 +117,16 @@ arec（activation record）把 Q8 激活和 scale 预计算一次，随后让权
 
 ### 融合和异步边界
 
-- DSV4 router 的 5-kernel 链融合为单 warp kernel，小行 indexer top-k 合并为单 radix kernel；GPU busy 18.76 -> 18.23 ms/token，tg 25.15 -> 25.91；
+- DSV4 router 的 5-kernel 链融合为单 warp kernel，小行 indexer top-k 合并为单 radix kernel；GPU busy 18.76 -> 18.23 ms/token，raw/no-DSpark tg 25.15 -> 25.91；
 - pinned staging + event drain 将 CPU input readback 从 13 降到 4.6 ms/token；
-- MXFP4 repack GEMV 软件预取带来 +2.6% TG；
-- 64 行 claim 与 UDNL 尾行批量化把 DSpark n2/p0 从 26.50 提升到 30.10 tok/s，同时保持接受率和输出一致。
+- MXFP4 repack GEMV 软件预取带来 +2.6% raw/no-DSpark TG；
+- 64 行 claim 与 UDNL 尾行批量化把 DSpark speculative n2/p0 从 26.50 提升到 30.10 tok/s，同时保持接受率和输出一致。
 
 ## 格式发展路线
 
 ### “Q2_K 为什么比预期慢”的起点
 
-最初一个名为 `Q2_K` 的 90.9 GiB 模型只有 223.60 pp2048 和 22.87 tg512。它的 TG 反而低于更大的 Q3_R（25.30 tok/s），虽然 PP 高于尚未充分优化 GEMM 的 Q3_R（174.60 tok/s）。读取 GGUF metadata 后又发现它实际是 IQ2_XXS（2.0625 bpw），并非 Q2_K。这个“Q2_K < Q3_K”现象最终被拆成格式标注和算子效率两个问题：文件更小不代表推理更快，码本查找、scale 展开、反量化长度以及是否能进入批量 GEMM，都会比名义 bpw 更早成为瓶颈。
+最初一个名为 `Q2_K` 的 90.9 GiB 模型只有 223.60 pp2048 和 22.87 raw/no-DSpark tg512。它的 TG 反而低于更大的 Q3_R（25.30 tok/s），虽然 PP 高于尚未充分优化 GEMM 的 Q3_R（174.60 tok/s）。读取 GGUF metadata 后又发现它实际是 IQ2_XXS（2.0625 bpw），并非 Q2_K。这个“Q2_K < Q3_K”现象最终被拆成格式标注和算子效率两个问题：文件更小不代表推理更快，码本查找、scale 展开、反量化长度以及是否能进入批量 GEMM，都会比名义 bpw 更早成为瓶颈。
 
 于是格式设计从“最少比特”转向“存储布局服从内核访问顺序”：
 
@@ -134,7 +140,7 @@ arec（activation record）把 Q8 激活和 scale 预计算一次，随后让权
 
 UDNL_MX 已从确认的源重新量化并用相同 `performance` 配方复测，替换图表中的旧污染行；其 PPL 使用 20×512 WikiText-2 历史口径。其余 PPL 沿用同一权重此前的质量测量；CPU 频率不会改变 PPL。`UD-IQ4_XS` 的 PP/TG 是原 3 轮 219.09/21.62 与补充 5 轮 214.03/20.78 按重复次数加权后的 215.93/21.10。`UD-Q4_K_XL` 在当前 loader 中实际被识别为 MXFP4 MoE，不能作为纯 Q4 专家端点。完整 17 点和原始历史口径见 [BENCHMARKS](docs/BENCHMARKS.md)。
 
-| 格式 | 体积 | pp2048 | tg512 | WikiText-2 PPL | 定位 |
+| 格式 | 体积 | pp2048 | tg512 raw/no-DSpark | WikiText-2 PPL | 定位 |
 |---|---:|---:|---:|---:|---|
 | MXFP4 | 145.26 GiB | 312.48 | 26.87 | 3.5830 | 质量与速度锚点 |
 | **UDNL_W4 + arec** | 146.36 GiB | 370.87 | 25.10 | 3.7997 | 固定 4-bit 计算亲和布局 |
@@ -143,9 +149,11 @@ UDNL_MX 已从确认的源重新量化并用相同 `performance` 配方复测，
 | UD-Q3_K_M | 119.28 GiB | 207.20 | 25.49 | 4.0242 | 标准 UD 对照 |
 | UD-Q3_K_XL | 119.40 GiB | 207.69 | 25.34 | 4.0189 | 标准 UD 对照 |
 
-UDNL_MX corrected 以比 Q3_K_XL 小约 2.7% 的体积换来约 2.0× PP 和 +6.2% TG，但 PPL 高 14.6%，因此**不推荐作为 Q3_K_XL 的替代品**。当前通过质量门的主线仍是 E4A strict-hot；UDNL_W4 是固定 4-bit 内核研究线。新 Q2/Q3/Q4 混合格式仍在验证，未完成的模型不进入表格，也不预填性能或质量数字。
+UDNL_MX corrected 以比 Q3_K_XL 小约 2.7% 的体积换来约 2.0× PP 和 +6.2% raw/no-DSpark TG，但 PPL 高 14.6%，因此**不推荐作为 Q3_K_XL 的替代品**。当前通过质量门的主线仍是 E4A strict-hot；UDNL_W4 是固定 4-bit 内核研究线。
 
-UDNL_MX corrected 的 K24 strict-hot pilot 将 TG 从 26.9 提升到 31.3 tok/s（+16.36%），同命令 5-chunk PPL 从 3.5614 改善到 3.5218；但 cold GGUF 与 12.8496 GiB 热权重合计约 **128.978 GiB**，比 Q3_K_XL 大 8.02%，且尚无同命令 Q3 20-chunk 对照。这只是速度/负面质量消融，不是同质量 headline 或推荐配置。
+新 Q2/Q3/Q4 首模尚未生成。Phase A v1 计划为 `Q2_K/Q3_K/Q4_K = 61/58/10`，dry-run **108.4046 GiB**、proxy loss **0.898640× all-Q3**、expert traffic **0.903594× all-Q3**；但物化在 `blk.21` 异常 MXFP4 gate/up 源数据使 Q3 fp16 scale 变为 `inf` 时被门禁拒绝，没有输出模型。全量只读扫描确认只有这两个 gate/up tensor 不适合转换。v2 将完整 gate/up 原子对保留为 MXFP4，分布为 `Q2_K/Q3_K/Q4_K/MXFP4 = 61/56/10/2`，dry-run **108.8109 GiB**；它尚未开始完整转换，因此仍无 PPL、raw TG 或 DSpark TG，不在表中预填数字。
+
+UDNL_MX corrected 的 K24 strict-hot raw/no-DSpark pilot 将 TG 从 26.9 提升到 31.3 tok/s（+16.36%），同命令 5-chunk PPL 从 3.5614 改善到 3.5218；但 cold GGUF 与 12.8496 GiB 热权重合计约 **128.978 GiB**，比 Q3_K_XL 大 8.02%，且尚无同命令 Q3 20-chunk 对照。这只是速度/负面质量消融，不是同质量 headline 或推荐配置。
 
 ![UDNL_MX corrected 的体积、速度与质量权衡](docs/img/udnl-mx-tradeoff.png)
 

@@ -71,6 +71,8 @@ The hot path is restricted by model type, tensor format, token count, and device
 
 The current staging buffers and completion events are process-global and have been validated only for one active slot. A multi-slot implementation must make this state context/slot-owned before enabling concurrent hot forks; it must not reuse the single-slot path speculatively.
 
+Strict pure remote EP can opt into the same fork for one-token decode. CUDA1 computes slots whose expert is in the resident K24 set; the dealer receives an active mask and sends only cold slots to the NUMA workers. Sync REQ4 returns one unweighted vector per cold slot. The master applies each router weight once and folds GPU and CPU vectors in the original router-slot order. This bridge is restricted to one slot, KLOCAL=0, weight-on-master REQ4, and non-pipe execution. A per-layer in-flight guard rejects concurrent reuse of the global staging buffer.
+
 Speculative decoding wraps the target decode loop. DSpark drafts candidate tokens on its configured device, then the target model verifies them as a small batch. Draft acceptance changes the target `MUL_MAT_ID` shape, so decode kernel dispatch must remain workload-aware.
 
 ## Prefill data flow
@@ -101,6 +103,8 @@ master graph
 ```
 
 Each NUMA node can run one `llama-epd` process. Multiple workers cooperate on the same model request and slot; they are not independent model replicas. `SCHED_KLOCAL=0` is strict pure EP: the master cannot silently fall back to local routed-expert weights when coverage or transport fails.
+
+In the verified raw/no-DSpark bridge, CUDA1 hot slots reduce CPU assignments from 1,806 to 916 across 301 decode-layer calls. Four strict-cover workers receive 239/220/213/244 assignments, while TG512 improves from 25.25 to 28.85 tok/s and paired five-chunk PPL improves from 2.7647 to 2.7412. This result is not MAX_EFFORT replica mode and does not cover multiple slots or async PIPE.
 
 Transport selection is runtime-configured. RDMA requires matching support on master and worker; connection failure can fall back to TCP where the protocol permits it. Capability negotiation includes expert ownership and kernel compatibility. A reconnect is accepted only when the replacement worker reports the same execution contract.
 

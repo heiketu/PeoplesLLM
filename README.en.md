@@ -16,15 +16,16 @@ Primary test system: dual Intel Ice Lake-SP sockets (152 logical threads, 251 Gi
 
 ## Verified results
 
-Each row below is an independent benchmark scope. Percentages from different rows must not be multiplied together.
+Each row below is an independent benchmark scope. Percentages from different rows must not be multiplied together. Decode results are explicitly labeled `raw/no-DSpark` or `DSpark speculative`; PP is prefill and contains no draft-acceptance gain.
 
 | Track | Matched baseline | Current result | Change |
 |---|---:|---:|---:|
 | DSV4 pp2048, quality-equivalent MXFP4 -> E4A | 312.48 tok/s | **362.92 tok/s** | **+16.1%** |
-| DSV4 DSpark decode, n2/p0 | 23.9 tok/s | **30.1 tok/s** | **+26%** |
-| DSV4 E4A decode, strict hot experts, 12-run A/B | 25.02 tok/s | **30.23 tok/s** | **+20.85%** |
+| DSV4 DSpark speculative decode, n2/p0 | 23.9 tok/s | **30.1 tok/s** | **+26%** |
+| DSV4 E4A raw/no-DSpark decode, strict hot experts, 12-run A/B | 25.02 tok/s | **30.23 tok/s** | **+20.85%** |
 | DSV4 16K GPU MoE prefill | 213 tok/s | **334.5 tok/s** | **+57%** |
-| DSV4 single-slot pure EP, 2 -> 4 NUMA workers | 22.1 tok/s | **25.2 tok/s** | **+14.03%** |
+| DSV4 single-slot raw/no-DSpark pure EP, 2 -> 4 NUMA workers | 22.1 tok/s | **25.2 tok/s** | **+14.03%** |
+| DSV4 single-slot raw/no-DSpark, four-worker strict remote-only -> GPU-hot + CPU-remote | 25.25 tok/s | **28.85 tok/s** | **+14.26%** |
 | GLM-5.2 pp512, true EP on 2 -> 4 NUMA workers | 24.13 tok/s | **40.59 tok/s** | **+68.2%** |
 
 ![Milestones across three performance tracks](docs/img/evolution-staircase.png)
@@ -37,11 +38,11 @@ Naive interleaving on a dual-socket machine sends a large fraction of weight rea
 
 ### 2. Mirror: eliminate remote reads first
 
-`--numa mirror` keeps one complete weight replica per socket and binds pages and threads to the same node. It removes cross-UPI expert traffic and reaches 30.35 tok/s on DSV4 tg512, about 8%-13% above the same-machine upstream distribute result of 26.9-28.0 tok/s. The cost is 2 x expert-weight memory.
+`--numa mirror` keeps one complete weight replica per socket and binds pages and threads to the same node. It removes cross-UPI expert traffic and reaches 30.35 tok/s on DSV4 raw/no-DSpark tg512, about 8%-13% above the same-machine upstream distribute result of 26.9-28.0 tok/s. The cost is 2 x expert-weight memory.
 
 ### 3. NUMA EP: half the memory, but static ownership is too coarse
 
-The next design stores each expert on only one node. Expert memory is halved and pp512 roughly matches mirror (343-348 versus 338-347 tok/s). At batch=1, however, one expert is one indivisible GEMV. Statically placing eight active experts into two nodes leaves a long-tail bubble and reaches only 23.9-24.2 tok/s on tg512. This stage established the central constraint: **placement must preserve fine-grained parallelism and scheduling freedom.**
+The next design stores each expert on only one node. Expert memory is halved and pp512 roughly matches mirror (343-348 versus 338-347 tok/s). At batch=1, however, one expert is one indivisible GEMV. Statically placing eight active experts into two nodes leaves a long-tail bubble and reaches only 23.9-24.2 tok/s on raw/no-DSpark tg512. This stage established the central constraint: **placement must preserve fine-grained parallelism and scheduling freedom.**
 
 ### 4. NUMA row-window TP + DME
 
@@ -51,9 +52,9 @@ The final layout alternates 128-row windows of every expert plane across the two
 
 | Workload | Off | On | Change |
 |---|---:|---:|---:|
-| hybrid tg512 | 16.59 | **25.01** | **+51%** |
+| hybrid raw/no-DSpark tg512 | 16.59 | **25.01** | **+51%** |
 | hybrid pp2048 | 267.05 | **298.98** | +12% |
-| pure-CPU tg128 | 7.23 | **11.65** | **+61%** |
+| pure-CPU raw/no-DSpark tg128 | 7.23 | **11.65** | **+61%** |
 | pure-CPU pp512 | 101.41 | **107.91** | +6.4% |
 
 On top of row-window TP, DME (Dynamic Matrix Execution) handles irregular MoE shapes inside each node:
@@ -67,8 +68,8 @@ On top of row-window TP, DME (Dynamic Matrix Execution) handles irregular MoE sh
 
 In the production-style hybrid path, the GPU runs attention, dense layers, the router, and KV; the CPU runs routed experts. Three complementary mechanisms target different phases:
 
-- **Hot-expert residency**: the top 24 experts per layer cover about 57.6% of selections; compact MXFP4 weights for all 43 layers use 12.85 GiB. The GPU hot branch and CPU cold branch fork and join inside the graph. The GPU returns per-router-slot values, the CPU restores the baseline slot 0..5 left fold, and AVX512 vectorizes only across hidden rows. Twelve tg512 runs improve from 25.0167 to 30.2333 tok/s (+20.85%); PP2048 is 361.47 tok/s and five-chunk PPL improves from 2.7758 to 2.7548.
-- **NVLink P2P TP**: capture-safe P2P allreduce and asynchronous D2H readback improve the TP path itself from 13.6 to 20.3 tok/s (+49%) and reduce `cudaStreamSynchronize` from about 690 to 150 calls per token. This is an internal TP-path A/B, not a comparison against the best layer-placement path.
+- **Hot-expert residency**: the top 24 experts per layer cover about 57.6% of selections; compact MXFP4 weights for all 43 layers use 12.85 GiB. The GPU hot branch and CPU cold branch fork and join inside the graph. The GPU returns per-router-slot values, the CPU restores the baseline slot 0..5 left fold, and AVX512 vectorizes only across hidden rows. Twelve raw/no-DSpark tg512 runs improve from 25.0167 to 30.2333 tok/s (+20.85%); PP2048 is 361.47 tok/s and five-chunk PPL improves from 2.7758 to 2.7548.
+- **NVLink P2P TP**: capture-safe P2P allreduce and asynchronous D2H readback improve the raw/no-DSpark TP path itself from 13.6 to 20.3 tok/s (+49%) and reduce `cudaStreamSynchronize` from about 690 to 150 calls per token. This is an internal TP-path A/B, not a comparison against the best layer-placement path.
 - **Streaming MoE prefill**: expert weights remain in pinned host memory. Long prompts upload them once per layer, reuse them across tiles, and overlap H2D with dual-GPU expert-axis EP and three-slot prefetch.
 
 ![GPU streaming MoE prefill](docs/img/gpu-prefill-streaming.png)
@@ -88,13 +89,18 @@ In the production-style hybrid path, the GPU runs attention, dense layers, the r
 | Test | Before | After | Change |
 |---|---:|---:|---:|
 | GLM-5.2 MoE pp512, 2 -> 4 workers | 24.13 | **40.59** | **1.682 x** |
-| DSV4 MXFP4 TG512, 2 -> 4 workers | 22.1 | **25.2** | **1.140 x** |
+| DSV4 MXFP4 raw/no-DSpark TG512, 2 -> 4 workers | 22.1 | **25.2** | **1.140 x** |
+| DSV4 raw/no-DSpark TG512, four-worker strict remote-only -> GPU-hot + CPU-remote | 25.25 | **28.85** | **+14.26%** |
 | DSV4 16K PP, UB64 -> UB256 | 235.37 | **269.36** | +14.4% |
 | 64 B RPC RTT, TCP -> RoCEv2 | 42-74 us | **10-13 us** | about 4-6 x lower |
 
-GLM dense layers and attention remain on the GPU; the first row scales only CPU MoE. Aggregate decode time for 75 MoE layers falls from 86.71 to 69.58 ms/token (1.246 x), with byte-identical 128-token output. Fixed-acceptance DSV4 pure EP over four workers and RDMA reaches 37.921 tok/s on average and 38.423 tok/s at peak, with the same output SHA256 as the single-machine reference.
+GLM dense layers and attention remain on the GPU; the first row scales only CPU MoE. Aggregate raw/no-DSpark decode time for 75 MoE layers falls from 86.71 to 69.58 ms/token (1.246 x), with byte-identical 128-token output. A separate DSV4 four-worker pure-EP run explicitly using DSpark speculative decode (NMAX=3) reaches 37.921 tok/s on average and 38.423 tok/s at peak, with the same output SHA256 as its matched single-machine reference; it is not mixed with the raw 25.2 tok/s row above.
 
-The new DSV4 row is a matched single run with one slot, one master, one model, and one command. Two local workers own 128 experts each; four cross-machine workers own 64 each, while `KLOCAL=0` makes the master skip all routed-expert weights. Generated-response SHA256 is identical across the two topologies. The hosts have different core counts and network latency, so this system result is not an ideal 2 x scaling claim.
+The 2 -> 4 DSV4 row is a matched single run with one slot, one master, one model, and one command. Two local workers own 128 experts each; four cross-machine workers own 64 each, while `KLOCAL=0` makes the master skip all routed-expert weights. Generated-response SHA256 is identical across the two topologies. The hosts have different core counts and network latency, so this system result is not an ideal 2 x scaling claim.
+
+GPU-hot + CPU-remote-EP has now passed one narrowly scoped end-to-end configuration: one slot, raw/no-DSpark, four-worker modulo strict cover, synchronous REQ4, and no MAX_EFFORT. Eight TG512 runs in ABBA+BAAB order are A (remote-only) `[24.9, 25.2, 25.5, 25.4]` and B (K24 hot + remote cold) `[29.6, 28.3, 28.6, 28.9]` tok/s, for 25.25 -> **28.85 tok/s (+14.26%)**. Same-command b1/ub1 five-chunk PPL is 2.7647 -> **2.7412 (-0.85%)**. All four A hashes agree and all four B hashes agree, but A differs from B, so this is not a bit-exact claim across CPU and GPU kernels. Every B run has 43/43 hot-fork and 43/43 remote-bridge markers.
+
+An eight-token verbose diagnostic checks structure only and is not a performance sample. Across 301 one-token MoE calls, CPU assignments fall from 1,806 to 916 (-49.28%), endpoint totals are 239/220/213/244, all-four-worker fanout falls from 117 to 18 calls, mean remote wait falls from 0.444 to 0.310 ms, and mixed merge averages 0.0296 ms. These results do not extend to DSpark, MAX_EFFORT, or multiple slots, and must not be multiplied by the independent hot-expert or remote-EP gains.
 
 ## Kernel evolution
 
@@ -111,16 +117,16 @@ An arec (activation record) precomputes the Q8 activation and scale once. Weight
 
 ### Fusion and asynchronous boundaries
 
-- the five-kernel DSV4 router chain becomes one single-warp kernel, and small-row indexer top-k becomes one radix kernel; GPU busy time falls from 18.76 to 18.23 ms/token and tg rises from 25.15 to 25.91;
+- the five-kernel DSV4 router chain becomes one single-warp kernel, and small-row indexer top-k becomes one radix kernel; GPU busy time falls from 18.76 to 18.23 ms/token and raw/no-DSpark tg rises from 25.15 to 25.91;
 - pinned staging plus event draining cuts CPU input readback from 13 to 4.6 ms/token;
-- MXFP4 repack GEMV software prefetch adds 2.6% TG;
-- 64-row claims and UDNL tail batching improve DSpark n2/p0 from 26.50 to 30.10 tok/s without changing acceptance or output.
+- MXFP4 repack GEMV software prefetch adds 2.6% raw/no-DSpark TG;
+- 64-row claims and UDNL tail batching improve DSpark speculative n2/p0 from 26.50 to 30.10 tok/s without changing acceptance or output.
 
 ## Format evolution
 
 ### The “why is Q2_K slower than expected?” starting point
 
-An initial 90.9 GiB model named `Q2_K` reached only 223.60 pp2048 and 22.87 tg512. Its TG was below the larger Q3_R at 25.30 tok/s, although its PP was above the not-yet-optimized Q3_R GEMM path at 174.60 tok/s. GGUF metadata then revealed that it was actually IQ2_XXS at 2.0625 bpw, not Q2_K. The apparent “Q2_K < Q3_K” result therefore separated into a labeling problem and a kernel-efficiency problem: codebook lookup, scale expansion, dequantization-chain length, and access to batch GEMM can dominate nominal bpw.
+An initial 90.9 GiB model named `Q2_K` reached only 223.60 pp2048 and 22.87 raw/no-DSpark tg512. Its TG was below the larger Q3_R at 25.30 tok/s, although its PP was above the not-yet-optimized Q3_R GEMM path at 174.60 tok/s. GGUF metadata then revealed that it was actually IQ2_XXS at 2.0625 bpw, not Q2_K. The apparent “Q2_K < Q3_K” result therefore separated into a labeling problem and a kernel-efficiency problem: codebook lookup, scale expansion, dequantization-chain length, and access to batch GEMM can dominate nominal bpw.
 
 The format work therefore moves from “fewest bits” to storage layouts that follow the kernel access order:
 
@@ -134,7 +140,7 @@ The figure and table use one 2026-08-24 `performance` recipe for 17 format point
 
 UDNL_MX was regenerated from the verified source and rerun with the same `performance` recipe, replacing the old tainted row in the chart; its PPL uses the historical 20×512 WikiText-2 scope. Other PPL values are reused from prior measurements of the same weights because CPU frequency does not affect PPL. The PP/TG value for `UD-IQ4_XS`, 215.93/21.10, is weighted by repeat count from the original three runs at 219.09/21.62 and five supplemental runs at 214.03/20.78. The current loader identifies the routed MoE tensors in `UD-Q4_K_XL` as MXFP4, so that row is not a pure-Q4 expert endpoint. See [BENCHMARKS](docs/BENCHMARKS.md) for all 17 points and the historical scope.
 
-| Format | Size | pp2048 | tg512 | WikiText-2 PPL | Role |
+| Format | Size | pp2048 | tg512 raw/no-DSpark | WikiText-2 PPL | Role |
 |---|---:|---:|---:|---:|---|
 | MXFP4 | 145.26 GiB | 312.48 | 26.87 | 3.5830 | quality and speed anchor |
 | **UDNL_W4 + arec** | 146.36 GiB | 370.87 | 25.10 | 3.7997 | fixed 4-bit compute-oriented layout |
@@ -143,9 +149,11 @@ UDNL_MX was regenerated from the verified source and rerun with the same `perfor
 | UD-Q3_K_M | 119.28 GiB | 207.20 | 25.49 | 4.0242 | standard UD reference |
 | UD-Q3_K_XL | 119.40 GiB | 207.69 | 25.34 | 4.0189 | standard UD reference |
 
-Corrected UDNL_MX is about 2.7% smaller than Q3_K_XL while delivering about 2.0× PP and +6.2% TG, but its PPL is 14.6% worse. It is therefore **not recommended as a Q3_K_XL replacement**. E4A strict-hot remains the quality-gated path, while UDNL_W4 is the fixed 4-bit kernel research line. New Q2/Q3/Q4 mixtures remain under validation; unfinished models receive no placeholder performance or quality claims.
+Corrected UDNL_MX is about 2.7% smaller than Q3_K_XL while delivering about 2.0× PP and +6.2% raw/no-DSpark TG, but its PPL is 14.6% worse. It is therefore **not recommended as a Q3_K_XL replacement**. E4A strict-hot remains the quality-gated path, while UDNL_W4 is the fixed 4-bit kernel research line.
 
-A K24 strict-hot pilot on corrected UDNL_MX raises TG from 26.9 to 31.3 tok/s (+16.36%) and improves same-command five-chunk PPL from 3.5614 to 3.5218. However, the cold GGUF plus 12.8496 GiB of hot weights total about **128.978 GiB**, 8.02% larger than Q3_K_XL, and no same-command 20-chunk Q3 comparison exists. This is a speed/negative-quality ablation, not a same-quality headline or recommended configuration.
+The first Q2/Q3/Q4 mixture has not produced a model. Phase A v1 selected `Q2_K/Q3_K/Q4_K = 61/58/10`, with a **108.4046 GiB** dry run, proxy loss **0.898640× all-Q3**, and expert traffic **0.903594× all-Q3**. Materialization was rejected by the gate when anomalous MXFP4 source data in the `blk.21` gate/up pair made a Q3 fp16 scale become `inf`; no model was emitted. A full read-only scan found only those two gate/up tensors unsafe to convert. v2 preserves the complete gate/up atomic pair as MXFP4, yielding `Q2_K/Q3_K/Q4_K/MXFP4 = 61/56/10/2` and a **108.8109 GiB** dry run. Full v2 conversion has not started, so there is still no PPL, raw TG, or DSpark TG and no placeholder result appears in the table.
+
+A K24 strict-hot raw/no-DSpark pilot on corrected UDNL_MX raises TG from 26.9 to 31.3 tok/s (+16.36%) and improves same-command five-chunk PPL from 3.5614 to 3.5218. However, the cold GGUF plus 12.8496 GiB of hot weights total about **128.978 GiB**, 8.02% larger than Q3_K_XL, and no same-command 20-chunk Q3 comparison exists. This is a speed/negative-quality ablation, not a same-quality headline or recommended configuration.
 
 ![Size, speed, and quality tradeoff of corrected UDNL_MX](docs/img/udnl-mx-tradeoff.png)
 

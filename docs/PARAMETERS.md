@@ -251,16 +251,17 @@ server 侧资格门：全新单序列 prompt、token 数 ≥ 阈值、无 cache 
 | `GGML_HOT_EXPERT` | 关 | 总开关（`=1` 开启） |
 | `GGML_HOT_EXPERT_TABLE` | 空（开启时**必填**，缺失报错） | 热专家 TSV 路径（`GGML_MOE_HOT_STATS` 产出格式） |
 | `GGML_HOT_EXPERT_GGUF` | 空（开启时**必填**） | 模型 GGUF 路径（读取热专家权重来源） |
-| `GGML_HOT_EXPERT_K` | `16` | 每层钉驻的热专家数；DSV4 最终单槽质量门使用 K24（约 13.16 GiB 热权重），不得在未做显存与 PPL 门禁时机械照搬 |
+| `GGML_HOT_EXPERT_K` | `16` | 每层钉驻的热专家数；DSV4 最终单槽质量门使用 K24（12.8496 GiB 热权重），不得在未做显存与 PPL 门禁时机械照搬 |
 | `GGML_HOT_EXPERT_DEV` | `CUDA1` | 热专家驻留设备 |
 | `GGML_HOT_EXPERT_LAYERS` | `all` | 生效层：逗号表/区间（如 `42`、`30-42`） |
 | `GGML_HOT_EXPERT_MAX_TOKENS` | `1` | GPU fork 处理的最大 n_tokens；当前 compact graph 固定单 token，设置 >1 会 warning 并钳制到 1；`0` 禁用 fork |
 | `GGML_HOT_EXPERT_PACKED_IO` | 开 | 把 hidden、ids 和 router weights 按 256 B 对齐后合成一次 H2D；`=0` 回退三次独立 H2D。layer 42 callback ABBA 为 137.560 -> 134.432 us（+2.33%），43 层端到端收益仍待测 |
 | `GGML_HOT_EXPERT_SLOT_ORDER` | **开** | `=1` 让 GPU 回传逐 router-slot 专家输出，由 CPU 按 slot 0..5 严格左折叠，恢复 baseline 求和顺序；`=0` 回退 cold/hot 两 partial 最后相加的旧路径，用于 A/B。当前严格路径限定 `MAX_TOKENS=1` |
 | `GGML_HOT_EXPERT_SLOT_MERGE_AVX512` | **开** | x86 GCC/Clang 且 CPU 支持 AVX512F 时，跨 16 个 hidden rows 向量化 strict slot merge；slot 0..5 仍逐 slot 独立 `mul` 后 `add`，不使用 FMA。`=0` 强制 scalar 回退；其它平台自动 scalar |
+| `GGML_HOT_EXPERT_REMOTE_EP` | 关 | `=1` 将CUDA hot slots与scheduled remote-EP合并；当前只接受单slot、`n_seq_max=1`、`KLOCAL=0`、同步REQ4、`WEIGHT_ON_MASTER=1`、`PIPE=0`。dealer只向CPU派cold slots，master按原slot顺序合并 |
 | `GGML_HOT_EXPERT_MARKERS` | 关 | `=1` 输出稳定的 `[hotmarker] init/fork` 记录；init 显式包含 `slot_order=1/0`，供正式 benchmark meta 校验实际路径 |
 
-当前已验收范围是单槽 decode。DSV4 K24 的 12 轮配对结果为 25.0167→30.2333 tok/s，PP2048=361.47 tok/s，5-chunk PPL 2.7758→2.7548；多槽并发尚未验收，因为 staging/event 状态仍需从进程级单例拆成 per-context/per-slot 所有权。`SLOT_ORDER=0` 只用于旧路径消融，不应作为生产提速开关。
+当前已验收范围是单槽 decode。DSV4 K24 本地CPU cold路径的12轮结果为25.0167→30.2333 tok/s，PP2048=361.47 tok/s，5-chunk PPL 2.7758→2.7548。四路remote CPU cold桥接的raw/no-DSpark八轮为25.25→28.85 tok/s（+14.26%），paired PPL 2.7647→2.7412。后者仍是strict modulo cover，不是MAX_EFFORT。多槽并发尚未验收，因为 staging/event 状态仍需拆成per-context/per-slot所有权；当前in-flight原子门会拒绝并发覆盖。`SLOT_ORDER=0`只用于旧路径消融，不应作为生产提速开关。
 
 ---
 
