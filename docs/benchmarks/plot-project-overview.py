@@ -8,6 +8,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.lines import Line2D
 
 
 OUT = Path(__file__).resolve().parents[1] / "img"
@@ -86,86 +87,124 @@ def numa_tp():
 
 
 def formats():
-    # Full-format matrix measured on 2026-08-21 with one hybrid setup.
+    # Formal performance sweep, 2026-08-24. Values are intentionally embedded
+    # so the public chart generator does not depend on private benchmark artifacts.
     rows = [
-        ("UD-IQ1_S",                         76.9, 256.86, 27.94),
-        ("UD-IQ1_M",                         80.9, 242.84, 26.44),
-        ("UD-IQ2_XXS",                       84.6, 251.75, 27.17),
-        ("UD-IQ2_M",                         84.7, 244.99, 26.60),
-        ("UD-Q2_K_XL",                       90.2, 236.31, 26.56),
-        ("UD-IQ3_XXS",                       97.1, 209.67, 24.77),
-        ("UD-IQ3_S",                        108.1, 265.20, 22.97),
-        ("mix-IQ2XS/IQ3XXS/MXFP4",         112.1, 233.71, 25.14),
-        ("UD-Q3_K_M",                       119.3, 209.77, 24.05),
-        ("UD-Q3_K_XL",                      119.4, 209.62, 23.92),
-        ("UD-IQ4_XS",                       127.3, 226.92, 21.05),
-        ("UD-IQ4_NL",                       127.3, 229.91, 20.74),
-        ("UD-Q4_K_XL",                      144.4, 318.49, 25.17),
-        ("mix-MXFP4-MoE/Q8",                145.6, 313.28, 24.49),
-        ("UD-Q8_K_XL",                      150.8, 307.48, 20.78),
-        ("mix-MXFP4-MoE/BF16",              150.8, 306.81, 20.59),
+        ("UD-IQ1_S",      76.87065544724464, 251.18, 29.45, "ud"),
+        ("UD-IQ1_M",      80.93315544724464, 241.38, 29.03, "ud"),
+        ("UD-IQ2_XXS",    84.62065544724464, 247.17, 28.89, "ud"),
+        ("UD-IQ2_M",      84.68230095505714, 246.83, 29.24, "ud"),
+        ("UD-Q2_K_XL",    90.18230098485947, 232.22, 28.03, "ud"),
+        ("UD-IQ3_XXS",    97.05112132430077, 208.96, 26.74, "ud"),
+        ("UD-IQ3_S",     108.09799629449844, 254.48, 23.99, "ud"),
+        ("UD-Q3_K_M",    119.28238350152970, 207.20, 25.49, "ud"),
+        ("UD-Q3_K_XL",   119.40182167291641, 207.69, 25.34, "ud"),
+        # Weighted across the 3-run formal batch and the 5-run confirmation batch.
+        ("UD-IQ4_XS",    127.27682167291641, 215.93, 21.10, "ud"),
+        ("UD-IQ4_NL",    127.27682167291641, 223.53, 21.36, "ud"),
+        ("UD-Q4_K_XL",   144.44369927048683, 314.15, 25.65, "ud"),
+        ("UD-Q8_K_XL",   150.75282707810402, 306.17, 21.39, "ud"),
+        ("MXFP4",        145.26439723372460, 312.48, 26.87, "baseline"),
+        ("UDNL_W4",      146.36274161934853, 370.87, 25.10, "xllama"),
+        ("UDNL_MX",      116.12836688756943, 415.56, 25.91, "xllama"),
+        ("E4A",          145.26439723372460, 362.92, 24.83, "xllama"),
     ]
     rows.sort(key=lambda row: (row[1], row[0]))
 
     def smaller_but_slower(metric):
         result = []
-        for index, row in enumerate(rows):
+        for row in rows:
             size = row[1]
             speed = row[metric]
-            result.append(any(other[1] > size + 0.05 and other[metric] > speed * 1.03 for other in rows[index + 1:]))
+            result.append(any(other[1] > size + 0.05 and other[metric] > speed * 1.03 for other in rows))
         return result
 
     sizes = np.array([row[1] for row in rows])
     pp = np.array([row[2] for row in rows])
     tg = np.array([row[3] for row in rows])
+    kinds = np.array([row[4] for row in rows])
     counter_pp = smaller_but_slower(2)
     counter_tg = smaller_but_slower(3)
 
-    fig, axes = plt.subplots(2, 1, figsize=(11.5, 8.7), sharex=True)
-    close_size_label_dx = {3: -10, 4: 10, 9: -10, 10: 10, 11: -10, 12: 10, 15: -10, 16: 10}
-    for ax, values, counter, color, ylabel, trend_x_pos, trend_ha in (
-        (axes[0], pp, counter_pp, GREEN, "pp2048 (tok/s)", 0.015, "left"),
-        (axes[1], tg, counter_tg, BLUE, "tg512 (tok/s)", 0.985, "right"),
+    pp_offsets = {
+        "UD-IQ1_S": (-8, 14), "UD-IQ1_M": (-18, -19),
+        "UD-IQ2_XXS": (27, 13), "UD-IQ2_M": (28, -18),
+        "UD-Q2_K_XL": (0, 10), "UD-IQ3_XXS": (0, -17),
+        "UD-IQ3_S": (-8, 10), "UDNL_MX": (2, 11),
+        "UD-Q3_K_M": (-46, -18), "UD-Q3_K_XL": (11, 9),
+        "UD-IQ4_XS": (-49, -18), "UD-IQ4_NL": (10, 9),
+        "UD-Q4_K_XL": (-58, -18), "MXFP4": (-26, 10),
+        "E4A": (-21, -18), "UDNL_W4": (20, 10), "UD-Q8_K_XL": (0, -18),
+    }
+    tg_offsets = {
+        "UD-IQ1_S": (-6, 13), "UD-IQ1_M": (-24, -19),
+        "UD-IQ2_XXS": (27, -13), "UD-IQ2_M": (28, 13),
+        "UD-Q2_K_XL": (0, 10), "UD-IQ3_XXS": (-3, -17),
+        "UD-IQ3_S": (-10, -17), "UDNL_MX": (-8, 11),
+        "UD-Q3_K_M": (-46, 10), "UD-Q3_K_XL": (10, -17),
+        "UD-IQ4_XS": (-48, -17), "UD-IQ4_NL": (11, 9),
+        "UD-Q4_K_XL": (-58, -18), "MXFP4": (-24, 10),
+        "E4A": (-22, -18), "UDNL_W4": (20, 10), "UD-Q8_K_XL": (0, -18),
+    }
+
+    fig, axes = plt.subplots(2, 1, figsize=(13.2, 9.7), sharex=True)
+    trend_mask = kinds != "xllama"
+    for ax, values, counter, ylabel, offsets, trend_label_x, trend_ha in (
+        (axes[0], pp, counter_pp, "pp2048 (tok/s)", pp_offsets, 0.015, "left"),
+        (axes[1], tg, counter_tg, "tg512 (tok/s)", tg_offsets, 0.985, "right"),
     ):
-        trend_coeff = np.polyfit(sizes, values, 1)
+        trend_sizes = sizes[trend_mask]
+        trend_values = values[trend_mask]
+        trend_coeff = np.polyfit(trend_sizes, trend_values, 1)
         trend_x = np.linspace(sizes.min(), sizes.max(), 200)
-        fitted = np.polyval(trend_coeff, sizes)
-        residual = np.sum((values - fitted) ** 2)
-        total = np.sum((values - values.mean()) ** 2)
+        fitted = np.polyval(trend_coeff, trend_sizes)
+        residual = np.sum((trend_values - fitted) ** 2)
+        total = np.sum((trend_values - trend_values.mean()) ** 2)
         r_squared = 1.0 - residual / total
-        ax.plot(trend_x, np.polyval(trend_coeff, trend_x), color=color, linewidth=2.0, linestyle="--", alpha=0.8, zorder=1)
-        for index, (size, speed, is_counterexample) in enumerate(zip(sizes, values, counter), 1):
-            point_color = "#d62728" if is_counterexample else color
-            marker = "D" if is_counterexample else "o"
-            ax.scatter(size, speed, s=70, marker=marker, color=point_color, edgecolor="black", linewidth=0.7, zorder=3)
-            label_dx = close_size_label_dx.get(index, 0)
-            ax.annotate(str(index), (size, speed), xytext=(label_dx, 7), textcoords="offset points", ha="center", fontsize=7.5)
+        ax.plot(trend_x, np.polyval(trend_coeff, trend_x), color=GRAY, linewidth=1.8, linestyle="--", alpha=0.85, zorder=1)
+        for row, size, speed, kind, is_counterexample in zip(rows, sizes, values, kinds, counter):
+            name = row[0]
+            if kind == "ud":
+                marker, face, point_size, width = "o", BLUE, 58, 0.65
+            elif kind == "baseline":
+                marker, face, point_size, width = "X", "black", 100, 0.8
+            else:
+                marker, face, point_size, width = "*", ORANGE, 190, 1.0
+            ax.scatter(size, speed, s=point_size, marker=marker, color=face, edgecolor="black", linewidth=width, zorder=3)
+            if is_counterexample:
+                ax.scatter(size, speed, s=130 if kind != "xllama" else 245, marker="D", facecolors="none",
+                           edgecolors="#d62728", linewidth=1.45, zorder=4)
+            dx, dy = offsets[name]
+            text_color = "#8f3f1f" if kind == "xllama" else ("black" if kind == "baseline" else "#244b73")
+            ax.annotate(f"{name}  {speed:.2f}", (size, speed), xytext=(dx, dy), textcoords="offset points",
+                        ha="center", va="center", fontsize=7.2, color=text_color,
+                        fontweight="bold" if kind != "ud" else "normal",
+                        arrowprops=dict(arrowstyle="-", color=text_color, alpha=0.45, linewidth=0.55) if abs(dx) > 15 else None)
         ax.set_ylabel(ylabel)
         ax.grid(alpha=0.25)
-        ax.text(trend_x_pos, 0.94, f"linear trend: {trend_coeff[0]:+.3f} tok/s/GiB, R²={r_squared:.2f}",
-                transform=ax.transAxes, ha=trend_ha, va="top", color=color, fontsize=9, fontweight="bold")
+        ax.text(trend_label_x, 0.95, f"UD + MXFP4 OLS: {trend_coeff[0]:+.3f} tok/s/GiB, R²={r_squared:.2f}",
+                transform=ax.transAxes, ha=trend_ha, va="top", color="#555b63", fontsize=8.8, fontweight="bold")
 
-    axes[0].set_ylim(160, 335)
-    axes[1].set_ylim(17.5, 29.5)
-    axes[1].set_xlim(73, 154)
+    axes[0].set_ylim(185, 440)
+    axes[1].set_ylim(19.8, 30.3)
+    axes[1].set_xlim(73.5, 154.0)
     axes[1].set_xlabel("Model size (GiB)")
-    axes[0].set_title(
-        "DSV4-Flash format scatter and least-squares trend: size alone does not explain speed\n"
-        "red diamond = a smaller format is at least 3% slower than a larger format"
+    fig.suptitle(
+        "DSV4-Flash formal format sweep (performance governor, unified binary and recipe)\n"
+        "red open diamond: a smaller format is at least 3% slower than a larger format",
+        y=0.995,
     )
-
-    entries = [f"{index:>2}  {name} ({size:.1f}G)" for index, (name, size, _, _) in enumerate(rows, 1)]
-    columns = 2
-    rows_per_column = (len(entries) + columns - 1) // columns
-    legend_lines = []
-    for row_index in range(rows_per_column):
-        cells = []
-        for column in range(columns):
-            entry_index = column * rows_per_column + row_index
-            cells.append(entries[entry_index] if entry_index < len(entries) else "")
-        legend_lines.append("    ".join(f"{cell:<39}" for cell in cells))
-    fig.text(0.5, 0.005, "\n".join(legend_lines), ha="center", va="bottom", family="monospace", fontsize=7.3)
-    fig.tight_layout(rect=(0, 0.145, 1, 1))
+    legend = [
+        Line2D([0], [0], marker="o", color="none", markerfacecolor=BLUE, markeredgecolor="black", markersize=7, label="Unsloth UD"),
+        Line2D([0], [0], marker="X", color="none", markerfacecolor="black", markeredgecolor="black", markersize=8, label="MXFP4 anchor"),
+        Line2D([0], [0], marker="*", color="none", markerfacecolor=ORANGE, markeredgecolor="black", markersize=13, label="PeoplesLLM format"),
+        Line2D([0], [0], marker="D", color="none", markerfacecolor="none", markeredgecolor="#d62728", markersize=8, label="smaller but >=3% slower"),
+        Line2D([0], [0], color=GRAY, linestyle="--", linewidth=1.8, label="OLS on UD + MXFP4 only"),
+    ]
+    fig.legend(handles=legend, ncol=5, loc="upper center", bbox_to_anchor=(0.5, 0.948), fontsize=8, framealpha=0.94)
+    fig.text(0.5, 0.008, "UD-IQ4_XS combines the 3-run formal batch and 5-run confirmation batch by repeat count: pp 215.93, tg 21.10.",
+             ha="center", va="bottom", fontsize=8, color="#555b63")
+    fig.tight_layout(rect=(0, 0.035, 1, 0.905))
     finish(fig, "quant-formats.png")
 
 

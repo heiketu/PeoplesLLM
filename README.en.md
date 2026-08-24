@@ -20,8 +20,8 @@ Each row below is an independent benchmark scope. Percentages from different row
 
 | Track | Matched baseline | Current result | Change |
 |---|---:|---:|---:|
-| DSV4 pp2048, MXFP4 -> UDNL_MX | 307.58 tok/s | **384.87 tok/s** | **+25.1%** |
-| DSV4 pp2048, quality-equivalent MXFP4 -> E4A | 315.7 tok/s | **370.0 tok/s** | **+17.2%** |
+| DSV4 pp2048, MXFP4 -> UDNL_MX | 312.48 tok/s | **415.56 tok/s** | **+33.0%** |
+| DSV4 pp2048, quality-equivalent MXFP4 -> E4A | 312.48 tok/s | **362.92 tok/s** | **+16.1%** |
 | DSV4 DSpark decode, n2/p0 | 23.9 tok/s | **30.1 tok/s** | **+26%** |
 | DSV4 raw decode, matched hot-expert A/B | 26.0 tok/s | **28.5 tok/s** | **+9.7%** |
 | DSV4 16K GPU MoE prefill | 213 tok/s | **334.5 tok/s** | **+57%** |
@@ -128,18 +128,20 @@ The format work therefore moves from “fewest bits” to storage layouts that f
 
 ![Full MoE format matrix by model size and PP/TG speed](docs/img/quant-formats.png)
 
-The chart is a historical scatter and least-squares trend for 16 production-format points measured under `powersave` on 2026-08-21. It is retained only to show that smaller files are not necessarily faster, not as a current performance ranking. The entire matrix is being rerun with one `performance` frequency policy, binary, and parameter set; the three abandoned models whose names contain `exp` will not return. A red diamond marks a smaller format that is at least 3% slower than some larger format. The weak trend and many counterexamples show that this workload is not controlled by DRAM bytes alone: codebook expansion, scale handling, storage-to-kernel layout, and access to batch kernels also matter. The table below lists representative Pareto points after later kernel work and must not be mixed point-by-point with the earlier matrix.
+The figure and table use the unified 2026-08-24 `performance` run with 17 format points. The fixed arguments are `-ngl 99 -ncmoe 99 -fa 1 -dev CUDA0 -sm layer -t 72 --numa distribute -b 4096 -ub 1024 --load-mode none -p 2048 -n 512 -r 3`; all 152/152 CPU governors and EPP settings were `performance`, turbo was enabled, and `numa_balancing=1` was recorded. These are raw single-slot results with neither DSpark nor hot experts. Standard UD formats are ordinary circles, MXFP4 is the anchor, the in-house UDNL_W4/UDNL_MX/E4A formats are large stars, and red hollow diamonds flag points that are smaller yet at least 3% slower than a larger format. Trend lines are fitted only to standard UD points plus the MXFP4 anchor; the three in-house formats are excluded from the fit.
+
+PPL is reused from the prior quality measurement of the same weights: CPU frequency does not change PPL, so it was not recomputed in this run. The PP/TG value for `UD-IQ4_XS`, 215.93/21.10, is weighted by repeat count from the original three runs at 219.09/21.62 and five supplemental runs at 214.03/20.78. The current loader identifies the routed MoE tensors in `UD-Q4_K_XL` as MXFP4, so that row is not a pure-Q4 expert endpoint. See [BENCHMARKS](docs/BENCHMARKS.md) for all 17 points and the historical scope.
 
 | Format | Size | pp2048 | tg512 | WikiText-2 PPL | Role |
 |---|---:|---:|---:|---:|---|
-| MXFP4 | 145.3 GiB | 307.58 | 26.26 | 3.5830 | quality baseline |
-| **UDNL_W4 + arec** | 146.4 GiB | 366.58 | 24.99 | 3.7997 | fixed 4-bit compute-oriented layout |
-| **UDNL_MX + arec** | **116.1 GiB** | **384.87** | 26.38 | 4.6274 | smallest size and highest PP |
-| **E4A** | about 147.2 GiB | **370.0** | 26.37 | approximately MXFP4 | bit-exact MXFP4 values; load about 22 -> 11 s |
-| Q3_R (MoE) | 114.1 GiB | 174.60 | 25.30 | 4.7636 | small-format reference |
-| IQ2_XXS (file named Q2_K) | 90.9 GiB | 223.60 | 22.87 | 6.6338 | dequantization-cost reference |
+| MXFP4 | 145.26 GiB | 312.48 | 26.87 | 3.5830 | quality and speed anchor |
+| **UDNL_W4 + arec** | 146.36 GiB | 370.87 | 25.10 | 3.7997 | fixed 4-bit compute-oriented layout |
+| **UDNL_MX + arec** | **116.13 GiB** | **415.56** | 25.91 | 4.6274 | smallest size and highest PP |
+| **E4A** | 145.26 GiB | **362.92** | 24.83 | 3.5830 | bit-exact MXFP4 values |
+| UD-Q3_K_M | 119.28 GiB | 207.20 | 25.49 | 4.0242 | standard UD reference |
+| UD-Q3_K_XL | 119.40 GiB | 207.69 | 25.34 | 4.0189 | standard UD reference |
 
-Choose UDNL_MX when capacity and PP matter most; choose E4A when MXFP4 values and quality must be preserved. The fixed format harness covers the main rows, while E4A quality was rechecked with a five-chunk PPL run; see [BENCHMARKS](docs/BENCHMARKS.md) for the exact scopes.
+Choose UDNL_MX when capacity and PP matter most; choose E4A when MXFP4 values and quality must be preserved. Every performance row comes from the same fixed 2026-08-24 harness, while PPL is reused from the matching-weight quality measurement.
 
 ## Build and run
 

@@ -20,8 +20,8 @@ PeoplesLLM 是面向异构本地推理的 llama.cpp 分支。项目围绕三条�
 
 | 路线 | 配对基线 | 当前结果 | 变化 |
 |---|---:|---:|---:|
-| DSV4 pp2048，MXFP4 -> UDNL_MX | 307.58 tok/s | **384.87 tok/s** | **+25.1%** |
-| DSV4 pp2048，同质量 MXFP4 -> E4A | 315.7 tok/s | **370.0 tok/s** | **+17.2%** |
+| DSV4 pp2048，MXFP4 -> UDNL_MX | 312.48 tok/s | **415.56 tok/s** | **+33.0%** |
+| DSV4 pp2048，同质量 MXFP4 -> E4A | 312.48 tok/s | **362.92 tok/s** | **+16.1%** |
 | DSV4 DSpark decode，n2/p0 | 23.9 tok/s | **30.1 tok/s** | **+26%** |
 | DSV4 raw decode，热专家分流配对 A/B | 26.0 tok/s | **28.5 tok/s** | **+9.7%** |
 | DSV4 16K GPU MoE prefill | 213 tok/s | **334.5 tok/s** | **+57%** |
@@ -128,18 +128,20 @@ arec（activation record）把 Q8 激活和 scale 预计算一次，随后让权
 
 ![MoE 全格式体积与 PP/TG 速度矩阵](docs/img/quant-formats.png)
 
-上图是 2026-08-21 在 `powersave` 下测得的 16 个正式格式历史散点与最小二乘趋势线，只用于展示“体积更小不一定更快”的格式异常，不作为当前性能排名。整个矩阵正在用统一 `performance` 频率、同一二进制和同一参数重测；名称含 `exp` 的三个已放弃试验模型不再纳入。红色菱形表示该格式虽然更小，却被至少一个更大的格式以 3% 以上速度反超。较低的趋势解释力和大量反例说明这里不是单一 DRAM 字节数问题；码本展开、scale 处理、磁盘/计算布局以及能否进入批量内核同样决定速度。下表另列后续内核优化后的代表性 Pareto 点，不能与上图逐点混算。
+上图与下表使用 2026-08-24 的统一 `performance` 口径，共 17 个格式点。固定参数为 `-ngl 99 -ncmoe 99 -fa 1 -dev CUDA0 -sm layer -t 72 --numa distribute -b 4096 -ub 1024 --load-mode none -p 2048 -n 512 -r 3`；152/152 CPU governor 均为 `performance`，EPP 均为 `performance`，turbo 开启，`numa_balancing=1` 已记录。这是单 slot 原始推理结果，未启用 DSpark 或热专家。普通 UD 格式画为圆点，MXFP4 是锚点，自研 UDNL_W4、UDNL_MX、E4A 画为大星，红色空心菱形表示“体积更小但被更大格式反超至少 3%”的异常点。趋势线只拟合普通 UD 点与 MXFP4 锚点，自研格式不参与拟合。
+
+PPL 沿用同一权重此前的质量测量，CPU 频率不会改变 PPL，因此本轮没有重复计算。`UD-IQ4_XS` 的 PP/TG 是原 3 轮 219.09/21.62 与补充 5 轮 214.03/20.78 按重复次数加权后的 215.93/21.10。`UD-Q4_K_XL` 在当前 loader 中实际被识别为 MXFP4 MoE，不能作为纯 Q4 专家端点。完整 17 点和原始历史口径见 [BENCHMARKS](docs/BENCHMARKS.md)。
 
 | 格式 | 体积 | pp2048 | tg512 | WikiText-2 PPL | 定位 |
 |---|---:|---:|---:|---:|---|
-| MXFP4 | 145.3 GiB | 307.58 | 26.26 | 3.5830 | 质量基线 |
-| **UDNL_W4 + arec** | 146.4 GiB | 366.58 | 24.99 | 3.7997 | 固定 4-bit 计算亲和布局 |
-| **UDNL_MX + arec** | **116.1 GiB** | **384.87** | 26.38 | 4.6274 | 最小体积和最高 PP |
-| **E4A** | 约 147.2 GiB | **370.0** | 26.37 | ≈ MXFP4 | MXFP4 值 bit-exact，加载约 22 -> 11 s |
-| Q3_R（MoE） | 114.1 GiB | 174.60 | 25.30 | 4.7636 | 小体积对照 |
-| IQ2_XXS（文件名为 Q2_K） | 90.9 GiB | 223.60 | 22.87 | 6.6338 | 反量化成本对照 |
+| MXFP4 | 145.26 GiB | 312.48 | 26.87 | 3.5830 | 质量与速度锚点 |
+| **UDNL_W4 + arec** | 146.36 GiB | 370.87 | 25.10 | 3.7997 | 固定 4-bit 计算亲和布局 |
+| **UDNL_MX + arec** | **116.13 GiB** | **415.56** | 25.91 | 4.6274 | 最小体积和最高 PP |
+| **E4A** | 145.26 GiB | **362.92** | 24.83 | 3.5830 | MXFP4 数值 bit-exact |
+| UD-Q3_K_M | 119.28 GiB | 207.20 | 25.49 | 4.0242 | 标准 UD 对照 |
+| UD-Q3_K_XL | 119.40 GiB | 207.69 | 25.34 | 4.0189 | 标准 UD 对照 |
 
-如果优先容量和 PP，选择 UDNL_MX；如果要求保持 MXFP4 数值与质量，选择 E4A。不同格式行来自固定 harness，但 E4A 的质量复验采用 5-chunk PPL；完整口径见 [BENCHMARKS](docs/BENCHMARKS.md)。
+如果优先容量和 PP，选择 UDNL_MX；如果要求保持 MXFP4 数值与质量，选择 E4A。所有性能行来自同一个 2026-08-24 固定 harness，PPL 则沿用同权重质量测量。
 
 ## 构建与使用
 
