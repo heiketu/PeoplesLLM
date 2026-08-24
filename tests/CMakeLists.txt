@@ -385,6 +385,16 @@ llama_build(test-resident-bf16.cpp)
 llama_build(test-dsv4-gather-dequant.cpp)
 llama_test(test-dsv4-gather-dequant)
 
+llama_build(test-hot-expert-slot-order.cpp)
+target_include_directories(test-hot-expert-slot-order PRIVATE ${PROJECT_SOURCE_DIR}/src)
+llama_test(test-hot-expert-slot-order)
+add_test(NAME test-hot-expert-slot-order-fallback
+    COMMAND ${CMAKE_COMMAND} -E env GGML_HOT_EXPERT_SLOT_ORDER=0
+        $<TARGET_FILE:test-hot-expert-slot-order>)
+add_test(NAME test-hot-expert-slot-merge-scalar
+    COMMAND ${CMAKE_COMMAND} -E env GGML_HOT_EXPERT_SLOT_MERGE_AVX512=0
+        $<TARGET_FILE:test-hot-expert-slot-order>)
+
 # standalone numerical tests + microbenchmarks for the 8x8 repack matmul kernels
 # (Q2_K / Q5_K x Q8_K); needs the internal ggml-cpu repack headers and symbols
 if (NOT LLAMA_USE_SYSTEM_GGML AND TARGET ggml-cpu)

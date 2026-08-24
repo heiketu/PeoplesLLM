@@ -2241,12 +2241,25 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             }
 
             if (m_star >= 0) {
+                ggml_tensor * hot_remote_send = nullptr;
+                if (m_star == 0 && llama_hot_expert_remote_ep_enabled() &&
+                        llama_remote_ep_sched_hot_compatible(il) &&
+                        n_tokens <= llama_hot_expert_max_tokens() && llama_hot_expert_layer_active(il)) {
+                    if (cparams.n_seq_max != 1) {
+                        GGML_ABORT("hot/remote EP requires n_seq_max=1, got %u", cparams.n_seq_max);
+                    }
+                    void * hot_ud = llama_hot_expert_userdata(il);
+                    hot_remote_send = ggml_map_custom3(ctx0, cur, selected_experts, weights,
+                            llama_hot_expert_send_cb, 1, hot_ud);
+                    ggml_build_forward_expand(gf, hot_remote_send);
+                }
+
                 // Partition+send op: for m*>0 dst contains local ids
                 // [m*,n_tokens]. For pure EP it is a one-row dependency token;
                 // the callback deals all slots to workers and writes no ids.
-                ggml_tensor * args_s[3] = {cur, selected_experts, weights};
+                ggml_tensor * args_s[4] = {cur, selected_experts, weights, hot_remote_send};
                 ggml_tensor * local_ids = ggml_custom_4d(ctx0, GGML_TYPE_I32,
-                        std::max(1, m_star), n_tokens, 1, 1, args_s, 3,
+                        std::max(1, m_star), n_tokens, 1, 1, args_s, hot_remote_send ? 4 : 3,
                         llama_remote_ep_sched_send_cb, 1,
                         llama_remote_ep_userdata(cparams.ep_stream, il));
                 ggml_build_forward_expand(gf, local_ids);
@@ -2572,10 +2585,26 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // backend event join — no scheduler splits); the CPU chain below computes
     // only the cold slots (hot ids masked to a sentinel that the repack mmid
     // skips and zeroes), so hot expert weights are never read from DRAM.
+    const auto hot_expert_cold_tensor_ok = [](const ggml_tensor * tensor) {
+        if (tensor == nullptr) {
+            return false;
+        }
+        switch (tensor->type) {
+            case GGML_TYPE_MXFP4:
+            case GGML_TYPE_UDNL_W4:
+            case GGML_TYPE_UDNL_MX:
+            case GGML_TYPE_E4A:
+                break;
+            default:
+                return false;
+        }
+        const ggml_tensor * storage = tensor->view_src ? tensor->view_src : tensor;
+        return storage->buffer != nullptr && strcmp(ggml_backend_buffer_name(storage->buffer), "CPU_REPACK") == 0;
+    };
     const bool hot_expert_ok = il >= 0 && !cparams.warmup &&
         n_tokens <= llama_hot_expert_max_tokens() && llama_hot_expert_layer_active(il) &&
         !weight_before_ffn && type_op == LLM_FFN_SILU && gate_exps && up_exps && down_exps && !gate_up_exps &&
-        gate_exps->type == GGML_TYPE_MXFP4 && up_exps->type == GGML_TYPE_MXFP4 && down_exps->type == GGML_TYPE_MXFP4 &&
+        hot_expert_cold_tensor_ok(gate_exps) && hot_expert_cold_tensor_ok(up_exps) && hot_expert_cold_tensor_ok(down_exps) &&
         !up_exps_b && !gate_exps_b && !down_exps_b && !gate_up_exps_b &&
         !up_exps_s && !gate_exps_s && !down_exps_s && loras->empty() &&
         !int8_island && !fp16_island && moe_input == cur;
@@ -2615,20 +2644,21 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(experts_c, "ffn_moe_down", il);
         ggml_build_forward_expand(gf, experts_c);
 
-        // cold partial: ascending slot adds; masked slots are exact zeros from
-        // the mmid, so this is bit-identical to the baseline cold contribution
-        ggml_tensor * moe_out = ggml_view_2d(ctx0, experts_c, n_embd, n_tokens,
-                experts_c->nb[2], 0);
-        ggml_build_forward_expand(gf, moe_out);
-        for (uint32_t i = 1; i < hparams.n_expert_used; ++i) {
-            ggml_tensor * v = ggml_view_2d(ctx0, experts_c, n_embd, n_tokens,
-                    experts_c->nb[2], i * experts_c->nb[1]);
-            moe_out = ggml_add(ctx0, moe_out, v);
-            ggml_build_forward_expand(gf, moe_out);
+        ggml_tensor * cold_merge = experts_c;
+        if (!llama_hot_expert_slot_order_enabled()) {
+            // legacy two-partial path: reduce cold slots before the merge
+            cold_merge = ggml_view_2d(ctx0, experts_c, n_embd, n_tokens, experts_c->nb[2], 0);
+            ggml_build_forward_expand(gf, cold_merge);
+            for (uint32_t i = 1; i < hparams.n_expert_used; ++i) {
+                ggml_tensor * v = ggml_view_2d(ctx0, experts_c, n_embd, n_tokens,
+                        experts_c->nb[2], i * experts_c->nb[1]);
+                cold_merge = ggml_add(ctx0, cold_merge, v);
+                ggml_build_forward_expand(gf, cold_merge);
+            }
         }
 
-        // join: wait for the GPU partial (event) and add it
-        ggml_tensor * merged = ggml_map_custom2(ctx0, send, moe_out,
+        // join: wait for the GPU output and merge it with the CPU cold slots
+        ggml_tensor * merged = ggml_map_custom2(ctx0, send, cold_merge,
                 llama_hot_expert_merge_cb, 1, ud);
         cb(merged, "ffn_moe_out", il);
         ggml_build_forward_expand(gf, merged);
@@ -3676,8 +3706,6 @@ ggml_tensor * llm_graph_context::build_attn(
             int       il) const {
     const bool is_swa = hparams.is_swa(il);
 
-    GGML_UNUSED(v_cur);
-
     auto * k_rot = is_swa ? inp->self_k_rot_swa : inp->self_k_rot;
 
     if (k_rot) {
@@ -3710,7 +3738,7 @@ ggml_tensor * llm_graph_context::build_attn(
     // MLA-style attention: the cached K is used as V
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = k;
+    ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);

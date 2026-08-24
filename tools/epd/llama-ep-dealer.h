@@ -32,6 +32,10 @@ struct llama_ep_dealer_input {
     int m_star   = 0;  // target local slots per token
     const int32_t  * ids     = nullptr;  // [k, n_tokens]: ids[t*k + j]
     const uint64_t * holders = nullptr;  // [n_expert] bitmask: bit0=master, bit(1+i)=endpoint i
+    // Optional [n_tokens*k] mask. Zero slots are absent from the local and
+    // remote plans; owner keeps 0xff so the original router slot index remains
+    // stable. Null means every slot is active and preserves legacy behavior.
+    const uint8_t * active_mask = nullptr;
     // Optional work already queued/running on each endpoint, in common
     // scheduler work units. The dealer adds the current batch on top so
     // concurrent EP streams avoid piling onto an already busy worker.
@@ -58,10 +62,12 @@ struct llama_ep_dealer_ep {
 };
 
 struct llama_ep_dealer_plan {
-    int m_local = 0;                    // == clamped m_star (uniform per token)
+    int m_local = 0;                    // clamped m_star; local_ids row capacity
     std::vector<uint8_t> owner;         // [n_tokens*k]: 0=master, 1+i=endpoint i
     std::vector<int32_t> local_ids;     // [m_local, n_tokens]: expert ids in
-                                        // ascending global slot order per token
+                                        // ascending global slot order; inactive
+                                        // tail entries remain -1
+    std::vector<int32_t> local_count;   // active local assignments per token
     std::vector<llama_ep_dealer_ep> eps;  // [n_endpoints]
 };
 
@@ -139,10 +145,14 @@ static inline bool llama_ep_dealer_plan_build(
         return false;
     }
     const int m_local = in.m_star > in.k ? in.k : in.m_star;
+    auto slot_is_active = [&](size_t pos) {
+        return in.active_mask == nullptr || in.active_mask[pos] != 0;
+    };
 
     out.m_local = m_local;
     out.owner.assign((size_t) in.n_tokens * in.k, 0xff);
     out.local_ids.assign((size_t) in.n_tokens * m_local, -1);
+    out.local_count.assign((size_t) in.n_tokens, 0);
     if (out.eps.size() != (size_t) in.n_endpoints) {
         out.eps.resize((size_t) in.n_endpoints);
     }
@@ -203,6 +213,12 @@ static inline bool llama_ep_dealer_plan_build(
     int32_t max_expert = 0;
     if (repeat_aware) {
         for (int i = 0; i < in.n_tokens * in.k; ++i) {
+            if (!slot_is_active((size_t) i)) {
+                continue;
+            }
+            if (in.ids[i] < 0) {
+                return false;
+            }
             max_expert = std::max(max_expert, in.ids[i]);
         }
     }
@@ -245,10 +261,21 @@ static inline bool llama_ep_dealer_plan_build(
 
     for (int t = 0; t < in.n_tokens; ++t) {
         const int32_t * ids = in.ids + (size_t) t * in.k;
+        int n_active = 0;
+        for (int j = 0; j < in.k; ++j) {
+            n_active += slot_is_active((size_t) t * in.k + j);
+        }
+        const int target_local = std::min(m_local, n_active);
 
         // pass 1: forced assignments — slots whose expert the master does not
         // hold must go to a slave holder (least loaded, rotated stable tie)
         for (int j = 0; j < in.k; ++j) {
+            if (!slot_is_active((size_t) t * in.k + j)) {
+                continue;
+            }
+            if (ids[j] < 0) {
+                return false;
+            }
             const uint64_t mask = in.holders[ids[j]];
             if (mask == 0) {
                 return false; // nobody holds this expert
@@ -279,11 +306,11 @@ static inline bool llama_ep_dealer_plan_build(
         std::vector<int> & cand = workspace.candidates;
         cand.clear();
         for (int j = 0; j < in.k; ++j) {
-            if (out.owner[(size_t) t * in.k + j] == 0xff) {
+            if (slot_is_active((size_t) t * in.k + j) && out.owner[(size_t) t * in.k + j] == 0xff) {
                 cand.push_back(j);
             }
         }
-        if ((int) cand.size() < m_local) {
+        if ((int) cand.size() < target_local) {
             return false; // cannot fill the static local shape
         }
         std::vector<char> & is_local = workspace.is_local;
@@ -291,17 +318,17 @@ static inline bool llama_ep_dealer_plan_build(
         int n_picked = 0;
         for (int j : cand) {
             if (in.holders[ids[j]] == 1u) {
-                // forced-local; more of these than m_local is infeasible (the
-                // static shape would overflow) — cannot happen when the master
+                // forced-local; more of these than target_local is infeasible
+                // (the static shape would overflow) — cannot happen when the master
                 // holds a full replica (every mask has bit0)
-                if (n_picked == m_local) {
+                if (n_picked == target_local) {
                     return false;
                 }
                 is_local[(size_t) j] = 1;
                 ++n_picked;
             }
         }
-        while (n_picked < m_local) {
+        while (n_picked < target_local) {
             std::vector<int64_t> & demand = workspace.demand;
             demand.assign((size_t) in.n_endpoints, 0);
             for (int j : cand) {
@@ -350,9 +377,13 @@ static inline bool llama_ep_dealer_plan_build(
                 out.local_ids[(size_t) t * m_local + p++] = ids[j];
             }
         }
+        out.local_count[(size_t) t] = n_picked;
 
         // pass 3: remaining slots go to their least-loaded slave holder
         for (int j = 0; j < in.k; ++j) {
+            if (!slot_is_active((size_t) t * in.k + j)) {
+                continue;
+            }
             if (out.owner[(size_t) t * in.k + j] != 0xff) {
                 continue;
             }
@@ -395,6 +426,9 @@ static inline bool llama_ep_dealer_plan_build(
             }
         }
         for (size_t pos = 0; pos < n_assignments; ++pos) {
+            if (!slot_is_active(pos)) {
+                continue;
+            }
             const int endpoint = (int) out.owner[pos] - 1;
             if (endpoint < 0 || endpoint >= in.n_endpoints) {
                 return false;
@@ -454,6 +488,9 @@ static inline bool llama_ep_dealer_plan_build(
             int best_endpoint = -1;
             best_load = refined_load;
             for (size_t pos = 0; pos < n_assignments; ++pos) {
+                if (!slot_is_active(pos)) {
+                    continue;
+                }
                 const int32_t expert = in.ids[pos];
                 const int src = (int) out.owner[pos] - 1;
                 const int32_t src_count = counts[(size_t) src * expert_stride + (size_t) expert];

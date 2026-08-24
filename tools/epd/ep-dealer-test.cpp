@@ -543,6 +543,108 @@ static void test_reusable_workspace_is_transparent() {
     }
 }
 
+static size_t assignment_count(const llama_ep_dealer_plan & plan) {
+    size_t total = 0;
+    for (int32_t count : plan.local_count) {
+        total += (size_t) count;
+    }
+    for (const auto & ep : plan.eps) {
+        total += ep.slot.size();
+    }
+    return total;
+}
+
+static bool same_endpoint_plan(const llama_ep_dealer_plan & a, const llama_ep_dealer_plan & b) {
+    if (a.eps.size() != b.eps.size()) return false;
+    for (size_t i = 0; i < a.eps.size(); ++i) {
+        if (a.eps[i].token != b.eps[i].token || a.eps[i].slot != b.eps[i].slot || a.eps[i].expert != b.eps[i].expert) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void test_active_mask_null_is_transparent() {
+    const int n_tokens = 2, k = 6, n_exp = 16, n_ep = 3;
+    int32_t ids[n_tokens*k] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
+    uint64_t holders[n_exp];
+    for (int expert = 0; expert < n_exp; ++expert) holders[expert] = 0xf;
+    uint8_t all_active[n_tokens*k];
+    memset(all_active, 1, sizeof(all_active));
+    llama_ep_dealer_input in;
+    in.n_tokens = n_tokens; in.k = k; in.n_endpoints = n_ep; in.m_star = 2;
+    in.ids = ids; in.holders = holders;
+    llama_ep_dealer_plan legacy, masked;
+    CHECK(llama_ep_dealer_plan_build(in, legacy), "legacy active plan should succeed");
+    in.active_mask = all_active;
+    CHECK(llama_ep_dealer_plan_build(in, masked), "all-active plan should succeed");
+    CHECK(legacy.owner == masked.owner && legacy.local_ids == masked.local_ids &&
+          legacy.local_count == masked.local_count && same_endpoint_plan(legacy, masked),
+          "nullptr and all-active mask must be bit-identical");
+    CHECK(assignment_count(masked) == (size_t) n_tokens*k, "all-active assignment count=%zu", assignment_count(masked));
+}
+
+static void test_active_mask_ragged_pure_ep() {
+    const int n_tokens = 3, k = 5, n_exp = 16, n_ep = 2;
+    int32_t ids[n_tokens*k] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14};
+    uint8_t active[n_tokens*k] = {1, 0, 1, 0, 1, 0, 1, 0, 0, 0, 1, 1, 1, 1, 0};
+    uint64_t holders[n_exp];
+    for (int expert = 0; expert < n_exp; ++expert) holders[expert] = 2ull << (expert & 1);
+    llama_ep_dealer_input in;
+    in.n_tokens = n_tokens; in.k = k; in.n_endpoints = n_ep; in.m_star = 0;
+    in.ids = ids; in.holders = holders; in.active_mask = active;
+    llama_ep_dealer_plan plan;
+    CHECK(llama_ep_dealer_plan_build(in, plan), "ragged pure-EP active plan should succeed");
+    size_t active_count = 0;
+    for (int pos = 0; pos < n_tokens*k; ++pos) {
+        active_count += active[pos] != 0;
+        if (!active[pos]) {
+            CHECK(plan.owner[(size_t) pos] == 0xff, "inactive position %d owner=%u", pos, (unsigned) plan.owner[(size_t) pos]);
+        } else {
+            const int endpoint = (int) plan.owner[(size_t) pos] - 1;
+            CHECK(endpoint >= 0 && endpoint < n_ep, "active position %d must be remote", pos);
+            CHECK(holders[ids[pos]] & (2ull << endpoint), "active position %d assigned to non-holder", pos);
+        }
+    }
+    CHECK(assignment_count(plan) == active_count, "ragged assignments=%zu active=%zu", assignment_count(plan), active_count);
+}
+
+static void test_active_mask_ragged_local_and_all_inactive() {
+    const int n_tokens = 2, k = 4, n_exp = 8;
+    int32_t ids[n_tokens*k] = {1, 2, 3, 4, 4, 5, 6, 7};
+    uint8_t active[n_tokens*k] = {0, 1, 0, 0, 1, 1, 1, 0};
+    uint64_t holders[n_exp];
+    for (int expert = 0; expert < n_exp; ++expert) holders[expert] = 0x3;
+    llama_ep_dealer_input in;
+    in.n_tokens = n_tokens; in.k = k; in.n_endpoints = 1; in.m_star = 2;
+    in.ids = ids; in.holders = holders; in.active_mask = active;
+    llama_ep_dealer_plan plan;
+    CHECK(llama_ep_dealer_plan_build(in, plan), "ragged local plan should succeed");
+    CHECK(plan.local_count == std::vector<int32_t>({1, 2}), "local counts should be 1/2");
+    CHECK(plan.local_ids[0] == 2 && plan.local_ids[1] == -1, "token0 local row must preserve inactive tail");
+    CHECK(assignment_count(plan) == 4, "ragged local assignment count=%zu", assignment_count(plan));
+
+    memset(active, 0, sizeof(active));
+    for (int & id : ids) id = -1; // inactive ids must never index holders
+    CHECK(llama_ep_dealer_plan_build(in, plan), "all-inactive plan should ignore ids/holders");
+    CHECK(assignment_count(plan) == 0, "all-inactive assignments=%zu", assignment_count(plan));
+    for (uint8_t owner : plan.owner) CHECK(owner == 0xff, "all-inactive owner=%u", (unsigned) owner);
+}
+
+static void test_active_mask_holder_feasibility() {
+    int32_t ids[2] = {1, 2};
+    uint8_t active[2] = {1, 0};
+    uint64_t holders[3] = {0, 0x2, 0};
+    llama_ep_dealer_input in;
+    in.n_tokens = 1; in.k = 2; in.n_endpoints = 1; in.m_star = 0;
+    in.ids = ids; in.holders = holders; in.active_mask = active;
+    llama_ep_dealer_plan plan;
+    CHECK(llama_ep_dealer_plan_build(in, plan), "inactive no-holder slot must be ignored");
+    CHECK(assignment_count(plan) == 1 && plan.owner[1] == 0xff, "partial-active assignment count");
+    active[1] = 1;
+    CHECK(!llama_ep_dealer_plan_build(in, plan), "active no-holder slot must fail");
+}
+
 int main() {
     test_full_replica_1ep();
     test_partitioned_2ep();
@@ -565,6 +667,10 @@ int main() {
     test_repeat_expert_affinity();
     test_prefill_repeat_affinity();
     test_reusable_workspace_is_transparent();
+    test_active_mask_null_is_transparent();
+    test_active_mask_ragged_pure_ep();
+    test_active_mask_ragged_local_and_all_inactive();
+    test_active_mask_holder_feasibility();
     if (failures == 0) {
         printf("ep-dealer-test: PASS (all cases)\n");
         return 0;

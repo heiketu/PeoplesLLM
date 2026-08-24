@@ -1,5 +1,7 @@
 #include "llama-remote-ep.h"
 
+#include "llama-hot-expert.h"
+
 #include "llama-impl.h"
 
 #include "../tools/epd/llama-ep-capability.h"
@@ -251,6 +253,7 @@ struct remote_ep_state {
         int                  m_local  = 0;
         const float        * hidden  = nullptr;  // graph buffers, valid until the merge op
         const float        * weights = nullptr;
+        void               * hot_userdata = nullptr;
         // Persistent plan and scratch are retained per EP stream. Decode calls
         // this path for every MoE layer; retaining capacity removes allocator
         // traffic without carrying load or routing state across layers.
@@ -266,6 +269,9 @@ struct remote_ep_state {
         std::vector<int64_t> service_work_milli;
         std::vector<uint8_t> measure_service;
         std::vector<uint8_t> accounting_seen;
+        std::vector<uint8_t> cold_active;
+        std::vector<uint8_t> hot_mask;
+        std::vector<float> hot_cold_slots;
         std::vector<int> active_eps;
         std::vector<uint8_t> recv_ok;
         std::vector<std::string> recv_err;
@@ -589,12 +595,6 @@ struct remote_ep_state {
             if (const char * value = getenv("GGML_REMOTE_EP_SCHED_REPEAT_ACCOUNTING")) {
                 sched_repeat_accounting = value[0] == '\0' || strcmp(value, "0") != 0;
             }
-            if (const char * d = getenv("GGML_REMOTE_EP_SCHED_DEAL")) {
-                if (strcmp(d, "static") != 0 && strcmp(d, "balance") != 0) {
-                    LLAMA_LOG_WARN("%s: ignoring unknown GGML_REMOTE_EP_SCHED_DEAL='%s'\n", __func__, d);
-                }
-                // P0: both modes use the same deterministic pure-function dealer
-            }
             if (mirror) {
                 LLAMA_LOG_WARN("%s: GGML_REMOTE_EP_SCHED=1 takes precedence over MIRROR; mirror disabled\n", __func__);
             }
@@ -884,6 +884,12 @@ bool llama_remote_ep_skip_weights_for_layer(int il) {
 bool llama_remote_ep_sched_pure_for_layer(int il) {
     remote_ep_state & st = remote_ep_get();
     return st.enabled && st.sched && st.sched_klocal == 0 && st.in_ranges(il);
+}
+
+bool llama_remote_ep_sched_hot_compatible(int il) {
+    remote_ep_state & st = remote_ep_get();
+    return st.enabled && st.in_ranges(il) && st.sched && st.sched_klocal == 0 &&
+        st.sched_weight_on_master && !st.pipe;
 }
 
 int llama_remote_ep_mirror_kremote(int il, int n_expert_used) {
@@ -1815,6 +1821,37 @@ void llama_remote_ep_sched_send_cb(ggml_tensor * dst, int ith, int nth, void * u
         GGML_ABORT("%s: layer %d: previous sched request (layer %d, stream %d) was never consumed", __func__, il, p.il, stream);
     }
 
+    p.hot_userdata = nullptr;
+    p.cold_active.clear();
+    p.hot_mask.clear();
+    if (dst->src[3] != nullptr && llama_remote_ep_sched_hot_compatible(il) &&
+            llama_hot_expert_remote_ep_enabled()) {
+        if (n_tokens != 1 || m_local != 0) {
+            GGML_ABORT("%s: layer %d: hot/remote EP requires one token and KLOCAL=0", __func__, il);
+        }
+        p.hot_userdata = llama_hot_expert_userdata(il);
+        p.cold_active.resize((size_t) k);
+        p.hot_mask.resize((size_t) k);
+        if (p.hot_userdata == nullptr || !llama_hot_expert_remote_ep_split(
+                    p.hot_userdata, p.cold_active.data(), p.hot_mask.data(), k)) {
+            GGML_ABORT("%s: layer %d: hot/remote EP slot split unavailable", __func__, il);
+        }
+        if (llama_hot_expert_markers_enabled()) {
+            static std::mutex marker_mtx;
+            static std::vector<uint8_t> marker_layers;
+            std::lock_guard<std::mutex> marker_lock(marker_mtx);
+            if ((int) marker_layers.size() <= il) {
+                marker_layers.resize((size_t) il + 1, 0);
+            }
+            if (!marker_layers[(size_t) il]) {
+                marker_layers[(size_t) il] = 1;
+                const int hot_slots = std::count(p.hot_mask.begin(), p.hot_mask.end(), (uint8_t) 1);
+                fprintf(stderr, "[hotmarker] remote-ep layer=%d hot_slots=%d cold_slots=%lld req4=1\n",
+                        il, hot_slots, (long long) k - hot_slots);
+            }
+        }
+    }
+
     const int32_t * ids = (const int32_t *) b->data;
     const float   * w   = (const float   *) c->data;
 
@@ -1868,6 +1905,7 @@ void llama_remote_ep_sched_send_cb(ggml_tensor * dst, int ith, int nth, void * u
     din.m_star      = m_local;
     din.ids         = ids;
     din.holders     = holder_data;
+    din.active_mask = p.hot_userdata != nullptr ? p.cold_active.data() : nullptr;
 
     llama_ep_dealer_plan & plan = p.plan;
     const int service_class = n_tokens <= 4 ? 0 : 1;
@@ -2275,60 +2313,80 @@ void llama_remote_ep_sched_merge_cb(ggml_tensor * dst, int ith, int nth, void * 
     const int64_t m_local = p.m_local;
     const int64_t n_embd  = p.n_embd;
 
-    // Response vectors are endpoint-grouped in (token, slot) order. Build a
-    // token prefix for each endpoint so token ranges can merge independently
-    // without sharing the old sequential endpoint cursors.
-    const size_t token_stride = (size_t) p.n_tokens + 1;
-    p.ep_token_base.assign(p.eps.size() * token_stride, 0);
-    for (size_t i = 0; i < p.eps.size(); ++i) {
-        size_t * base = p.ep_token_base.data() + i * token_stride;
-        for (int32_t token : p.plan.eps[i].token) {
-            ++base[(size_t) token + 1];
-        }
-        for (int64_t t = 0; t < p.n_tokens; ++t) {
-            base[(size_t) t + 1] += base[(size_t) t];
-        }
-    }
-
-    const int n_merge_threads = std::min<int64_t>(remote_ep_merge_threads(), p.n_tokens);
-    p.merge_cursors.assign((size_t) n_merge_threads * p.eps.size(), 0);
-    auto merge_range = [&](int task, int64_t t_first, int64_t t_last) {
-        size_t * cur_ep = p.merge_cursors.data() + (size_t) task * p.eps.size();
-        for (int64_t t = t_first; t < t_last; ++t) {
-            for (size_t i = 0; i < p.eps.size(); ++i) {
-                cur_ep[i] = p.ep_token_base[i * token_stride + (size_t) t];
+    if (p.hot_userdata != nullptr) {
+        GGML_ASSERT(p.n_tokens == 1 && pure && st.sched_weight_on_master && !st.pipe);
+        GGML_ASSERT(p.hot_mask.size() == (size_t) k);
+        p.hot_cold_slots.assign((size_t) k * n_embd, 0.0f);
+        std::vector<size_t> cursor(p.eps.size(), 0);
+        for (int64_t j = 0; j < k; ++j) {
+            if (p.hot_mask[(size_t) j]) {
+                if (p.plan.owner[(size_t) j] != 0xff) {
+                    GGML_ABORT("%s: layer %d: hot slot %lld was assigned remotely", __func__, il, (long long) j);
+                }
+                continue;
             }
-            float * acc = out + t * n_embd;
-            int64_t lp = 0; // local slots are ascending per token
-            for (int64_t j = 0; j < k; ++j) {
-                const uint8_t o = p.plan.owner[(size_t) t * k + j];
-                if (o == 0) {
-                    if (experts_l == nullptr) {
-                        GGML_ABORT("%s: layer %d: pure EP dealer assigned slot %lld to the master",
-                                __func__, il, (long long) j);
-                    }
-                    const float * v = experts_l + ((size_t) t * m_local + lp) * n_embd;
-                    const float wj = w[(size_t) t * k + j];
-                    ++lp;
-                    if (j == 0) {
-                        for (int64_t e = 0; e < n_embd; ++e) {
-                            acc[e] = v[e] * wj;
+            const uint8_t owner = p.plan.owner[(size_t) j];
+            if (owner == 0 || owner == 0xff) {
+                GGML_ABORT("%s: layer %d: cold slot %lld has no remote owner", __func__, il, (long long) j);
+            }
+            auto & pe = p.eps[(size_t) owner - 1];
+            const size_t idx = cursor[(size_t) owner - 1]++;
+            if (idx >= p.plan.eps[(size_t) owner - 1].token.size() ||
+                    pe.resp.size() != p.plan.eps[(size_t) owner - 1].token.size() * (size_t) n_embd) {
+                GGML_ABORT("%s: layer %d: endpoint %u RESP4 cursor/size mismatch", __func__, il, (unsigned) owner - 1);
+            }
+            const float * v = pe.resp.data() + idx * (size_t) n_embd;
+            float * cold_slot = p.hot_cold_slots.data() + (size_t) j * n_embd;
+            const float wj = w[j];
+            for (int64_t e = 0; e < n_embd; ++e) {
+                const volatile float product = v[e] * wj;
+                cold_slot[e] = product;
+            }
+        }
+        for (size_t i = 0; i < p.eps.size(); ++i) {
+            if (cursor[i] != p.plan.eps[i].token.size()) {
+                GGML_ABORT("%s: layer %d: endpoint %zu RESP4 was not consumed exactly", __func__, il, i);
+            }
+        }
+        llama_hot_expert_remote_ep_merge(
+            p.hot_userdata, out, p.hot_cold_slots.data(), (size_t) n_embd,
+            n_embd, k);
+    } else {
+        // Response vectors are endpoint-grouped in (token, slot) order. Build a
+        // token prefix for each endpoint so token ranges can merge independently
+        // without sharing the old sequential endpoint cursors.
+        const size_t token_stride = (size_t) p.n_tokens + 1;
+        p.ep_token_base.assign(p.eps.size() * token_stride, 0);
+        for (size_t i = 0; i < p.eps.size(); ++i) {
+            size_t * base = p.ep_token_base.data() + i * token_stride;
+            for (int32_t token : p.plan.eps[i].token) {
+                ++base[(size_t) token + 1];
+            }
+            for (int64_t t = 0; t < p.n_tokens; ++t) {
+                base[(size_t) t + 1] += base[(size_t) t];
+            }
+        }
+
+        const int n_merge_threads = std::min<int64_t>(remote_ep_merge_threads(), p.n_tokens);
+        p.merge_cursors.assign((size_t) n_merge_threads * p.eps.size(), 0);
+        auto merge_range = [&](int task, int64_t t_first, int64_t t_last) {
+            size_t * cur_ep = p.merge_cursors.data() + (size_t) task * p.eps.size();
+            for (int64_t t = t_first; t < t_last; ++t) {
+                for (size_t i = 0; i < p.eps.size(); ++i) {
+                    cur_ep[i] = p.ep_token_base[i * token_stride + (size_t) t];
+                }
+                float * acc = out + t * n_embd;
+                int64_t lp = 0; // local slots are ascending per token
+                for (int64_t j = 0; j < k; ++j) {
+                    const uint8_t o = p.plan.owner[(size_t) t * k + j];
+                    if (o == 0) {
+                        if (experts_l == nullptr) {
+                            GGML_ABORT("%s: layer %d: pure EP dealer assigned slot %lld to the master",
+                                    __func__, il, (long long) j);
                         }
-                    } else {
-                        for (int64_t e = 0; e < n_embd; ++e) {
-                            acc[e] += v[e] * wj;
-                        }
-                    }
-                } else {
-                    auto & pe = p.eps[(size_t) o - 1];
-                    const size_t idx = cur_ep[(size_t) o - 1]++;
-                    const float * response = st.pipe
-                        ? reinterpret_cast<const float *>(
-                              pe.preq->resp_payload.data() + sizeof(llama_ep_resp3_header))
-                        : pe.resp.data();
-                    const float * v = response + idx * (size_t) n_embd;
-                    if (st.sched_weight_on_master) {
+                        const float * v = experts_l + ((size_t) t * m_local + lp) * n_embd;
                         const float wj = w[(size_t) t * k + j];
+                        ++lp;
                         if (j == 0) {
                             for (int64_t e = 0; e < n_embd; ++e) {
                                 acc[e] = v[e] * wj;
@@ -2338,35 +2396,55 @@ void llama_remote_ep_sched_merge_cb(ggml_tensor * dst, int ith, int nth, void * 
                                 acc[e] += v[e] * wj;
                             }
                         }
-                    } else if (j == 0) {
-                        memcpy(acc, v, (size_t) n_embd * sizeof(float));
                     } else {
-                        for (int64_t e = 0; e < n_embd; ++e) {
-                            acc[e] += v[e];
+                        auto & pe = p.eps[(size_t) o - 1];
+                        const size_t idx = cur_ep[(size_t) o - 1]++;
+                        const float * response = st.pipe
+                            ? reinterpret_cast<const float *>(
+                                  pe.preq->resp_payload.data() + sizeof(llama_ep_resp3_header))
+                            : pe.resp.data();
+                        const float * v = response + idx * (size_t) n_embd;
+                        if (st.sched_weight_on_master) {
+                            const float wj = w[(size_t) t * k + j];
+                            if (j == 0) {
+                                for (int64_t e = 0; e < n_embd; ++e) {
+                                    acc[e] = v[e] * wj;
+                                }
+                            } else {
+                                for (int64_t e = 0; e < n_embd; ++e) {
+                                    acc[e] += v[e] * wj;
+                                }
+                            }
+                        } else if (j == 0) {
+                            memcpy(acc, v, (size_t) n_embd * sizeof(float));
+                        } else {
+                            for (int64_t e = 0; e < n_embd; ++e) {
+                                acc[e] += v[e];
+                            }
                         }
                     }
                 }
             }
-        }
-    };
+        };
 
-    if (n_merge_threads == 1 || p.n_tokens < 64) {
-        merge_range(0, 0, p.n_tokens);
-    } else {
-        llama_ep_parallel_for * merge_pool = nullptr;
-        {
-            std::lock_guard<std::mutex> pools_lock(st.merge_pools_mtx);
-            auto & pool = st.merge_pools[stream];
-            if (!pool) {
-                pool = std::make_unique<llama_ep_parallel_for>(remote_ep_merge_threads());
+        if (n_merge_threads == 1 || p.n_tokens < 64) {
+            merge_range(0, 0, p.n_tokens);
+        } else {
+            llama_ep_parallel_for * merge_pool = nullptr;
+            {
+                std::lock_guard<std::mutex> pools_lock(st.merge_pools_mtx);
+                auto & pool = st.merge_pools[stream];
+                if (!pool) {
+                    pool = std::make_unique<llama_ep_parallel_for>(remote_ep_merge_threads());
+                }
+                merge_pool = pool.get();
             }
-            merge_pool = pool.get();
+            merge_pool->run(n_merge_threads, [&](int task, int n_tasks) {
+                const int64_t first = p.n_tokens * task       / n_tasks;
+                const int64_t last  = p.n_tokens * (task + 1) / n_tasks;
+                merge_range(task, first, last);
+            });
         }
-        merge_pool->run(n_merge_threads, [&](int task, int n_tasks) {
-            const int64_t first = p.n_tokens * task       / n_tasks;
-            const int64_t last  = p.n_tokens * (task + 1) / n_tasks;
-            merge_range(task, first, last);
-        });
     }
 
     const int64_t done_n_tokens = p.n_tokens;
@@ -2379,6 +2457,7 @@ void llama_remote_ep_sched_merge_cb(ggml_tensor * dst, int ith, int nth, void * 
     p.active  = false;
     p.hidden  = nullptr;
     p.weights = nullptr;
+    p.hot_userdata = nullptr;
     if (st.pipe && (p.pipe_reserved.bytes > 0 || p.pipe_reserved.requests > 0)) {
         {
             std::lock_guard<std::mutex> pipe_lock(st.pipe_mtx);

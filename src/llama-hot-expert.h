@@ -9,15 +9,15 @@
 // weight zeroed) and launches the hot expert FFN on the GPU asynchronously;
 // the CPU chain computes only the cold slots (sentinel ids are skipped by the
 // repack mmid, so hot expert weights are never read from DRAM); a merge op
-// waits on the backend event and adds the GPU partial. No scheduler splits,
-// no host sync on the critical path beyond one event wait per layer.
+// waits on the backend event and combines the hot/cold slots. No scheduler
+// splits, no host sync on the critical path beyond one event wait per layer.
 //
-// Numerics: the cold (CPU) partial is bit-identical to the baseline chain
-// (skipped slots contribute exact +0.0f in the same ascending slot order).
-// The hot partial is computed by CUDA kernels and is not bit-identical to the
-// CPU repack kernels (different accumulation), same class of difference as
-// running those experts with -ot on GPU.
+// Numerics: the default slot-order merge restores the baseline router-slot
+// reduction order. Hot expert FFNs are still not bit-identical to the CPU
+// repack kernels, the same class of difference as -ot GPU execution.
 
+#include <cstddef>
+#include <cstdint>
 #include <string>
 
 struct ggml_tensor;
@@ -28,7 +28,11 @@ struct ggml_tensor;
 //      GGML_HOT_EXPERT_K=16         experts pinned per layer
 //      GGML_HOT_EXPERT_DEV=CUDA1    device that hosts the hot experts
 //      GGML_HOT_EXPERT_LAYERS=all   comma list / ranges, e.g. "42" or "30-42"
-//      GGML_HOT_EXPERT_MAX_TOKENS=1 max n_tokens for the GPU fork (tg path)
+//      GGML_HOT_EXPERT_MAX_TOKENS=1 max n_tokens for the GPU fork (currently clamped to 1)
+//      GGML_HOT_EXPERT_PACKED_IO=1  coalesce x/ids/weights into one H2D (default on)
+//      GGML_HOT_EXPERT_SLOT_ORDER=1 return per-slot GPU output and restore the baseline fold (default on)
+//      GGML_HOT_EXPERT_SLOT_MERGE_AVX512=1 use AVX512 strict slot merge when supported (default on)
+//      GGML_HOT_EXPERT_REMOTE_EP=1  let strict pure remote EP dispatch only cold slots (default off)
 
 bool llama_hot_expert_enabled();
 
@@ -45,6 +49,13 @@ bool llama_hot_expert_layer_active(int il);
 // max n_tokens handled by the GPU fork (GGML_HOT_EXPERT_MAX_TOKENS)
 int64_t llama_hot_expert_max_tokens();
 
+// use the strict router-slot merge; false selects the legacy two-partial merge
+bool llama_hot_expert_slot_order_enabled();
+
+// opt-in bridge for one-token strict pure remote EP
+bool llama_hot_expert_remote_ep_enabled();
+bool llama_hot_expert_markers_enabled();
+
 // userdata for the custom op callbacks of layer il (nullptr if inactive)
 void * llama_hot_expert_userdata(int il);
 
@@ -52,3 +63,35 @@ void * llama_hot_expert_userdata(int il);
 void llama_hot_expert_mask_ids_cb(struct ggml_tensor * dst, const struct ggml_tensor * ids, int ith, int nth, void * userdata);
 void llama_hot_expert_send_cb(struct ggml_tensor * dst, const struct ggml_tensor * x, const struct ggml_tensor * ids, const struct ggml_tensor * w, int ith, int nth, void * userdata);
 void llama_hot_expert_merge_cb(struct ggml_tensor * dst, const struct ggml_tensor * send, const struct ggml_tensor * cold, int ith, int nth, void * userdata);
+
+// Called after send_cb. Copies the runtime slot split used by the GPU graph.
+// cold_active is 1 for slots that remote EP must dispatch.
+bool llama_hot_expert_remote_ep_split(
+        void * userdata, uint8_t * cold_active, uint8_t * hot_mask, int64_t n_slots);
+
+// Waits for the GPU branch and left-folds hot slots with already-weighted
+// remote cold slots. cold has one n_embd-stride vector per router slot.
+void llama_hot_expert_remote_ep_merge(
+        void * userdata, float * dst, const float * cold, size_t cold_slot_stride,
+        int64_t n_embd, int64_t n_slots);
+
+// Strict F32 slot fold shared by the callback and its model-independent test.
+// Strides are in float elements. Cold is already weighted; hot is multiplied
+// by weights before each add.
+void llama_hot_expert_merge_slots_f32(
+        float * dst, const float * cold, size_t cold_slot_stride,
+        const float * hot, size_t hot_slot_stride, const float * weights,
+        const uint8_t * hot_mask, int64_t n_embd, int64_t n_slots);
+
+// Explicit paths for bit-exact tests and microbenchmarks. The AVX512 function
+// returns false without writing dst when the current build/CPU cannot run it.
+void llama_hot_expert_merge_slots_f32_scalar(
+        float * dst, const float * cold, size_t cold_slot_stride,
+        const float * hot, size_t hot_slot_stride, const float * weights,
+        const uint8_t * hot_mask, int64_t n_embd, int64_t n_slots);
+bool llama_hot_expert_merge_slots_f32_avx512(
+        float * dst, const float * cold, size_t cold_slot_stride,
+        const float * hot, size_t hot_slot_stride, const float * weights,
+        const uint8_t * hot_mask, int64_t n_embd, int64_t n_slots);
+bool llama_hot_expert_slot_merge_avx512_supported();
+bool llama_hot_expert_slot_merge_avx512_enabled();

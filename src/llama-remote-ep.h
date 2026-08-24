@@ -167,6 +167,11 @@ bool llama_remote_ep_mirror_fits(int64_t n_tokens, int64_t n_embd);
 // true when layer il is configured for strict scheduled pure EP (KLOCAL=0).
 bool llama_remote_ep_sched_pure_for_layer(int il);
 
+// true when the scheduled remote path can combine one-token CUDA hot slots
+// with strict KLOCAL=0 CPU workers. The first implementation requires sync
+// REQ4 so both domains are weighted and folded on the master.
+bool llama_remote_ep_sched_hot_compatible(int il);
+
 // number of expert slots computed locally per token for a scheduled layer.
 // 0 is a valid strict-pure-EP result; -1 means scheduling does not apply or CAP /
 // topology negotiation failed. The first call negotiates protocol v2 with every
