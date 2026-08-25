@@ -115,6 +115,10 @@ GPU-hot + CPU-remote-EP 现已在一个严格限定的端到端形态下通过�
 
 DSpark multi-token 桥接已进一步扩展到1-4 target tokens，REQ4 mask和严格merge均使用`[token,slot]`布局。K24是唯一通过质量门的热专家数：5-chunk PPL 2.7647 -> 2.7412。但warm server实测中，NMAX=3仅35.251 -> 35.950 tok/s（+1.98%）；NMAX=2的两个独立B进程六轮均值为36.353，对A=34.645提升**4.928%**、CV=2.466%，比预设5%门低0.072个百分点。因此该路径保留default-off研究开关，不替换生产默认，也不声称达到40 tok/s。
 
+MAX_EFFORT e128 副本图（worker 可重叠持有专家）的正式门也已实测：ABBABAAB 八轮中 strict 与 max 两种 placement 生成**相同正文 hash**、5-chunk PPL **完全相同**（2.7520 对 2.7520），paired TG 29.633 -> 30.575 tok/s（+3.18%，B CV 1.08%），即副本模式数值透明；但新二进制的 legacy-finite v3 E8M0 合同使整体 PPL 相对旧合同冻结基线 2.7412 漂移 +0.394%，越过 0.3% 门，候选保持 default-off。结论：“谁持有专家”本身不改变有效模型，但任何 value-contract 变更都必须重新过质量门、不得沿用旧合同基线。
+
+另一项“每 host 一个 256 专家 EPD、机内跨双 NUMA 行窗 TP”的二级拓扑原型通过功能与 RDMA 门（每机权重仍只有一份），但 TG512=30.65 低于 flat 四路约 31.8，64-token 诊断中 remote wait +52.39%；已否决“两个 NUMA 串在单个 EPD 请求临界路径”的实现，下一版需让机内两个 NUMA 执行队列真正并发。
+
 进一步的UPE消融仅对`hot_expert.*`启用CPU Q8_0同款RNE code生成，将真实激活的CPU/GPU code mismatch从33/10,144降到0（scale仍0 mismatch）；相同code后普通MXFP4算子仍有约2.29e-7–4.80e-7相对误差，来源转为CUDA warp归约。NMAX=2 warm-server A-B-B-A中，普通路径为35.0614±0.2720，CPU-Q8候选为37.9573±0.4868 tok/s（+8.2595%），acceptance从266/490变为273/474，两边各自hash稳定但轨迹不同。候选5-chunk PPL却为2.7855，比原strict-hot 2.7412差1.62%、比no-hot 2.7647差0.75%，超过0.3%门，且绝对速度仍低于40。因此`GGML_CUDA_HOT_MXFP4_CPU_Q8`继续默认关闭、生产REJECT；该结果说明code一致和acceptance改善都不能替代无DSpark质量门。
 
 ### 7. 统一精度引擎：混合 EP 的数值与数据控制面
@@ -137,6 +141,8 @@ CPU AVX512、CUDA MMVQ和远端worker即使读取相同逻辑权重，也可能�
 
 另一个更强的反例来自hot-scoped CPU-Q8：它把produced activation code差异完全清零，并在warm-server中同时提高速度与accepted tokens，但PPL反而显著越门。UPE因此不能停在code/scale合同；partial accumulation、epilogue、完整expert输出和无投机质量仍是独立发布条件。
 
+跨设备差异也不限于 CPU 与 GPU：同一 Qwen2.5-0.5B Q4_K_M 权重在 scalar、AVX2、AVX-512（VNNI 匹配对）、CUDA 与同卡 Vulkan 六 cell 上各自重复确定，但 fixed-token same-top 为 96.1%–100%、任务答案可翻转；编译期 strict 反事实链把首差瀑布推进为 Q5 dot → RoPE → Q8 V 投影 → attention QK 归约。该线为探索性数值审计（本地研究脚手架，不进公开 headline），结论是 ISA/backend 本身构成有效模型的一部分，混合 EP 的每一步 placement 都必须携带数值合同。
+
 ## 内核发展路线
 
 ### AVX512 repack：先让所有 MoE 分支进入批量内核
@@ -152,8 +158,8 @@ arec（activation record）把 Q8 激活和 scale 预计算一次，随后让权
 
 ### 融合和异步边界
 
-- DSV4 router 的 5-kernel 链融合为单 warp kernel，小行 indexer top-k 合并为单 radix kernel；GPU busy 18.76 -> 18.23 ms/token，raw/no-DSpark tg 25.15 -> 25.91；
-- pinned staging + event drain 将 CPU input readback 从 13 降到 4.6 ms/token；
+- DSV4 router 的 5-kernel 链融合为单 warp kernel，小行 indexer top-k 合并为单 radix kernel；GPU busy 18.76 -> 18.23 ms/token，历史 raw/no-DSpark tg 25.15 -> 25.91 来自当时受污染的 UDNL_MX 文件，只证明 router/top-k 小 kernel launch 是可见的 Amdahl 项，不作为修复格式的正式端到端增益；
+- pinned staging + event drain 将 CPU input readback 从 13 降到 4.6 ms/token，但首次端到端测试未见稳定提升；早期 CUPTI 记录遗漏 graph 内 kernel，曾误判为“无收益”，这提醒 profiler 必须理解 CUDA graph；
 - MXFP4 repack GEMV 软件预取带来 +2.6% raw/no-DSpark TG；
 - 64 行 claim 与 UDNL 尾行批量化把 DSpark speculative n2/p0 从 26.50 提升到 30.10 tok/s，同时保持接受率和输出一致。
 
@@ -171,7 +177,7 @@ GPU 侧没有照搬 CPU x8。一个零增容 MXFP4 `E8M0-plane + code-plane` 候
 
 ### “Q2_K 为什么比预期慢”的起点
 
-最初一个名为 `Q2_K` 的 90.9 GiB 模型只有 223.60 pp2048 和 22.87 raw/no-DSpark tg512。它的 TG 反而低于更大的 Q3_R（25.30 tok/s），虽然 PP 高于尚未充分优化 GEMM 的 Q3_R（174.60 tok/s）。读取 GGUF metadata 后又发现它实际是 IQ2_XXS（2.0625 bpw），并非 Q2_K。这个“Q2_K < Q3_K”现象最终被拆成格式标注和算子效率两个问题：文件更小不代表推理更快，码本查找、scale 展开、反量化长度以及是否能进入批量 GEMM，都会比名义 bpw 更早成为瓶颈。
+最初一个名为 `Q2_K` 的 90.9 GiB 模型只有 223.60 pp2048 和 22.87 raw/no-DSpark tg512。它的 TG 反而低于更大的 Q3_R（25.07 tok/s），虽然 PP 高于尚未充分优化 GEMM 的 Q3_R（146.69 tok/s）。读取 GGUF metadata 后又发现它实际是 IQ2_XXS（2.0625 bpw），并非 Q2_K。这个“Q2_K < Q3_K”现象最终被拆成格式标注和算子效率两个问题：文件更小不代表推理更快，码本查找、scale 展开、反量化长度以及是否能进入批量 GEMM，都会比名义 bpw 更早成为瓶颈。
 
 于是格式设计从“最少比特”转向“存储布局服从内核访问顺序”：
 

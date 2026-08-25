@@ -115,6 +115,10 @@ An eight-token verbose diagnostic checks structure only and is not a performance
 
 The DSpark bridge now supports one to four target tokens with `[token,slot]` REQ4 masks and strict merges. K24 is the only tested hot count that passes the quality gate: five-chunk PPL changes from 2.7647 to 2.7412. Warm-server performance is only 35.251 -> 35.950 tok/s (+1.98%) at NMAX=3. At NMAX=2, six B runs across two independent server processes average 36.353 tok/s versus A=34.645, a **4.928%** gain with 2.466% CV. This misses the frozen 5% gate by 0.072 percentage points, so the path remains default-off, does not replace the production default, and is not claimed to reach 40 tok/s.
 
+The formal MAX_EFFORT e128 replica-map gate (workers may hold overlapping experts) is also measured: across eight ABBABAAB runs, the strict and max placements produce the **same body hash** and an **identical** five-chunk PPL (2.7520 versus 2.7520), with paired TG 29.633 -> 30.575 tok/s (+3.18%, B CV 1.08%), so replica placement is numerically transparent. However, the new binary's legacy-finite v3 E8M0 contract shifts overall PPL by +0.394% versus the frozen old-contract baseline of 2.7412, which exceeds the 0.3% gate, so the candidate stays default-off. Conclusion: who holds an expert does not change the effective model, but every value-contract change must re-pass the quality gate and cannot reuse the old baseline.
+
+A two-level prototype with one 256-expert EPD per host and row-window TP across the two internal NUMA nodes passes its functional and RDMA gates (each machine still holds one copy of the weights), but its TG512 of 30.65 is below the flat four-worker value of about 31.8 and remote wait grows by 52.39% in the 64-token diagnostic. This rejects serializing two NUMA nodes on one EPD request critical path; the next version must provide two truly concurrent in-host NUMA queues.
+
 A stricter UPE ablation applies CPU-Q8_0-style RNE code generation only to `hot_expert.*`. It reduces real activation code mismatches from 33/10,144 to zero while scale mismatches remain zero; with identical codes, ordinary MXFP4 operators still show about 2.29e-7–4.80e-7 relative error from CUDA warp reduction. In an NMAX=2 warm-server A-B-B-A, the ordinary path is 35.0614±0.2720 and the CPU-Q8 candidate is 37.9573±0.4868 tok/s (+8.2595%); acceptance changes from 266/490 to 273/474, with stable hashes inside each path but different trajectories. Candidate five-chunk PPL is nevertheless 2.7855, 1.62% worse than strict-hot 2.7412 and 0.75% worse than no-hot 2.7647, beyond the 0.3% gate, while absolute speed remains below 40. `GGML_CUDA_HOT_MXFP4_CPU_Q8` therefore stays default-off and is rejected for production. Code agreement and improved acceptance do not replace a non-speculative quality gate.
 
 ### 7. Unified Precision Engine: the numerical and data control plane of hybrid EP
@@ -137,6 +141,8 @@ Real extreme blocks remain accumulation-order sensitive, so `GGML_HOT_EXPERT_EXC
 
 The hot-scoped CPU-Q8 result is a stronger counterexample: it eliminates produced activation-code differences and improves both warm-server speed and accepted tokens, yet PPL regresses beyond the quality gate. UPE therefore cannot stop at a code/scale contract; partial accumulation, epilogue, complete expert output, and non-speculative quality remain independent publication conditions.
 
+Cross-device divergence is not limited to CPU versus GPU either. The same Qwen2.5-0.5B Q4_K_M weights are repeatable in six cells (scalar, AVX2, an AVX-512 VNNI matched pair, CUDA, and Vulkan on the same card), yet fixed-token same-top spans 96.1%-100% and task answers can flip; a compile-time strict counterfactual chain advances the first divergence from the Q5 dot through RoPE and the Q8 V projection to the attention QK reduction. This line is an exploratory numerical audit (a local research scaffold, not a public headline): ISA and backend are themselves part of the effective model, so every hybrid-EP placement step must carry a numerical contract.
+
 ## Kernel evolution
 
 ### AVX512 repack: route every MoE shape into a batch kernel
@@ -152,8 +158,8 @@ An arec (activation record) precomputes the Q8 activation and scale once. Weight
 
 ### Fusion and asynchronous boundaries
 
-- the five-kernel DSV4 router chain becomes one single-warp kernel, and small-row indexer top-k becomes one radix kernel; GPU busy time falls from 18.76 to 18.23 ms/token and raw/no-DSpark tg rises from 25.15 to 25.91;
-- pinned staging plus event draining cuts CPU input readback from 13 to 4.6 ms/token;
+- the five-kernel DSV4 router chain becomes one single-warp kernel, and small-row indexer top-k becomes one radix kernel; GPU busy time falls from 18.76 to 18.23 ms/token; the historical raw/no-DSpark tg of 25.15 -> 25.91 came from the then-contaminated UDNL_MX file, so it only shows that router/top-k kernel launches are a visible Amdahl term and is not a formal gain for the fixed format;
+- pinned staging plus event draining cuts CPU input readback from 13 to 4.6 ms/token, but the first end-to-end test showed no stable gain; early CUPTI records missed kernels inside graphs and once mistook this for "no effect", a reminder that profilers must understand CUDA graphs;
 - MXFP4 repack GEMV software prefetch adds 2.6% raw/no-DSpark TG;
 - 64-row claims and UDNL tail batching improve DSpark speculative n2/p0 from 26.50 to 30.10 tok/s without changing acceptance or output.
 
@@ -171,7 +177,7 @@ A subsequent multi-token gate/up + DSV4-clamp + GLU fusion improves the complete
 
 ### The “why is Q2_K slower than expected?” starting point
 
-An initial 90.9 GiB model named `Q2_K` reached only 223.60 pp2048 and 22.87 raw/no-DSpark tg512. Its TG was below the larger Q3_R at 25.30 tok/s, although its PP was above the not-yet-optimized Q3_R GEMM path at 174.60 tok/s. GGUF metadata then revealed that it was actually IQ2_XXS at 2.0625 bpw, not Q2_K. The apparent “Q2_K < Q3_K” result therefore separated into a labeling problem and a kernel-efficiency problem: codebook lookup, scale expansion, dequantization-chain length, and access to batch GEMM can dominate nominal bpw.
+An initial 90.9 GiB model named `Q2_K` reached only 223.60 pp2048 and 22.87 raw/no-DSpark tg512. Its TG was below the larger Q3_R at 25.07 tok/s, although its PP was above the not-yet-optimized Q3_R GEMM path at 146.69 tok/s. GGUF metadata then revealed that it was actually IQ2_XXS at 2.0625 bpw, not Q2_K. The apparent “Q2_K < Q3_K” result therefore separated into a labeling problem and a kernel-efficiency problem: codebook lookup, scale expansion, dequantization-chain length, and access to batch GEMM can dominate nominal bpw.
 
 The format work therefore moves from “fewest bits” to storage layouts that follow the kernel access order:
 
