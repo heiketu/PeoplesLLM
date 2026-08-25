@@ -1930,7 +1930,7 @@ static void udnl_mx_quantize_panel(const float * GGML_RESTRICT x, block_udnl_mx 
             }
             if (quant_weights) {
                 const float sigma2 = 2*sumx2/QK_UDNL_MX;
-                const float * qw = quant_weights + r*n_per_row + QK_UDNL_MX*i;
+                const float * qw = quant_weights + QK_UDNL_MX*i;
                 for (int j = 0; j < QK_UDNL_MX/32; ++j) {
                     for (int v = 0; v < 32; ++v) {
                         wt[r][j][v] = qw[32*j + v]*sqrtf(sigma2 + xs[r][32*j + v]*xs[r][32*j + v]);
@@ -1941,7 +1941,7 @@ static void udnl_mx_quantize_panel(const float * GGML_RESTRICT x, block_udnl_mx 
 
         // per (row, group, mode) candidate step + panel-summed error
         float step[16][8][3];
-        float E[8][3] = {};
+        float E[8][3] = {{0}};
         for (int64_t r = 0; r < nr; ++r) {
             for (int g = 0; g < 8; ++g) {
                 const float * wtg = quant_weights ? wt[r][g] : NULL;
@@ -2100,16 +2100,14 @@ size_t quantize_udnl_mx(const float * GGML_RESTRICT src, void * GGML_RESTRICT ds
     const size_t row_size = ggml_row_size(GGML_TYPE_UDNL_MX, n_per_row);
     int64_t row = 0;
     for (; row + 16 <= nrow; row += 16) {
-        udnl_mx_quantize_panel(src + row*n_per_row, (block_udnl_mx *) ((char *) dst + row*row_size), 16, n_per_row,
-                quant_weights ? quant_weights + row*n_per_row : NULL);
+        udnl_mx_quantize_panel(src + row*n_per_row, (block_udnl_mx *) ((char *) dst + row*row_size), 16, n_per_row, quant_weights);
     }
     if (row < nrow) {
         // tail rows: quantized independently. A tensor whose row count is not a
         // multiple of 16 never takes the NR16 repack path, so the resulting
         // non-uniform panel mode words are harmless.
         for (; row < nrow; ++row) {
-            udnl_mx_quantize_panel(src + row*n_per_row, (block_udnl_mx *) ((char *) dst + row*row_size), 1, n_per_row,
-                    quant_weights ? quant_weights + row*n_per_row : NULL);
+            udnl_mx_quantize_panel(src + row*n_per_row, (block_udnl_mx *) ((char *) dst + row*row_size), 1, n_per_row, quant_weights);
         }
     }
     return nrow * row_size;

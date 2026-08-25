@@ -33,6 +33,17 @@
 
 namespace {
 
+struct hot_shadow_stat {
+    uint64_t vectors = 0;
+    uint64_t elements = 0;
+    double sum_abs = 0.0;
+    double sum_sq_err = 0.0;
+    double sum_sq_cpu = 0.0;
+    double sum_sq_gpu = 0.0;
+    double dot = 0.0;
+    float max_abs = 0.0f;
+};
+
 struct hot_layer {
     int il = -1;
 
@@ -43,13 +54,19 @@ struct hot_layer {
 
     // remap[global expert] -> compact slot, or -1 if the expert is cold
     std::vector<int32_t> remap;
+    std::vector<int32_t> compact_expert;
+    std::vector<hot_shadow_stat> shadow_stats;
+    hot_shadow_stat shadow_layer_stat;
+    std::vector<float> shadow_cpu_output;
+    std::vector<uint8_t> shadow_zero_mask;
+    std::vector<uint8_t> merge_hot_mask;
 
     float clamp_limit = 0.0f;
 
     // device-side objects
-    ggml_tensor * x_gpu       = nullptr; // [n_embd, 1, 1]  f32
-    ggml_tensor * ids_gpu     = nullptr; // [K_used, 1]     i32 (remapped, cold slots point at slot 0)
-    ggml_tensor * w_gpu       = nullptr; // [1, K_used, 1]  f32 (cold slots zeroed)
+    ggml_tensor * x_gpu       = nullptr; // [n_embd, 1, max_tokens]  f32
+    ggml_tensor * ids_gpu     = nullptr; // [K_used, max_tokens]     i32 (remapped, cold slots point at slot 0)
+    ggml_tensor * w_gpu       = nullptr; // [1, K_used, max_tokens]  f32 (cold slots zeroed)
     ggml_tensor * input_gpu   = nullptr; // byte view over the packed x/ids/weights region
     ggml_tensor * output_gpu  = nullptr; // partial [n_embd, 1] or slots [n_embd, K_used, 1]
 
@@ -69,6 +86,7 @@ struct hot_layer {
     float *               h_output = nullptr;
     std::vector<uint8_t>   h_hot_mask;
     std::unique_ptr<std::atomic<bool>> remote_inflight;
+    int64_t active_tokens = 0;
 
     size_t input_ids_offset = 0;
     size_t input_w_offset   = 0;
@@ -80,6 +98,8 @@ struct hot_state {
     bool enabled = false;
     bool markers = false;
     bool remote_ep = false;
+    bool shadow = false;
+    bool verify_cpu = false;
 
     std::string table_path;
     std::string gguf_path;
@@ -87,6 +107,7 @@ struct hot_state {
     int K = 16;
     int64_t max_tokens = 1;
     std::string layers_spec = "all";
+    std::string shadow_file;
 
     ggml_backend_dev_t dev = nullptr;
     ggml_backend_t     backend = nullptr;
@@ -111,6 +132,42 @@ std::string env_str(const char * name, const std::string & dflt) {
 int env_int(const char * name, int dflt) {
     const char * e = getenv(name);
     return e ? atoi(e) : dflt;
+}
+
+bool apply_expert_exclusions(
+        std::map<int, std::map<int, int64_t>> & table,
+        const std::string                     & spec) {
+    if (spec.empty()) {
+        return true;
+    }
+    size_t pos = 0;
+    while (pos <= spec.size()) {
+        const size_t comma = spec.find(',', pos);
+        const std::string token = spec.substr(pos,
+            comma == std::string::npos ? std::string::npos : comma - pos);
+        int layer = -1;
+        int expert = -1;
+        char trailing = '\0';
+        if (sscanf(token.c_str(), "%d:%d%c", &layer, &expert, &trailing) != 2 ||
+                layer < 0 || expert < 0) {
+            LLAMA_LOG_ERROR("%s: malformed GGML_HOT_EXPERT_EXCLUDE token '%s' (want layer:expert)\n",
+                __func__, token.c_str());
+            return false;
+        }
+        auto layer_it = table.find(layer);
+        if (layer_it == table.end() || layer_it->second.erase(expert) != 1) {
+            LLAMA_LOG_ERROR("%s: exclusion %d:%d is absent from the hot table\n",
+                __func__, layer, expert);
+            return false;
+        }
+        LLAMA_LOG_INFO("%s: forcing layer %d expert %d to the CPU/cold domain\n",
+            __func__, layer, expert);
+        if (comma == std::string::npos) {
+            break;
+        }
+        pos = comma + 1;
+    }
+    return true;
 }
 
 size_t align_256(size_t value) {
@@ -250,6 +307,8 @@ bool build_layer(hot_layer & L, FILE * gguf_file, struct gguf_context * gctx, si
         L.remap[ranked[s].second] = s;
     }
     L.K = K;
+    L.compact_expert.assign(slot_expert.begin(), slot_expert.end());
+    L.shadow_stats.resize((size_t) K);
 
     ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(g_hot.dev);
 
@@ -279,11 +338,14 @@ bool build_layer(hot_layer & L, FILE * gguf_file, struct gguf_context * gctx, si
     ggml_tensor * Wg = ggml_new_tensor_3d(L.gctx, GGML_TYPE_MXFP4, L.n_embd, L.n_ff, K);
     ggml_tensor * Wu = ggml_new_tensor_3d(L.gctx, GGML_TYPE_MXFP4, L.n_embd, L.n_ff, K);
     ggml_tensor * Wd = ggml_new_tensor_3d(L.gctx, GGML_TYPE_MXFP4, L.n_ff, L.n_embd, K);
+    ggml_format_name(Wg, "hot_expert.gate.%d", L.il);
+    ggml_format_name(Wu, "hot_expert.up.%d", L.il);
+    ggml_format_name(Wd, "hot_expert.down.%d", L.il);
 
     const int64_t k_used = g_hot.n_expert_used;
-    L.x_gpu   = ggml_new_tensor_3d(L.gctx, GGML_TYPE_F32, L.n_embd, 1, 1);
-    L.ids_gpu = ggml_new_tensor_2d(L.gctx, GGML_TYPE_I32, k_used, 1);
-    L.w_gpu   = ggml_new_tensor_3d(L.gctx, GGML_TYPE_F32, 1, k_used, 1);
+    L.x_gpu   = ggml_new_tensor_3d(L.gctx, GGML_TYPE_F32, L.n_embd, 1, g_hot.max_tokens);
+    L.ids_gpu = ggml_new_tensor_2d(L.gctx, GGML_TYPE_I32, k_used, g_hot.max_tokens);
+    L.w_gpu   = ggml_new_tensor_3d(L.gctx, GGML_TYPE_F32, 1, k_used, g_hot.max_tokens);
 
     L.input_ids_offset = align_256(ggml_nbytes(L.x_gpu));
     L.input_w_offset   = align_256(L.input_ids_offset + ggml_nbytes(L.ids_gpu));
@@ -380,7 +442,10 @@ bool build_layer(hot_layer & L, FILE * gguf_file, struct gguf_context * gctx, si
     L.h_ids     = (int32_t *) ((uint8_t *) L.h_base + L.input_ids_offset);
     L.h_w       = (float *)   ((uint8_t *) L.h_base + L.input_w_offset);
     L.h_output  = (float *)   ((uint8_t *) L.h_base + L.input_bytes);
-    L.h_hot_mask.resize(k_used);
+    L.h_hot_mask.resize((size_t) k_used * g_hot.max_tokens);
+    L.shadow_cpu_output.resize((size_t) L.n_embd * g_hot.max_tokens);
+    L.shadow_zero_mask.resize((size_t) k_used * g_hot.max_tokens, 0);
+    L.merge_hot_mask.resize((size_t) k_used * g_hot.max_tokens, 0);
     L.remote_inflight.reset(new std::atomic<bool>(false));
 
     L.event = ggml_backend_event_new(g_hot.dev);
@@ -441,6 +506,29 @@ void merge_slots_f32_scalar_rows(
     }
 }
 
+void merge_raw_tokens_f32_scalar(
+        float * dst, const float * const * cold, const float * hot, const float * weights,
+        const uint8_t * hot_mask, int64_t n_embd, int64_t n_tokens, int64_t n_slots,
+        int64_t row_begin, int64_t row_end) {
+    for (int64_t token = 0; token < n_tokens; ++token) {
+        for (int64_t row = row_begin; row < row_end; ++row) {
+            float acc = 0.0f;
+            for (int64_t slot = 0; slot < n_slots; ++slot) {
+                const size_t pos = (size_t) token*n_slots + slot;
+                const float * src = hot_mask[pos] ? hot + pos*(size_t) n_embd : cold[pos];
+                const volatile float product = src[row]*weights[pos];
+                if (slot == 0) {
+                    acc = product;
+                } else {
+                    const volatile float sum = acc + product;
+                    acc = sum;
+                }
+            }
+            dst[(size_t) token*n_embd + row] = acc;
+        }
+    }
+}
+
 #if LLAMA_HOT_EXPERT_HAVE_TARGET_AVX512
 __attribute__((target("avx512f")))
 void merge_slots_f32_avx512_impl(
@@ -479,6 +567,33 @@ void merge_slots_f32_avx512_impl(
     merge_slots_f32_scalar_rows(
         dst, cold, cold_slot_stride, hot, hot_slot_stride, weights,
         hot_mask, row_vec_end, n_embd, n_slots);
+}
+
+
+__attribute__((target("avx512f")))
+void merge_raw_tokens_f32_avx512_impl(
+        float * dst, const float * const * cold, const float * hot, const float * weights,
+        const uint8_t * hot_mask, int64_t n_embd, int64_t n_tokens, int64_t n_slots) {
+    const int64_t row_vec_end = n_embd & ~int64_t(15);
+    for (int64_t token = 0; token < n_tokens; ++token) {
+        for (int64_t row = 0; row < row_vec_end; row += 16) {
+            const size_t pos0 = (size_t) token*n_slots;
+            const float * src0 = hot_mask[pos0] ? hot + pos0*(size_t) n_embd : cold[pos0];
+            __m512 acc = _mm512_mul_ps(_mm512_loadu_ps(src0 + row), _mm512_set1_ps(weights[pos0]));
+            __asm__ volatile("" : "+v"(acc));
+            for (int64_t slot = 1; slot < n_slots; ++slot) {
+                const size_t pos = (size_t) token*n_slots + slot;
+                const float * src = hot_mask[pos] ? hot + pos*(size_t) n_embd : cold[pos];
+                __m512 term = _mm512_mul_ps(_mm512_loadu_ps(src + row), _mm512_set1_ps(weights[pos]));
+                __asm__ volatile("" : "+v"(term));
+                acc = _mm512_add_ps(acc, term);
+                __asm__ volatile("" : "+v"(acc));
+            }
+            _mm512_storeu_ps(dst + (size_t) token*n_embd + row, acc);
+        }
+    }
+    merge_raw_tokens_f32_scalar(
+        dst, cold, hot, weights, hot_mask, n_embd, n_tokens, n_slots, row_vec_end, n_embd);
 }
 #endif
 
@@ -543,6 +658,40 @@ void llama_hot_expert_merge_slots_f32(
         weights, hot_mask, n_embd, n_slots);
 }
 
+void llama_hot_expert_merge_tokens_f32(
+        float * dst, const float * cold, const float * hot, const float * weights,
+        const uint8_t * hot_mask, int64_t n_embd, int64_t n_tokens, int64_t n_slots) {
+    GGML_ASSERT(n_tokens > 0);
+    const size_t token_stride = (size_t) n_embd * n_slots;
+    const size_t weight_stride = (size_t) n_slots;
+    for (int64_t token = 0; token < n_tokens; ++token) {
+        llama_hot_expert_merge_slots_f32(
+            dst + (size_t) token * n_embd,
+            cold + (size_t) token * token_stride, (size_t) n_embd,
+            hot + (size_t) token * token_stride, (size_t) n_embd,
+            weights + (size_t) token * weight_stride,
+            hot_mask + (size_t) token * weight_stride,
+            n_embd, n_slots);
+    }
+}
+
+void llama_hot_expert_merge_raw_tokens_f32(
+        float * dst, const float * const * cold, const float * hot, const float * weights,
+        const uint8_t * hot_mask, int64_t n_embd, int64_t n_tokens, int64_t n_slots) {
+    GGML_ASSERT(dst != nullptr && cold != nullptr && hot != nullptr && weights != nullptr && hot_mask != nullptr);
+    GGML_ASSERT(n_embd > 0 && n_tokens > 0 && n_slots > 0);
+    for (int64_t pos = 0; pos < n_tokens*n_slots; ++pos) {
+        GGML_ASSERT(hot_mask[pos] || cold[pos] != nullptr);
+    }
+#if LLAMA_HOT_EXPERT_HAVE_TARGET_AVX512
+    if (llama_hot_expert_slot_merge_avx512_enabled()) {
+        merge_raw_tokens_f32_avx512_impl(dst, cold, hot, weights, hot_mask, n_embd, n_tokens, n_slots);
+        return;
+    }
+#endif
+    merge_raw_tokens_f32_scalar(dst, cold, hot, weights, hot_mask, n_embd, n_tokens, n_slots, 0, n_embd);
+}
+
 bool llama_hot_expert_enabled() {
     static const bool enabled = env_flag("GGML_HOT_EXPERT", false);
     return enabled;
@@ -555,6 +704,37 @@ bool llama_hot_expert_slot_order_enabled() {
 
 bool llama_hot_expert_remote_ep_enabled() {
     return g_hot.enabled && g_hot.remote_ep && llama_hot_expert_slot_order_enabled();
+}
+
+bool llama_hot_expert_remote_ep_shadow_enabled() {
+    return llama_hot_expert_remote_ep_enabled() && g_hot.shadow;
+}
+
+bool llama_hot_expert_upe_verify_cpu_enabled() {
+    return llama_hot_expert_remote_ep_enabled() && g_hot.verify_cpu;
+}
+
+void llama_hot_expert_remote_ep_cancel(void * userdata) {
+    hot_layer & layer = *(hot_layer *) userdata;
+    layer.active_tokens = 0;
+    layer.remote_inflight->store(false, std::memory_order_release);
+}
+
+static void shadow_stat_update(hot_shadow_stat & stat, const float * cpu, const float * gpu, int64_t n_embd) {
+    ++stat.vectors;
+    stat.elements += (uint64_t) n_embd;
+    for (int64_t row = 0; row < n_embd; ++row) {
+        const double cv = cpu[row];
+        const double gv = gpu[row];
+        const double diff = gv - cv;
+        const float abs_diff = (float) std::abs(diff);
+        stat.max_abs = std::max(stat.max_abs, abs_diff);
+        stat.sum_abs += abs_diff;
+        stat.sum_sq_err += diff*diff;
+        stat.sum_sq_cpu += cv*cv;
+        stat.sum_sq_gpu += gv*gv;
+        stat.dot += cv*gv;
+    }
 }
 
 bool llama_hot_expert_markers_enabled() {
@@ -593,10 +773,18 @@ bool llama_hot_expert_init(const float * swiglu_clamp_exp, int n_layer, int64_t 
     g_hot.n_expert_used = n_expert_used;
     g_hot.markers       = env_flag("GGML_HOT_EXPERT_MARKERS", false);
     g_hot.remote_ep     = env_flag("GGML_HOT_EXPERT_REMOTE_EP", false);
+    g_hot.shadow        = env_flag("GGML_HOT_EXPERT_REMOTE_EP_SHADOW", false);
+    g_hot.verify_cpu    = env_flag("GGML_HOT_EXPERT_UPE_VERIFY_CPU", false);
+    g_hot.shadow_file   = env_str("GGML_HOT_EXPERT_SHADOW_FILE", "");
 
-    if (g_hot.max_tokens > 1) {
-        LLAMA_LOG_WARN("%s: hot-expert graph supports max_tokens=1; clamping %" PRId64 " to 1\n", __func__, g_hot.max_tokens);
-        g_hot.max_tokens = 1;
+    if (g_hot.shadow && !g_hot.remote_ep) {
+        LLAMA_LOG_ERROR("%s: GGML_HOT_EXPERT_REMOTE_EP_SHADOW requires GGML_HOT_EXPERT_REMOTE_EP=1\n", __func__);
+        return false;
+    }
+
+    if (g_hot.max_tokens < 1 || g_hot.max_tokens > 4) {
+        LLAMA_LOG_WARN("%s: GGML_HOT_EXPERT_MAX_TOKENS must be in [1,4]; clamping %" PRId64 "\n", __func__, g_hot.max_tokens);
+        g_hot.max_tokens = std::max<int64_t>(1, std::min<int64_t>(4, g_hot.max_tokens));
     }
 
     if (g_hot.table_path.empty() || g_hot.gguf_path.empty()) {
@@ -611,6 +799,9 @@ bool llama_hot_expert_init(const float * swiglu_clamp_exp, int n_layer, int64_t 
     std::map<int, std::map<int, int64_t>> table;
     if (!load_table(g_hot.table_path, table)) {
         LLAMA_LOG_ERROR("%s: failed to read hot table %s\n", __func__, g_hot.table_path.c_str());
+        return false;
+    }
+    if (!apply_expert_exclusions(table, env_str("GGML_HOT_EXPERT_EXCLUDE", ""))) {
         return false;
     }
 
@@ -680,9 +871,9 @@ bool llama_hot_expert_init(const float * swiglu_clamp_exp, int n_layer, int64_t 
     on_exit([](int status, void *) { fflush(NULL); _exit(status); }, nullptr);
 #endif
 
-    LLAMA_LOG_INFO("%s: hot-expert offload active: %d layers, top-%d/layer on %s, ~%.1f MiB weights, slot_order=%d, slot_avx512=%d\n",
+    LLAMA_LOG_INFO("%s: hot-expert offload active: %d layers, top-%d/layer on %s, ~%.1f MiB weights, max_tokens=%" PRId64 ", slot_order=%d, slot_avx512=%d\n",
         __func__, n_built, g_hot.K, g_hot.dev_name.c_str(), mib,
-        llama_hot_expert_slot_order_enabled(), llama_hot_expert_slot_merge_avx512_enabled());
+        g_hot.max_tokens, llama_hot_expert_slot_order_enabled(), llama_hot_expert_slot_merge_avx512_enabled());
     if (g_hot.markers) {
         fprintf(stderr, "[hotmarker] init layers=%d K=%d dev=%s weight_mib=%.1f slot_order=%d slot_avx512=%d\n",
             n_built, g_hot.K, g_hot.dev_name.c_str(), mib,
@@ -695,6 +886,39 @@ void llama_hot_expert_shutdown() {
     if (!g_hot.enabled) {
         return;
     }
+    if (g_hot.shadow) {
+        FILE * file = stderr;
+        if (!g_hot.shadow_file.empty()) {
+            file = fopen(g_hot.shadow_file.c_str(), "w");
+            if (file == nullptr) {
+                LLAMA_LOG_WARN("%s: cannot open shadow output %s; using stderr\n", __func__, g_hot.shadow_file.c_str());
+                file = stderr;
+            }
+        }
+        fprintf(file, "layer,expert,vectors,elements,max_abs,mae,rmse,relative_rmse,cosine\n");
+        for (const auto & [il, layer] : g_hot.layers) {
+            const auto write_stat = [&](int expert, const hot_shadow_stat & stat) {
+                if (stat.elements == 0) {
+                    return;
+                }
+                const double inv = 1.0/stat.elements;
+                const double rmse = std::sqrt(stat.sum_sq_err*inv);
+                const double cpu_rms = std::sqrt(stat.sum_sq_cpu*inv);
+                const double denom = std::sqrt(stat.sum_sq_cpu*stat.sum_sq_gpu);
+                fprintf(file, "%d,%d,%" PRIu64 ",%" PRIu64 ",%.9g,%.9g,%.9g,%.9g,%.9g\n",
+                    il, expert, stat.vectors, stat.elements, stat.max_abs, stat.sum_abs*inv, rmse,
+                    cpu_rms > 0.0 ? rmse/cpu_rms : 0.0, denom > 0.0 ? stat.dot/denom : 0.0);
+            };
+            write_stat(-1, layer.shadow_layer_stat);
+            for (int compact = 0; compact < layer.K; ++compact) {
+                write_stat(layer.compact_expert[(size_t) compact], layer.shadow_stats[(size_t) compact]);
+            }
+        }
+        if (file != stderr) {
+            fclose(file);
+        }
+    }
+
     // NOTE: intentionally leak everything (backend, buffers, events, contexts).
     // This runs inside ~llama_model while the CUDA driver and the model's own
     // backends are about to be torn down; issuing any CUDA free here races
@@ -758,30 +982,49 @@ void llama_hot_expert_send_cb(struct ggml_tensor * dst, const struct ggml_tensor
     GGML_ASSERT(ggml_is_contiguous(x));
 
     const int64_t k = ids->ne[0];
-    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ids->ne[1] == 1 && k == g_hot.n_expert_used);
-    GGML_ASSERT(w->type == GGML_TYPE_F32 && w->ne[1] == k);
+    const int64_t n_tokens = ids->ne[1];
+    GGML_ASSERT(n_tokens >= 1 && n_tokens <= g_hot.max_tokens);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && k == g_hot.n_expert_used);
+    GGML_ASSERT(w->type == GGML_TYPE_F32 && w->ne[0] == 1 && w->ne[1] == k && w->ne[2] == n_tokens);
+    GGML_ASSERT(x->ne[1] == 1 && x->ne[2] == n_tokens);
 
-    // stage x
-    memcpy(L.h_x, x->data, L.n_embd * sizeof(float));
+    if (g_hot.remote_ep && g_hot.verify_cpu && n_tokens > 1) {
+        std::fill(L.h_hot_mask.begin(), L.h_hot_mask.end(), 0);
+        L.active_tokens = n_tokens;
+        memset(dst->data, 0, ggml_nbytes(dst));
+        if (g_hot.markers) {
+            fprintf(stderr, "[upe-verify-cpu] layer=%d n_tokens=%lld skip_gpu=1\n",
+                L.il, (long long) n_tokens);
+        }
+        return;
+    }
+
+    memset(L.h_base, 0, L.input_bytes);
+    std::fill(L.h_hot_mask.begin(), L.h_hot_mask.end(), 0);
+    memcpy(L.h_x, x->data, (size_t) n_tokens * L.n_embd * sizeof(float));
 
     // remap ids into compact slots; cold slots point at slot 0 with weight 0
-    for (int64_t s = 0; s < k; s++) {
-        const int32_t e = *(const int32_t *) ((const char *) ids->data + s * ids->nb[0]);
-        const int32_t slot = (e >= 0 && e < L.n_expert) ? L.remap[e] : -1;
-        const float wt = *(const float *) ((const char *) w->data + s * w->nb[1]);
-        L.h_ids[s] = slot >= 0 ? slot : 0;
-        L.h_w[s]   = slot >= 0 ? wt : 0.0f;
-        L.h_hot_mask[s] = slot >= 0;
+    for (int64_t token = 0; token < n_tokens; ++token) {
+        for (int64_t s = 0; s < k; ++s) {
+            const int32_t e = *(const int32_t *) ((const char *) ids->data + s * ids->nb[0] + token * ids->nb[1]);
+            const int32_t slot = (e >= 0 && e < L.n_expert) ? L.remap[e] : -1;
+            const float wt = *(const float *) ((const char *) w->data + s * w->nb[1] + token * w->nb[2]);
+            const size_t pos = (size_t) token * k + s;
+            L.h_ids[pos] = slot >= 0 ? slot : 0;
+            L.h_w[pos]   = slot >= 0 ? wt : 0.0f;
+            L.h_hot_mask[pos] = slot >= 0;
+        }
     }
+    L.active_tokens = n_tokens;
 
     // all stream-ordered on the executor backend: H2D -> graph -> D2H -> event
     static const bool packed_io = env_flag("GGML_HOT_EXPERT_PACKED_IO", true);
     if (packed_io) {
         ggml_backend_tensor_set_async(g_hot.backend, L.input_gpu, L.h_base, 0, L.input_bytes);
     } else {
-        ggml_backend_tensor_set_async(g_hot.backend, L.x_gpu,   L.h_x,   0, L.n_embd * sizeof(float));
-        ggml_backend_tensor_set_async(g_hot.backend, L.ids_gpu, L.h_ids, 0, k * sizeof(int32_t));
-        ggml_backend_tensor_set_async(g_hot.backend, L.w_gpu,   L.h_w,   0, k * sizeof(float));
+        ggml_backend_tensor_set_async(g_hot.backend, L.x_gpu,   L.h_x,   0, ggml_nbytes(L.x_gpu));
+        ggml_backend_tensor_set_async(g_hot.backend, L.ids_gpu, L.h_ids, 0, ggml_nbytes(L.ids_gpu));
+        ggml_backend_tensor_set_async(g_hot.backend, L.w_gpu,   L.h_w,   0, ggml_nbytes(L.w_gpu));
     }
 
     ggml_status status = ggml_backend_graph_compute_async(g_hot.backend, L.graph);
@@ -792,7 +1035,10 @@ void llama_hot_expert_send_cb(struct ggml_tensor * dst, const struct ggml_tensor
         GGML_ABORT("%s: layer %d GPU graph submission failed: %s", __func__, L.il, ggml_status_to_string(status));
     }
 
-    ggml_backend_tensor_get_async(g_hot.backend, L.output_gpu, L.h_output, 0, L.output_bytes);
+    const size_t active_output_bytes = llama_hot_expert_slot_order_enabled()
+        ? (size_t) n_tokens*k*L.n_embd*sizeof(float)
+        : (size_t) n_tokens*L.n_embd*sizeof(float);
+    ggml_backend_tensor_get_async(g_hot.backend, L.output_gpu, L.h_output, 0, active_output_bytes);
     ggml_backend_event_record(L.event, g_hot.backend);
 
     // dst content is never read (merge only uses it as a shape/ordering token)
@@ -810,58 +1056,101 @@ void llama_hot_expert_merge_cb(struct ggml_tensor * dst, const struct ggml_tenso
 
     ggml_backend_event_synchronize(L.event);
 
-    GGML_ASSERT(dst->type == GGML_TYPE_F32 && dst->ne[0] == L.n_embd && dst->ne[1] == 1 && dst->nb[0] == sizeof(float));
+    const int64_t n_tokens = L.active_tokens;
+    GGML_ASSERT(n_tokens >= 1 && n_tokens <= g_hot.max_tokens);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && dst->ne[0] == L.n_embd && dst->ne[1] == 1 && dst->ne[2] == n_tokens && dst->nb[0] == sizeof(float));
     GGML_ASSERT(cold->type == GGML_TYPE_F32 && cold->ne[0] == L.n_embd);
     float * out = (float *) dst->data;
     if (llama_hot_expert_slot_order_enabled()) {
         GGML_ASSERT(cold->nb[0] == sizeof(float));
-        GGML_ASSERT(cold->nb[1] % sizeof(float) == 0);
-        GGML_ASSERT(cold->ne[1] == g_hot.n_expert_used && cold->ne[2] == 1 && cold->ne[3] == 1);
-        GGML_ASSERT(L.output_bytes == (size_t) L.n_embd*g_hot.n_expert_used*sizeof(float));
+        GGML_ASSERT(ggml_is_contiguous(cold));
+        GGML_ASSERT(cold->ne[1] == g_hot.n_expert_used && cold->ne[2] == n_tokens && cold->ne[3] == 1);
+        GGML_ASSERT(L.output_bytes == (size_t) L.n_embd*g_hot.n_expert_used*g_hot.max_tokens*sizeof(float));
 
-        // send and merge are serialized graph nodes, and each layer owns its
-        // staging state, so the mask and weights cannot be overwritten here.
-        llama_hot_expert_merge_slots_f32(
-            out, (const float *) cold->data, cold->nb[1]/sizeof(float),
-            L.h_output, L.n_embd, L.h_w, L.h_hot_mask.data(), L.n_embd, g_hot.n_expert_used);
+        llama_hot_expert_merge_tokens_f32(
+            out, (const float *) cold->data, L.h_output, L.h_w, L.h_hot_mask.data(),
+            L.n_embd, n_tokens, g_hot.n_expert_used);
     } else {
-        GGML_ASSERT(cold->ne[1] == 1 && L.output_bytes == (size_t) L.n_embd*sizeof(float));
-        for (int64_t i = 0; i < L.n_embd; i++) {
-            const float c = *(const float *) ((const char *) cold->data + i*cold->nb[0]);
-            out[i] = c + L.h_output[i];
+        GGML_ASSERT(cold->ne[1] == 1 && cold->ne[2] == n_tokens);
+        GGML_ASSERT(L.output_bytes == (size_t) L.n_embd*g_hot.max_tokens*sizeof(float));
+        for (int64_t token = 0; token < n_tokens; ++token) {
+            for (int64_t i = 0; i < L.n_embd; ++i) {
+                const float c = *(const float *) ((const char *) cold->data + i*cold->nb[0] + token*cold->nb[2]);
+                out[(size_t) token*L.n_embd + i] = c + L.h_output[(size_t) token*L.n_embd + i];
+            }
         }
     }
+    L.active_tokens = 0;
     if (g_hot.remote_ep) {
         L.remote_inflight->store(false, std::memory_order_release);
     }
 }
 
 bool llama_hot_expert_remote_ep_split(
-        void * userdata, uint8_t * cold_active, uint8_t * hot_mask, int64_t n_slots) {
+        void * userdata, uint8_t * cold_active, uint8_t * hot_mask, int64_t n_tokens, int64_t n_slots) {
     hot_layer & L = *(hot_layer *) userdata;
     if (!llama_hot_expert_remote_ep_enabled() || cold_active == nullptr || hot_mask == nullptr ||
-            n_slots != g_hot.n_expert_used || (int64_t) L.h_hot_mask.size() != n_slots ||
+            n_tokens < 1 || n_tokens > g_hot.max_tokens || L.active_tokens != n_tokens ||
+            n_slots != g_hot.n_expert_used || (int64_t) L.h_hot_mask.size() != g_hot.max_tokens*n_slots ||
             !L.remote_inflight->load(std::memory_order_acquire)) {
         return false;
     }
-    for (int64_t slot = 0; slot < n_slots; ++slot) {
-        hot_mask[slot] = L.h_hot_mask[(size_t) slot] != 0;
-        cold_active[slot] = hot_mask[slot] ? 0 : 1;
+    for (int64_t pos = 0; pos < n_tokens*n_slots; ++pos) {
+        hot_mask[pos] = L.h_hot_mask[(size_t) pos] != 0;
+        cold_active[pos] = hot_mask[pos] ? 0 : 1;
     }
     return true;
 }
 
 void llama_hot_expert_remote_ep_merge(
-        void * userdata, float * dst, const float * cold, size_t cold_slot_stride,
-        int64_t n_embd, int64_t n_slots) {
+        void * userdata, float * dst, const float * const * cold, const float * weights,
+        const uint8_t * cpu_override,
+        int64_t n_embd, int64_t n_tokens, int64_t n_slots) {
     hot_layer & L = *(hot_layer *) userdata;
     GGML_ASSERT(llama_hot_expert_remote_ep_enabled());
-    GGML_ASSERT(dst != nullptr && cold != nullptr && n_embd == L.n_embd);
-    GGML_ASSERT(n_slots == g_hot.n_expert_used && (int64_t) L.h_hot_mask.size() == n_slots);
-    GGML_ASSERT(L.output_bytes == (size_t) n_embd * n_slots * sizeof(float));
+    GGML_ASSERT(dst != nullptr && cold != nullptr && weights != nullptr && n_embd == L.n_embd);
+    GGML_ASSERT(n_tokens >= 1 && n_tokens <= g_hot.max_tokens && L.active_tokens == n_tokens);
+    GGML_ASSERT(n_slots == g_hot.n_expert_used && (int64_t) L.h_hot_mask.size() == g_hot.max_tokens*n_slots);
+    GGML_ASSERT(L.output_bytes == (size_t) n_embd * n_slots * g_hot.max_tokens * sizeof(float));
     ggml_backend_event_synchronize(L.event);
-    llama_hot_expert_merge_slots_f32(
-        dst, cold, cold_slot_stride, L.h_output, (size_t) n_embd,
-        L.h_w, L.h_hot_mask.data(), n_embd, n_slots);
+    if (g_hot.shadow) {
+        for (int64_t token = 0; token < n_tokens; ++token) {
+            for (int64_t slot = 0; slot < n_slots; ++slot) {
+                const size_t pos = (size_t) token*n_slots + slot;
+                if (!L.h_hot_mask[pos]) {
+                    continue;
+                }
+                GGML_ASSERT(cold[pos] != nullptr);
+                const int32_t compact = L.h_ids[pos];
+                GGML_ASSERT(compact >= 0 && compact < L.K);
+                const float * cpu = cold[pos];
+                const float * gpu = L.h_output + pos*(size_t) n_embd;
+                shadow_stat_update(L.shadow_stats[(size_t) compact], cpu, gpu, n_embd);
+            }
+        }
+    }
+    const uint8_t * merge_hot_mask = L.h_hot_mask.data();
+    if (cpu_override != nullptr) {
+        const size_t count = (size_t) n_tokens * n_slots;
+        for (size_t pos = 0; pos < count; ++pos) {
+            L.merge_hot_mask[pos] = L.h_hot_mask[pos] && !cpu_override[pos];
+        }
+        merge_hot_mask = L.merge_hot_mask.data();
+    }
+    llama_hot_expert_merge_raw_tokens_f32(
+        dst, cold, L.h_output, weights, merge_hot_mask, n_embd, n_tokens, n_slots);
+    if (g_hot.shadow) {
+        llama_hot_expert_merge_raw_tokens_f32(
+            L.shadow_cpu_output.data(), cold, L.h_output, weights, L.shadow_zero_mask.data(),
+            n_embd, n_tokens, n_slots);
+        for (int64_t token = 0; token < n_tokens; ++token) {
+            shadow_stat_update(
+                L.shadow_layer_stat,
+                L.shadow_cpu_output.data() + (size_t) token*n_embd,
+                dst + (size_t) token*n_embd,
+                n_embd);
+        }
+    }
+    L.active_tokens = 0;
     L.remote_inflight->store(false, std::memory_order_release);
 }

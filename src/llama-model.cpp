@@ -44,14 +44,6 @@
 #include <unordered_map>
 #include <vector>
 
-#if defined(__gnu_linux__)
-#include <cerrno>
-#include <sys/mman.h>
-#ifndef MADV_COLLAPSE
-#define MADV_COLLAPSE 25 // linux >= 6.1
-#endif
-#endif
-
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
     switch (arch) {
         case LLM_ARCH_CLIP:
@@ -1303,26 +1295,6 @@ static void llama_numa_mirror_memcpy(void * dst, const void * src, size_t size) 
         w.join();
     }
 
-#if defined(__gnu_linux__)
-    // env GGML_NUMA_THP=collapse: synchronously collapse the just-populated mirror into
-    // 2 MiB pages (MADV_COLLAPSE, best-effort). The VMA already carries MADV_HUGEPAGE from
-    // ggml_numa_alloc, but under memory fragmentation fault-time THP allocation mostly falls
-    // back to 4 KiB pages; collapse triggers direct compaction instead. One-time cost at
-    // model load; ignored on kernels < 6.1 or when the range cannot collapse.
-    static const bool thp_collapse = []() {
-        const char * e = getenv("GGML_NUMA_THP");
-        return e && strcmp(e, "collapse") == 0;
-    }();
-    if (thp_collapse) {
-        const int64_t t0 = ggml_time_us();
-        if (madvise(dst, size, MADV_COLLAPSE) == 0) {
-            LLAMA_LOG_INFO("%s: MADV_COLLAPSE %.2f GiB in %.1f s\n", __func__,
-                    size / 1073741824.0, (ggml_time_us() - t0) / 1.0e6);
-        } else {
-            LLAMA_LOG_WARN("%s: MADV_COLLAPSE failed (errno=%d); continuing with 4K pages\n", __func__, errno);
-        }
-    }
-#endif
 }
 
 static bool llama_buffer_is_pinned_host(ggml_backend_buffer_t buffer) {
@@ -1570,27 +1542,9 @@ void llama_model::numa_ep_place_experts(bool used_mmap) {
             }
         }
     }
-#if defined(__gnu_linux__)
-    // env GGML_NUMA_THP=collapse: after binding each expert range to its node (pages are
-    // already populated by the weight read + mbind migration), synchronously collapse it
-    // into 2 MiB pages (MADV_COLLAPSE, best-effort). This is where the bulk of CPU-side
-    // weight bytes live under GGML_NUMA_EP, so it is the main TLB-miss lever for TG.
-    // NOTE: with the default row-window placement the per-(expert, node) windows are
-    // ~1.7 MiB and not PMD-aligned, so MADV_COLLAPSE fails with EINVAL on every window
-    // (and mbind fragments the VMA into alternating-policy pieces that can never merge).
-    // Use GGML_NUMA_EP_PLACE=block to make collapse actually take effect.
-    static const bool thp_collapse = []() {
-        const char * e = getenv("GGML_NUMA_THP");
-        return e && strcmp(e, "collapse") == 0;
-    }();
-    size_t collapsed_bytes = 0;
-#endif
     // env GGML_NUMA_EP_PLACE=block: instead of splitting each expert plane into
     // per-node 128-row windows, bind the tensor in 2 MiB PMD blocks alternating
-    // across nodes (block index counted from the first PMD boundary; head bytes
-    // count as block -1). Every fragment is then a full PMD-aligned VMA, which is
-    // what MADV_COLLAPSE requires. The compute side (repack.cpp UDNL mmid claim
-    // path) derives node-local row ranges from the same byte grid.
+    // across nodes. The compute side derives node-local row ranges from the same byte grid.
     static const bool place_block = []() {
         const char * e = getenv("GGML_NUMA_EP_PLACE");
         return e && strcmp(e, "block") == 0;
@@ -1645,7 +1599,7 @@ void llama_model::numa_ep_place_experts(bool used_mmap) {
                 // (k = -1 is the head before the first PMD boundary) and is bound to node
                 // k mod n_nodes. The UDNL mmid claim path in repack.cpp
                 // (mmid_ep_block_ranges) reconstructs node-local row ranges from the
-                // same grid. Only full PMD blocks are collapse candidates.
+                // same grid.
                 constexpr uintptr_t PMD = 2u << 20;
                 const uintptr_t tbase = (uintptr_t) t->data;
                 const uintptr_t tend  = tbase + ggml_nbytes(t);
@@ -1668,17 +1622,6 @@ void llama_model::numa_ep_place_experts(bool used_mmap) {
                     } else {
                         llama_numa_bind((void *) a0, a1 - a0, node);
                     }
-#if defined(__gnu_linux__)
-                    if (thp_collapse && a1 - a0 == PMD) {
-                        madvise((void *) a0, PMD, MADV_HUGEPAGE);
-                        if (madvise((void *) a0, PMD, MADV_COLLAPSE) == 0) {
-                            collapsed_bytes += PMD;
-                        } else {
-                            LLAMA_LOG_WARN("%s: MADV_COLLAPSE failed on 2 MiB block (errno=%d); continuing\n",
-                                    __func__, errno);
-                        }
-                    }
-#endif
                 }
                 ++n_placed;
                 placed_bytes += ggml_nbytes(t);
@@ -1718,35 +1661,12 @@ void llama_model::numa_ep_place_experts(bool used_mmap) {
                     } else {
                         llama_numa_bind(p, sz, n);
                     }
-#if defined(__gnu_linux__)
-                    if (thp_collapse) {
-                        const uintptr_t ua = ((uintptr_t) p + pg - 1) & ~((uintptr_t) pg - 1);
-                        if ((size_t) (ua - (uintptr_t) p) < sz) {
-                            const size_t csz = sz - (ua - (uintptr_t) p);
-                            // the weight buffer is plain posix_memalign memory: make sure the
-                            // VMA is THP-eligible before asking for a synchronous collapse
-                            madvise((void *) ua, csz, MADV_HUGEPAGE);
-                            if (madvise((void *) ua, csz, MADV_COLLAPSE) == 0) {
-                                collapsed_bytes += csz;
-                            } else {
-                                LLAMA_LOG_WARN("%s: MADV_COLLAPSE failed on %.2f MiB (errno=%d); continuing\n",
-                                        __func__, csz/1048576.0, errno);
-                            }
-                        }
-                    }
-#endif
                 }
             }
             ++n_placed;
             placed_bytes += ggml_nbytes(t);
         }
     }
-#if defined(__gnu_linux__)
-    if (thp_collapse) {
-        LLAMA_LOG_INFO("%s: MADV_COLLAPSE applied to %.2f GiB of expert weights\n",
-                __func__, collapsed_bytes/1073741824.0);
-    }
-#endif
     LLAMA_LOG_INFO("%s: NUMA EP: placed %d expert tensors (%.2f GiB) across %d nodes\n",
             __func__, n_placed, placed_bytes/1073741824.0, n_nodes);
     if (n_gpu_placed > 0) {

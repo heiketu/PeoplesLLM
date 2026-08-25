@@ -1583,6 +1583,10 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * gate_bias = nullptr;
     const ggml_tensor * x_scale = nullptr;
     const ggml_tensor * gate_scale = nullptr;
+    float x_clamp_min = -INFINITY;
+    float x_clamp_max =  INFINITY;
+    float gate_clamp_min = -INFINITY;
+    float gate_clamp_max =  INFINITY;
     ggml_glu_op glu_op;
 };
 struct ggml_cuda_mm_fusion_args_device {
@@ -1591,6 +1595,10 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * gate_bias = nullptr;
     const void * x_scale = nullptr;
     const void * gate_scale = nullptr;
+    float x_clamp_min = -INFINITY;
+    float x_clamp_max =  INFINITY;
+    float gate_clamp_min = -INFINITY;
+    float gate_clamp_max =  INFINITY;
     ggml_glu_op glu_op;
 };
 

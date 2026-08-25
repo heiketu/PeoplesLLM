@@ -24,6 +24,10 @@
 //                   when LLAMA_EP_CAP_EXPERT_BITMAP is set. Bitmap bit e-first
 //                   reports arbitrary sparse ownership; the fixed prefix stays
 //                   wire-compatible with range-only protocol-v2 workers.
+//                   A master that sets LLAMA_EP_CAP_MASTER_WANT_PRECISION asks a
+//                   current worker to append llama_ep_precision_contract before
+//                   the optional bitmap. Old masters send flags=0 and therefore
+//                   continue to receive the old payload exactly.
 //                   (kernel_id: ggml build + ISA fingerprint, for the §7.3
 //                   homogeneity check). an old LEP1-only worker answers ERR to
 //                   CAP. The caller may use a retained local path; a pure sharded
@@ -101,6 +105,24 @@ enum llama_ep_cap_bits : uint32_t {
     LLAMA_EP_CAP_REQ3 = 1u << 1, // async req_id dispatch (REQ3/RESP3)
     LLAMA_EP_CAP_EXPERT_BITMAP = 1u << 2, // CAP appends sparse ownership bitmap
     LLAMA_EP_CAP_REQ4 = 1u << 3, // sync ragged dispatch, master applies weights
+    LLAMA_EP_CAP_PRECISION_CONTRACT = 1u << 4, // CAP carries llama_ep_precision_contract
+};
+
+enum llama_ep_cap_master_flags : uint32_t {
+    LLAMA_EP_CAP_MASTER_WANT_PRECISION = 1u << 0,
+};
+
+enum llama_ep_precision_profile_bits : uint32_t {
+    LLAMA_EP_PRECISION_DETERMINISTIC_ENDPOINT = 1u << 0,
+    LLAMA_EP_PRECISION_RAW_SLOT_F32            = 1u << 1,
+    LLAMA_EP_PRECISION_WEIGHTED_SLOT_F32       = 1u << 2,
+};
+
+enum llama_ep_precision_ids : uint32_t {
+    LLAMA_EP_PRECISION_ACTIVATION_Q8_0_BLOCK32_FP16_NATIVE = 1,
+    LLAMA_EP_PRECISION_DOT_I8_I8_I32_BLOCK32_F32           = 1,
+    LLAMA_EP_PRECISION_FFN_MODEL_SCHEMA_E8M0_LEGACY_FINITE = 3,
+    LLAMA_EP_PRECISION_MERGE_PER_SLOT_F32                  = 1,
 };
 
 enum llama_ep_err_code : int32_t {
@@ -143,6 +165,24 @@ struct llama_ep_cap_worker {
     int32_t  expert_first; // half-open [first, last), clamped to actual n_expert
     int32_t  expert_last;
     uint32_t kernel_id;
+};
+
+// Optional UPE extension negotiated by LLAMA_EP_CAP_MASTER_WANT_PRECISION.
+// IDs describe observable execution semantics, not merely a formula name.
+// model_schema_id covers architecture, layer shapes, weight types and FFN
+// nonlinear/clamp metadata. data_epoch_id is an operator-supplied immutable
+// model-version hash; zero explicitly means unknown and is rejected by strict
+// UPE mode. contract_id fingerprints every preceding field plus kernel_id.
+struct llama_ep_precision_contract {
+    uint32_t version;
+    uint32_t profile_flags;
+    uint32_t activation_id;
+    uint32_t dot_id;
+    uint32_t ffn_id;
+    uint32_t merge_id;
+    uint64_t model_schema_id;
+    uint64_t data_epoch_id;
+    uint64_t contract_id;
 };
 
 struct llama_ep_req2_header {

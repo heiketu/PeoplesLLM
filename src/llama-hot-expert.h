@@ -28,11 +28,14 @@ struct ggml_tensor;
 //      GGML_HOT_EXPERT_K=16         experts pinned per layer
 //      GGML_HOT_EXPERT_DEV=CUDA1    device that hosts the hot experts
 //      GGML_HOT_EXPERT_LAYERS=all   comma list / ranges, e.g. "42" or "30-42"
-//      GGML_HOT_EXPERT_MAX_TOKENS=1 max n_tokens for the GPU fork (currently clamped to 1)
+//      GGML_HOT_EXPERT_MAX_TOKENS=1 max n_tokens for the GPU fork (1-4)
 //      GGML_HOT_EXPERT_PACKED_IO=1  coalesce x/ids/weights into one H2D (default on)
 //      GGML_HOT_EXPERT_SLOT_ORDER=1 return per-slot GPU output and restore the baseline fold (default on)
 //      GGML_HOT_EXPERT_SLOT_MERGE_AVX512=1 use AVX512 strict slot merge when supported (default on)
 //      GGML_HOT_EXPERT_REMOTE_EP=1  let strict pure remote EP dispatch only cold slots (default off)
+//      GGML_HOT_EXPERT_REMOTE_EP_SHADOW=1 also compute hot slots on CPU for vector comparison (default off)
+//      GGML_HOT_EXPERT_SHADOW_FILE   optional per-layer/expert comparison CSV
+//      GGML_CUDA_HOT_MXFP4_CPU_Q8=1  match CPU Q8_0 activation codes in hot MXFP4 MMVQ (default off)
 
 bool llama_hot_expert_enabled();
 
@@ -52,12 +55,15 @@ int64_t llama_hot_expert_max_tokens();
 // use the strict router-slot merge; false selects the legacy two-partial merge
 bool llama_hot_expert_slot_order_enabled();
 
-// opt-in bridge for one-token strict pure remote EP
+// opt-in bridge for small-batch strict pure remote EP
 bool llama_hot_expert_remote_ep_enabled();
+bool llama_hot_expert_remote_ep_shadow_enabled();
+bool llama_hot_expert_upe_verify_cpu_enabled();
 bool llama_hot_expert_markers_enabled();
 
 // userdata for the custom op callbacks of layer il (nullptr if inactive)
 void * llama_hot_expert_userdata(int il);
+void llama_hot_expert_remote_ep_cancel(void * userdata);
 
 // ggml custom-op callbacks (see llama-graph.cpp build_moe_ffn)
 void llama_hot_expert_mask_ids_cb(struct ggml_tensor * dst, const struct ggml_tensor * ids, int ith, int nth, void * userdata);
@@ -67,13 +73,24 @@ void llama_hot_expert_merge_cb(struct ggml_tensor * dst, const struct ggml_tenso
 // Called after send_cb. Copies the runtime slot split used by the GPU graph.
 // cold_active is 1 for slots that remote EP must dispatch.
 bool llama_hot_expert_remote_ep_split(
-        void * userdata, uint8_t * cold_active, uint8_t * hot_mask, int64_t n_slots);
+        void * userdata, uint8_t * cold_active, uint8_t * hot_mask, int64_t n_tokens, int64_t n_slots);
 
 // Waits for the GPU branch and left-folds hot slots with already-weighted
 // remote cold slots. cold has one n_embd-stride vector per router slot.
 void llama_hot_expert_remote_ep_merge(
-        void * userdata, float * dst, const float * cold, size_t cold_slot_stride,
-        int64_t n_embd, int64_t n_slots);
+        void * userdata, float * dst, const float * const * cold, const float * weights,
+        const uint8_t * cpu_override,
+        int64_t n_embd, int64_t n_tokens, int64_t n_slots);
+
+// Strict merge for contiguous [n_tokens,n_slots,n_embd] buffers.
+void llama_hot_expert_merge_tokens_f32(
+        float * dst, const float * cold, const float * hot, const float * weights,
+        const uint8_t * hot_mask, int64_t n_embd, int64_t n_tokens, int64_t n_slots);
+
+// Strict merge for raw remote slot pointers and contiguous GPU hot slots.
+void llama_hot_expert_merge_raw_tokens_f32(
+        float * dst, const float * const * cold, const float * hot, const float * weights,
+        const uint8_t * hot_mask, int64_t n_embd, int64_t n_tokens, int64_t n_slots);
 
 // Strict F32 slot fold shared by the callback and its model-independent test.
 // Strides are in float elements. Cold is already weighted; hot is multiplied

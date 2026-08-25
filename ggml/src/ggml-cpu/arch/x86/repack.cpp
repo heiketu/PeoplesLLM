@@ -4021,6 +4021,18 @@ void ggml_gemv_iq2_xs_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const 
 #endif
 }
 
+#if defined(__AVX512F__)
+static inline __m512i iq2_parity7_sign_epi32(__m512i value) {
+    const __m512i m127 = _mm512_set1_epi32(127);
+    const __m512i mone = _mm512_set1_epi32(1);
+    const __m512i field = _mm512_and_si512(value, m127);
+    __m512i parity = _mm512_xor_si512(field, _mm512_srli_epi32(field, 4));
+    parity = _mm512_xor_si512(parity, _mm512_srli_epi32(parity, 2));
+    parity = _mm512_xor_si512(parity, _mm512_srli_epi32(parity, 1));
+    return _mm512_or_si512(field, _mm512_slli_epi32(_mm512_and_si512(parity, mone), 7));
+}
+#endif
+
 void ggml_gemv_iq2_xxs_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
     const int qk = QK_K;
     const int nb = n / qk;
@@ -4062,9 +4074,6 @@ void ggml_gemv_iq2_xxs_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const
 #if defined(__GFNI__)
     // gf2p8affine matrix computing identity on bits 0..6 and parity of bits 0..6 into bit 7
     const __m512i mpar     = _mm512_set1_epi64(0x010204081020407fULL);
-#else
-    const __m512i m127     = _mm512_set1_epi32(127);
-    const __m512i mone32   = _mm512_set1_epi32(1);
 #endif
     // per-entry splat: byte p of the result = sign byte of (lane p/8, entry e), which sits
     // at byte 16*(p/8) + 4*e of the (lo, hi) sign vectors
@@ -4116,10 +4125,8 @@ void ggml_gemv_iq2_xxs_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const
                 const __m512i sb_lo = _mm512_gf2p8affine_epi64_epi8(sf_lo, mpar, 0);
                 const __m512i sb_hi = _mm512_gf2p8affine_epi64_epi8(sf_hi, mpar, 0);
 #else
-                const __m512i sb_lo = _mm512_or_si512(_mm512_and_si512(sf_lo, m127),
-                    _mm512_slli_epi32(_mm512_and_si512(_mm512_popcnt_epi32(_mm512_and_si512(sf_lo, m127)), mone32), 7));
-                const __m512i sb_hi = _mm512_or_si512(_mm512_and_si512(sf_hi, m127),
-                    _mm512_slli_epi32(_mm512_and_si512(_mm512_popcnt_epi32(_mm512_and_si512(sf_hi, m127)), mone32), 7));
+                const __m512i sb_lo = iq2_parity7_sign_epi32(sf_lo);
+                const __m512i sb_hi = iq2_parity7_sign_epi32(sf_hi);
 #endif
 
                 // per-column sub block scale: ls = 2*(bits 60..63) + 1, shared by all 4 entries
@@ -12154,9 +12161,6 @@ void ggml_gemm_iq2_xxs_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const
     const __m512i sshift   = _mm512_set_epi32(21,14,7,0, 21,14,7,0, 21,14,7,0, 21,14,7,0);
 #if defined(__GFNI__)
     const __m512i mpar     = _mm512_set1_epi64(0x010204081020407fULL);
-#else
-    const __m512i m127     = _mm512_set1_epi32(127);
-    const __m512i mone32   = _mm512_set1_epi32(1);
 #endif
     const __m512i splat_base = _mm512_set_epi8(
         112,112,112,112,112,112,112,112, 96,96,96,96,96,96,96,96, 80,80,80,80,80,80,80,80, 64,64,64,64,64,64,64,64,
@@ -12207,10 +12211,8 @@ void ggml_gemm_iq2_xxs_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const
                     const __m512i sb_lo = _mm512_gf2p8affine_epi64_epi8(sf_lo, mpar, 0);
                     const __m512i sb_hi = _mm512_gf2p8affine_epi64_epi8(sf_hi, mpar, 0);
 #else
-                    const __m512i sb_lo = _mm512_or_si512(_mm512_and_si512(sf_lo, m127),
-                        _mm512_slli_epi32(_mm512_and_si512(_mm512_popcnt_epi32(_mm512_and_si512(sf_lo, m127)), mone32), 7));
-                    const __m512i sb_hi = _mm512_or_si512(_mm512_and_si512(sf_hi, m127),
-                        _mm512_slli_epi32(_mm512_and_si512(_mm512_popcnt_epi32(_mm512_and_si512(sf_hi, m127)), mone32), 7));
+                    const __m512i sb_lo = iq2_parity7_sign_epi32(sf_lo);
+                    const __m512i sb_hi = iq2_parity7_sign_epi32(sf_hi);
 #endif
 
                     // per-column sub block scale: ls = 2*(bits 60..63) + 1

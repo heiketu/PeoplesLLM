@@ -1,18 +1,18 @@
 #!/bin/bash
 # P1 server 集成验证（需安静窗口，严禁与生产 llama-server 同时跑）：
 # 资格门路由（合格/不合格请求）、PP 提升、并发 slot TG 抖动、门限扫参。
-# 用法: ./bench-gpuprefill-server.sh [MIN_TOKENS=4096]
+# 用法: MODEL_MX=/path/to/model.gguf ./bench-gpuprefill-server.sh [MIN_TOKENS=4096]
 # H2 修复（2026-08-23）：WT 原指向 ../llama-gpuprefill worktree（已不存在），改指本仓库根。
 set -x
 LOCK=/tmp/xllama-bench.lock
-MODEL_MX=/media/heiketu/2922DB6548C1F185/DeepSeek-V4-Flash-Q4-mxfp4-0731.gguf
+MODEL_MX=${MODEL_MX:?set MODEL_MX to the DSV4 MXFP4 GGUF path}
 WT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 OUT=/tmp/gpuprefill-server
 MIN_TOKENS=${1:-4096}
 PORT=8090
 mkdir -p "$OUT"
 
-ENV_BASE="GGML_NUMA_EP=1 LLAMA_LAYER_MAJOR_DEVICE_HC=2 GGML_CUDA_MOE_PP_MIN_TOKENS=2048 GGML_CUDA_MOE_PP_PREFETCH=3 GGML_CUDA_MOE_PP_DUAL=0 GGML_CUDA_MOE_PP_EP=1 GGML_CUDA_MOE_PP_EP_MIN_TOKENS=2048 GGML_CUDA_P2P=1 GGML_CUDA_BATCHED_TOPK=1 GGML_CUDA_DSV4_KV_REUSE=1 GGML_CUDA_MOE_PP_DEFER_PREFETCH=1 GGML_CUDA_MOE_PP_PIPE=1 LLAMA_GPU_PREFILL_MIN_TOKENS=$MIN_TOKENS"
+ENV_BASE="GGML_NUMA_EP=1 LLAMA_LAYER_MAJOR_DEVICE_HC=2 GGML_CUDA_MOE_PP_MIN_TOKENS=2048 GGML_CUDA_MOE_PP_PREFETCH=3 GGML_CUDA_MOE_PP_EP=1 GGML_CUDA_MOE_PP_EP_MIN_TOKENS=2048 GGML_CUDA_P2P=1 GGML_CUDA_BATCHED_TOPK=1 GGML_CUDA_DSV4_KV_REUSE=1 GGML_CUDA_MOE_PP_DEFER_PREFETCH=1 GGML_CUDA_MOE_PP_PIPE=1 LLAMA_GPU_PREFILL_MIN_TOKENS=$MIN_TOKENS"
 
 # 生产对齐形态（缩小 ctx 以便窗口内跑；q8 KV + 0 pin + EP 全部保持）
 flock -x "$LOCK" systemd-run --user --scope --unit="aq-gpuprefill-server" \

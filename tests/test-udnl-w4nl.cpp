@@ -138,6 +138,7 @@ double elapsed_s(clock_type::time_point a, clock_type::time_point b) {
 // 2.3 GHz on this box) because the achieved core clock drifts ±20% under the
 // powersave governor, and perf counters are unavailable (perf_event_paranoid=4).
 double calibrate_ghz() {
+#if UDNL_X86
     uint64_t x = 0x9e3779b97f4a7c15ull;
     const int64_t iters = 200000000;
     double best = 1e30;
@@ -152,6 +153,9 @@ double calibrate_ghz() {
     volatile uint64_t sink = x;
     (void) sink;
     return (double) iters / best / 1e9;
+#else
+    return 1.0;
+#endif
 }
 
 #if UDNL_X86
@@ -188,7 +192,9 @@ double time_best(F && body, double target_s = 0.15, int reps = 3) {
         const auto a = clock_type::now();
         for (int i = 0; i < iters; i++) {
             body();
+#if UDNL_X86
             __asm__ volatile("" ::: "memory");
+#endif
         }
         const auto b = clock_type::now();
         best = std::min(best, elapsed_s(a, b) / iters);
@@ -449,7 +455,7 @@ void run_ceiling(int nc, int k, double ghz) {
 // Part B: W4-NL NR16 x K4 vs MXFP4 gemv vs Q3_R gemv
 // ---------------------------------------------------------------------------
 
-void run_w4nl_bench(int nc, int k, double ghz) {
+bool run_w4nl_bench(int nc, int k, double ghz) {
 #if UDNL_X86
     printf("== w4nl: nc=%d k=%d (single core, L2-hot) ==\n", nc, k);
     const std::vector<float> w = make_random_f32((int64_t) nc * k, 1234);
@@ -469,6 +475,7 @@ void run_w4nl_bench(int nc, int k, double ghz) {
     w4nl_pack pk = pack_w4nl(w, nc, k);
 
     // correctness on the full matrix (scalar reference is slow but the matrix is small)
+    bool ok = true;
     {
         std::vector<float> o_ref(nc), o_avx(nc);
         w4nl_gemv_ref(nc, k, o_ref.data(), pk, a);
@@ -484,6 +491,7 @@ void run_w4nl_bench(int nc, int k, double ghz) {
         }
         printf("  [W4-NL] avx512-vs-scalar: max_abs=%.3g max_rel=%.3g bad=%d -> %s\n",
                max_abs, max_rel, n_bad, n_bad == 0 ? "OK" : "MISMATCH");
+        ok = n_bad == 0;
     }
 
     std::vector<float> s(nc, 0.0f);
@@ -521,22 +529,28 @@ void run_w4nl_bench(int nc, int k, double ghz) {
     // bits-per-weight summary for the table
     const double bpw_w4nl  = 8.0 * pk.nbytes / ((double) nc * k);
     printf("  [W4-NL] effective bpw (payload+srel+drow): %.4f\n", bpw_w4nl);
+    return ok;
 #else
     (void) nc; (void) k; (void) ghz;
     printf("== w4nl: SKIPPED (not an x86-64 GCC build) ==\n");
+    return true;
 #endif
 }
 
 bool has_isa() {
     // ggml-cpu only exposes these three; F implies BW/DQ/VL in practice on the
     // CPUs this bench targets (ICX-SP), and the kernel self-guards at build time.
-    return ggml_cpu_has_avx512() && ggml_cpu_has_avx512_vnni() && ggml_cpu_has_avx512_vbmi();
+    return UDNL_X86 && ggml_cpu_has_avx512() && ggml_cpu_has_avx512_vnni() && ggml_cpu_has_avx512_vbmi();
 }
 
 } // namespace
 
 int main(int argc, char ** argv) {
+#if defined(_WIN32)
+    _putenv_s("GGML_REPACK_Q2_K", "1");
+#else
     setenv("GGML_REPACK_Q2_K", "1", 1); // same opt-in as test-repack-kernels
+#endif
 
     if (!has_isa()) {
         printf("test-udnl-w4nl: SKIPPED (needs AVX512F/BW/DQ/VL/VNNI/VBMI)\n");
@@ -557,11 +571,16 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    bool ok = true;
     if (mode == "--ceiling" || mode == "--all") {
         run_ceiling(nc, k, tsc_ghz);
     }
     if (mode == "--w4nl" || mode == "--all") {
-        run_w4nl_bench(nc, k, tsc_ghz);
+        ok = run_w4nl_bench(nc, k, tsc_ghz) && ok;
     }
-    return 0;
+    if (mode != "--ceiling" && mode != "--w4nl" && mode != "--all") {
+        fprintf(stderr, "unknown mode: %s\n", mode.c_str());
+        return 1;
+    }
+    return ok ? 0 : 1;
 }

@@ -14,15 +14,6 @@
 #include <map>
 #include <stdexcept>
 
-#if defined(__gnu_linux__)
-#include <cerrno>
-#include <cstdint>
-#include <sys/mman.h>
-#ifndef MADV_COLLAPSE
-#define MADV_COLLAPSE 25 // linux >= 6.1
-#endif
-#endif
-
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
 }
@@ -301,26 +292,6 @@ llama_kv_cache::llama_kv_cache(
         LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
 
         ggml_backend_buffer_clear(buf, 0);
-
-#if defined(__gnu_linux__)
-        // env GGML_KV_THP=collapse: the buffer was just fully populated by the clear above;
-        // synchronously collapse it into 2 MiB pages (MADV_COLLAPSE, best-effort). Plain
-        // GGML_KV_THP=1 only sets MADV_HUGEPAGE at alloc time (see ggml-backend.cpp).
-        if (ggml_backend_buffer_is_host(buf) && ggml_backend_buffer_get_size(buf) >= (size_t)(2u << 20)) {
-            static const bool kv_thp_collapse = []() {
-                const char * e = getenv("GGML_KV_THP");
-                return e && strcmp(e, "collapse") == 0;
-            }();
-            if (kv_thp_collapse) {
-                const size_t   size = ggml_backend_buffer_get_size(buf);
-                const uintptr_t beg = ((uintptr_t) ggml_backend_buffer_get_base(buf) + 4095) & ~(uintptr_t) 4095;
-                const size_t    adj = beg - (uintptr_t) ggml_backend_buffer_get_base(buf);
-                if (size > adj && madvise((void *) beg, size - adj, MADV_COLLAPSE) != 0) {
-                    LLAMA_LOG_WARN("%s: MADV_COLLAPSE on KV buffer failed (errno=%d); continuing\n", __func__, errno);
-                }
-            }
-        }
-#endif
 
         ctxs_bufs.emplace_back(std::move(ctx), buf);
     }

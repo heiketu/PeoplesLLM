@@ -138,6 +138,12 @@ target embedding/output，不能把 draft 与 target scheduler 的 device list �
 | `GGML_REMOTE_EP_SCHED_PP_REPEAT_COST` | `1000` | PP 同批次再次命中同一专家时的边际虚拟成本（0–1000）；当前 DSV4 生产显式设 250，同组 A/B +0.94% |
 | `GGML_REMOTE_EP_SCHED_REPEAT_ACCOUNTING` | 关 | 实验性地用“新专家 + repeat 边际成本”统一队列与服务率单位。DSV4 单-slot ABBA 实测 -1.45%，生产保持关，仅真多 stream 调度实验时开 |
 | `GGML_REMOTE_EP_RECONNECT_TIMEOUT_MS` | `0` | SCHED endpoint 传输失败后，允许等待 worker 重启并重发已暂存请求的最长毫秒数（0 保持旧的一次立即重连；最大 300000）。pure EP 常驻服务建议 90000；重连后 expert map、kernel ID、CAP 位必须与初次协商相同，否则拒绝继续；超时/能力变化仍是致命错误，因为 master 没有本地专家结果可回退 |
+| `GGML_REMOTE_EP_UPE_STRICT` | 关 | 要求每个 scheduled worker 返回 UPE precision-contract，并拒绝不同 activation/dot/FFN schema/per-slot merge/data epoch 或重连后合同变化。新 master 用 CAP flag 请求扩展；旧 flags=0 master 仍收到原 CAP 字节布局 |
+| `GGML_EP_DATA_EPOCH` | 空（unknown） | master/worker 必须设相同的不变版本字符串；wire 只传 hash。strict UPE 要求非空且全 endpoint 相同。建议用模型内容 SHA256 与 converter/量化版本组合 |
+| `GGML_REMOTE_EP_UPE_ACTIVATION_TRACE` / `_FILE` | 关 / 空 | master端default-off数值诊断：扫描真实expert hidden的32值块，统计CPU与nominal-CUDA code差异和half-step边界距离，退出时写per-layer CSV。`=1`只保留边界block，`=2`保留全部block到`.blocks.bin`供CUDA直接回放。有额外CPU/内存开销，不得用于性能样本 |
+| `GGML_HOT_EXPERT_UPE_BOUNDARY_FALLBACK` / `_BOUNDARY_THRESHOLD` / `_VERIFY_THRESHOLD` | 关 / `1e-6` / `0` | GPU-hot + CPU-remote实验策略：只对CPU/nominal-CUDA code已不同或接近Q8 half-step的token把hot slots额外派CPU并在merge选CPU结果。raw低阈值可恢复CPU短文hash；verify默认只用nominal mismatch，因为`1.6e-5`全覆盖形态的远端fanout税过大。仍必须通过PPL/acceptance/性能A/B，保持default-off |
+| `GGML_HOT_EXPERT_UPE_VERIFY_CPU` | 关 | n_tokens>1时跳过GPU-hot提交、直接CPU remote EP，单token仍GPU-hot；用于verify-strict且避免duplicate fallback税。保持default-off，待warm-server净收益门 |
+| `GGML_HOT_EXPERT_EXCLUDE` | 空 | `layer:expert,...`指定不进GPU热集的设备不适配专家，同层下一热点自动补K，被排除项继续由CPU worker计算。例：`21:202,21:205` |
 | `GGML_REMOTE_EP_PIPELINE` | 关 | 置 1 启用流水线分块投递：多 token 层（PP）把 token 维切成块，W=1 滑动窗口发送（发块 i 后收块 i-1 的响应），worker 计算与 master 收发重叠。协议不变（每块是一个普通 REQ 帧），逐 token 数值不变；decode（1 token）不受影响自动走原路径。TCP/RDMA 均可用 |
 | `GGML_REMOTE_EP_PIPELINE_CHUNK` | 256 | 每块 token 数上限；再按隐藏层字节数封顶（TCP ≤3MiB、RDMA ≤12MiB，保证 W=1 窗口在 socket buffer / RDMA 接收环容量内，不会死锁） |
 | `GGML_REMOTE_EP_MIRROR` | 关 | 置 1 启用层镜像 + 专家 slot 拆分：master 同时加载远程层专家权重（这些层不再 TENSOR_SKIP），每层 MoE 沿 slot 维切两半——slot [0,k_r) 发 worker（只发不等的 send op），slot [k_r,k) 在 master 本地走与单机 MoE 完全相同的链路，wait op 收 partial_r 后按 slot 升序合并（与全远程基线结合顺序一致，逐字对拍 bit 一致）。decode 与 PP 均生效；详见下文实测节 |

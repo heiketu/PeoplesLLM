@@ -21,6 +21,7 @@ PeoplesLLM 是面向异构本地推理的 llama.cpp 分支。项目围绕三条�
 | 路线 | 配对基线 | 当前结果 | 变化 |
 |---|---:|---:|---:|
 | DSV4 pp2048，同质量 MXFP4 -> E4A | 312.48 tok/s | **362.92 tok/s** | **+16.1%** |
+| DSV4 145.26 GiB 全模型 CPU_REPACK 加载 + smoke | 163.48 s | **98.66 s** | **-39.65% wall** |
 | DSV4 DSpark speculative decode，n2/p0 | 23.9 tok/s | **30.1 tok/s** | **+26%** |
 | DSV4 E4A raw/no-DSpark decode，strict 热专家 12 轮 A/B | 25.02 tok/s | **30.23 tok/s** | **+20.85%** |
 | DSV4 16K GPU MoE prefill | 213 tok/s | **334.5 tok/s** | **+57%** |
@@ -29,6 +30,16 @@ PeoplesLLM 是面向异构本地推理的 llama.cpp 分支。项目围绕三条�
 | GLM-5.2 pp512，2 -> 4 NUMA worker 真 EP | 24.13 tok/s | **40.59 tok/s** | **+68.2%** |
 
 ![三条性能路线的阶段结果](docs/img/evolution-staircase.png)
+
+## 三引擎控制面
+
+PeoplesLLM 把一次异构执行计划拆成三个边界明确的逻辑引擎：
+
+- **TAE（Topology-Aware Engine）**管“在哪里算、数据物理放在哪里”：感知 core/cache、CCD/die、NUMA/UPI、GPU/PCIe 与远端 worker，选择 layer/expert/tensor 粒度、mirror/split/owner和设备原生权重布局，并对 PCH/南桥 PCIe 等高代价拓扑给出警告。
+- **UPE（Unified Precision Engine）**管“还是不是同一模型语义”：维护 canonical tensor/data epoch、副本同步、激活量化、舍入/累加、非线性和 slot fold 契约，并用 shadow、PPL、hash 与 DSpark accepted/drafted 联合验收。
+- **DME（Dynamic Matrix Engine）**管“当前 phase 怎样算最快”：针对 TG、PP 和 speculative verify 的 shape，选择 GEMV/GEMM、tile、batch/ubatch、fusion/pipeline 以及 AVX512-VNNI、未来 AMX 或 CUDA kernel。
+
+决策关系可写成：**TAE 生成物理可行域，UPE 过滤数值与数据不合格路径，DME 在二者交集上最小化当前 phase 的关键路径**。E4A 因此不是单一引擎的功能：TAE 选设备布局，UPE 证明逻辑值/版本合法，DME 选择 NR16/VNNI、AMX 或 GPU 消费内核。
 
 ## 架构发展路线
 
@@ -57,7 +68,7 @@ PeoplesLLM 是面向异构本地推理的 llama.cpp 分支。项目围绕三条�
 | 纯 CPU raw/no-DSpark tg128 | 7.23 | **11.65** | **+61%** |
 | 纯 CPU pp512 | 101.41 | **107.91** | +6.4% |
 
-在行窗 TP 之上，DME（Dynamic Matrix Execution）继续处理节点内的不规则 MoE 形状：
+在行窗 TP 之上，DME（Dynamic Matrix Engine）继续处理节点内的不规则 MoE 形状：
 
 - claim 量子从 16 调到 64 行，微基准带宽由 145 提升到 165-179 GB/s；
 - 按 `nrows` 和 batch 形状在 GEMV/GEMM 之间分派，并把 UDNL 同专家的 2-8 行尾部任务合并；
@@ -100,7 +111,31 @@ GLM 的 dense/attention 仍在 GPU；上表第一行只扩展 CPU MoE。75 层 r
 
 GPU-hot + CPU-remote-EP 现已在一个严格限定的端到端形态下通过：单 slot、raw/no-DSpark、四 worker modulo strict cover、同步 REQ4，未启用 MAX_EFFORT。TG512 的 ABBA+BAAB 八轮为 A(remote-only) `[24.9, 25.2, 25.5, 25.4]`、B(K24 hot + remote cold) `[29.6, 28.3, 28.6, 28.9]` tok/s，均值 25.25 -> **28.85 tok/s（+14.26%）**；同命令 b1/ub1、5-chunk PPL 为 2.7647 -> **2.7412（-0.85%）**。A、B 各自四轮输出 hash 稳定，但两模式 hash 不同，因此这不是跨 CPU/GPU kernel 的 bit-exact 声明。所有 B 轮均有 43/43 hot-fork 与 43/43 remote-bridge marker。
 
-八 token verbose 诊断只用于验证结构，不是性能样本：301 次单 token MoE 调用中，CPU assignment 从 1,806 降到 916（-49.28%），四端点累计为 239/220/213/244，全四路 fanout 从 117 降到 18 次，remote wait 均值从 0.444 降到 0.310 ms，mixed merge 均值为 0.0296 ms。上述结论不能外推到 DSpark、MAX_EFFORT 或多 slot，也不能与热专家或远程 EP 的独立百分比相乘。
+八 token verbose 诊断只用于验证结构，不是性能样本：301 次单 token MoE 调用中，CPU assignment 从 1,806 降到 916（-49.28%），四端点累计为 239/220/213/244，全四路 fanout 从 117 降到 18 次，remote wait 均值从 0.444 降到 0.310 ms，mixed merge 均值为 0.0296 ms。这些 raw/no-DSpark 百分比不能与其他路径相乘。
+
+DSpark multi-token 桥接已进一步扩展到1-4 target tokens，REQ4 mask和严格merge均使用`[token,slot]`布局。K24是唯一通过质量门的热专家数：5-chunk PPL 2.7647 -> 2.7412。但warm server实测中，NMAX=3仅35.251 -> 35.950 tok/s（+1.98%）；NMAX=2的两个独立B进程六轮均值为36.353，对A=34.645提升**4.928%**、CV=2.466%，比预设5%门低0.072个百分点。因此该路径保留default-off研究开关，不替换生产默认，也不声称达到40 tok/s。
+
+进一步的UPE消融仅对`hot_expert.*`启用CPU Q8_0同款RNE code生成，将真实激活的CPU/GPU code mismatch从33/10,144降到0（scale仍0 mismatch）；相同code后普通MXFP4算子仍有约2.29e-7–4.80e-7相对误差，来源转为CUDA warp归约。NMAX=2 warm-server A-B-B-A中，普通路径为35.0614±0.2720，CPU-Q8候选为37.9573±0.4868 tok/s（+8.2595%），acceptance从266/490变为273/474，两边各自hash稳定但轨迹不同。候选5-chunk PPL却为2.7855，比原strict-hot 2.7412差1.62%、比no-hot 2.7647差0.75%，超过0.3%门，且绝对速度仍低于40。因此`GGML_CUDA_HOT_MXFP4_CPU_Q8`继续默认关闭、生产REJECT；该结果说明code一致和acceptance改善都不能替代无DSpark质量门。
+
+### 7. 统一精度引擎：混合 EP 的数值与数据控制面
+
+CPU AVX512、CUDA MMVQ和远端worker即使读取相同逻辑权重，也可能因Q8激活量化、舍入、scale恢复、累加树、clamp/GLU和FMA策略不同而产生不同专家向量。每条路径各自可重复，并不等于跨设备结果一致；在DSpark中，near-tie logits的微小变化还可能翻转target token，降低draft接受率并改变后续轨迹。因此PeoplesLLM把统一精度引擎（Unified Precision Engine, UPE）视为混合EP的组成部分，而不是事后正确性测试。UPE同时管理副本对应的logical tensor、data epoch与发布完成语义，不只是浮点容差测试。
+
+证据口径分三层：如果只改变accepted/drafted而最终target token相同，只能说明投机效率受影响；如果pure CPU与GPU expert offload在固定greedy配置下各自确定却生成不同target token/正文，已经证明两条路径实现了不同的有效模型并可能影响生成质量；只有无DSpark配对PPL、任务准确率和行为评测才能判断质量变化的方向与幅度。DSpark是敏感的误差放大器，不是独立质量指标。
+
+当前已实现逐slot回传、0→5严格左折叠、CPU/GPU shadow以及PPL、response hash和accepted/drafted联合门。EPD CAP现在可协商precision-contract，包含activation/dot/FFN schema/per-slot merge、model schema、data epoch与contract hash；`GGML_REMOTE_EP_UPE_STRICT=1` 会拒绝缺合同、跨worker不同或重连后变化的endpoint，并要求master/worker共享非空`GGML_EP_DATA_EPOCH`。该协议已通过CUDA/non-CUDA构建、单测和DSV4真实四worker验收：主从各两个e64 worker全部报告相同contract/schema/epoch，strict REQ4的32-token smoke为PP 52.4/TG 24.7~tok/s；故意错误epoch会在第一个CAP阶段拒绝。这个短样本只是协议/功能门，不与TG512 headline比较。K16虽然显著提速，却使PPL 2.7647→2.8066；K24才通过质量门。shadow还表明最大局部误差专家并不等于质量根因，排除它们反而更差。投机verify仍需要比普通raw decode更严格的激活code/scale和接受率档。
+
+直接回读CUDA Q8\_1临时块的新回归测试进一步给出了边界：平滑输入的4096个code和FP16 scale全部与CPU Q8\_0一致；half-step输入中CPU/GPU有1876个code不同，但scale仍0 mismatch，而GPU实code与主机模拟的CUDA公式也有470个不同。因此verify-strict必须对拍设备实际产出的code/scale，不能只比较公式名称。
+
+真实DSV4全量回放中，15,675,392个hidden值只有34个CPU/GPU code不同（2.17 ppm）、scale全部相同，差异值距half-step最大1.5259e-5。基于此实现了default-off的边界fallback：raw低阈值64-token短跑回退37个layer-token/112 hot slots，恢复CPU remote-only正文hash，TG为27.2（CPU 25.1，普通GPU-hot 28.5）。DSpark NMAX=2的nominal-only形态为34.8 tok/s、67/120 accepted/drafted，介于CPU 31.2、66/122与普通GPU-hot 37.9、66/122之间；接受改善只有1 token且正文未回到CPU hash。该策略因样本与性能门不足继续default-off，不作生产或通用提速主张。
+
+另一个default-off phase selector（`GGML_HOT_EXPERT_UPE_VERIFY_CPU=1`）在n_tokens>1时完全跳过GPU-hot提交，用来消除duplicate fallback税。同一DSpark测试中2,895次multi-token layer全部走CPU，结果30.7 tok/s、66/122，正文hash与CPU remote-only完全一致，但也没有任何净提速。这证明剩余轨迹差异来自multi-token GPU expert execution；下一落点是统一CUDA Q8/dot/累加/clamp-SwiGLU契约，而不是绕过GPU。
+
+进一步的weight-value审计找到layer21 expert202/205中7个OCP保留`E8M0=0xff`块和249/250极端有限指数。原CUDA原生转换对0xff产生NaN，CPU_REPACK历史路径则使用half-scale=$2^{127}$；一个e8m0-edge测试中CUDA曾有1536/1536非有限输出。当前不改CPU历史语义，而在CUDA MXFP4 MMVQ对0xff显式使用相同half-scale；0xff-only、e250-only和组合edge已全部CPU/GPU逐位一致。全局`0xff→0`方案因pure-CPU PPL 2.7647→2.7801（+0.56%）被否决并回退。
+
+对真实极端块，只统一0xff仍会因巨大正负项的累加次序产生误差，因此TAE/UPE放置规则用`GGML_HOT_EXPERT_EXCLUDE=21:202,21:205`使两个专家强制CPU，并用同层下一热点补足K24。候选单run为37.2 tok/s、66/120=55.0% acceptance。10-chunk PPL为2.5843，对CPU2.5853改善0.039%。但三提示ABCABC warm-server中均值从普通hot的34.124降到33.019 tok/s（-3.24%）；两组正文/acceptance不变，另一组从61/130降到56/140并改变正文。每个placement内部的重复hash都一致，所以这是稳定placement效应，不是随机抖动。候选未改善跨提示Pareto，继续default-off，仅作UPE因果/负结果研究。
+
+另一个更强的反例来自hot-scoped CPU-Q8：它把produced activation code差异完全清零，并在warm-server中同时提高速度与accepted tokens，但PPL反而显著越门。UPE因此不能停在code/scale合同；partial accumulation、epilogue、完整expert输出和无投机质量仍是独立发布条件。
 
 ## 内核发展路线
 
@@ -121,6 +156,16 @@ arec（activation record）把 Q8 激活和 scale 预计算一次，随后让权
 - pinned staging + event drain 将 CPU input readback 从 13 降到 4.6 ms/token；
 - MXFP4 repack GEMV 软件预取带来 +2.6% raw/no-DSpark TG；
 - 64 行 claim 与 UDNL 尾行批量化把 DSpark speculative n2/p0 从 26.50 提升到 30.10 tok/s，同时保持接受率和输出一致。
+
+### 通用加载期动态流式烘焙
+
+磁盘继续保存兼容 GGUF row blocks；`GGML_STREAM_BAKE=1` 在非 mmap 的 CPU_REPACK 加载中用双 staging `pread`，边读边写最终 CPU panel。当前覆盖 Q3_K/Q4_K、IQ2_XXS/IQ2_XS/IQ3_XXS、MXFP4、E4A（以及启用 repack trait 的 Q2_K），不重新量化。真实 MXFP4 1.14085 GB tensor 的整块/流式 FNV-1a64 都是 `84d0d08b79287973`，wall 3.23→2.12 s、峰值 RSS 2,420,908→1,307,104 KiB；IQ3_XXS 822.08 MB tensor 也保持 hash 一致，wall 4.37→3.11 s。
+
+145.26 GiB 全模型 load + `pp1` smoke 为 163.48→98.66 s（-39.65%）。带 NUMA-EP 的 PP256/TG128 三轮总 wall 为 256.83→177.55 s（-30.87%）；PP mean 229.87→230.14，TG 27.14±0.13→26.75±0.41，差异不足 2σ，且最终 repack bytes 相同，因此结论是**加载明显加速、推理速度无可检出变化**。1/4/16/64 MiB 扫描只给 4 MiB 约 1% 局部优势，默认仍用更省 staging 的 1 MiB；功能保持 opt-in。
+
+GPU 侧没有照搬 CPU x8。一个零增容 MXFP4 `E8M0-plane + code-plane` 候选虽然让单 projection 的两 token 微核快约 4%–5%，完整 K24/6-slot hot FFN 在 token=1/2/4 都只有约 1.00×，因此已从生产源码删除。这说明局部全局内存合并不等于完整 FFN 收益；后续 GPU 格式必须依赖跨 token/slot tile 复用、算子融合或原生 tensor-core 数据类型。
+
+随后实现的 gate/up + DSV4 clamp + GLU 多 token 融合在完整 hot FFN 内核上为 +6.3%/+4.3%/+2.6%（1/2/4 token），且 fusion on/off 输出逐位一致；但 K24、NMAX=2、四路 remote-EP 的 512-token ABBA-BAAB 为 39.675→39.225 tok/s（-1.13%，on CV3.21%）。GPU 节省被 remote CPU 关键路径隐藏，因此 `GGML_CUDA_MOE_CLAMPED_FUSION` 保持 default-off，不作为端到端提速。
 
 ## 格式发展路线
 
@@ -151,9 +196,7 @@ UDNL_MX 已从确认的源重新量化并用相同 `performance` 配方复测，
 
 UDNL_MX corrected 以比 Q3_K_XL 小约 2.7% 的体积换来约 2.0× PP 和 +6.2% raw/no-DSpark TG，但 PPL 高 14.6%，因此**不推荐作为 Q3_K_XL 的替代品**。当前通过质量门的主线仍是 E4A strict-hot；UDNL_W4 是固定 4-bit 内核研究线。
 
-Q2/Q3/Q4 Phase A v1 计划为 `61/58/10`，dry-run **108.4046 GiB**、proxy loss **0.898640× all-Q3**，但物化在 `blk.21` 异常 MXFP4 gate/up 源数据使 Q3 fp16 scale 变为 `inf` 时被门禁拒绝。v2 不 clamp 或静默修改数值，而是将完整 gate/up 原子对保留为 MXFP4。该模型已完整生成为 **108.8159 GiB**，129/129 个专家张量的 `Q2_K/Q3_K/Q4_K/MXFP4 = 61/56/10/2` 与 SHA256 均通过验证。不过 reconstruction/traffic proxy 不是质量证据；PPL、raw TG/PP 仍在验收，因此不在主表中预填性能或宣称它优于 Q3。
-
-在相同 CLI/DSO、MXFP4 DSpark draft、prompt/seed、CUDA 布局和 `NMAX=2,p_min=0` 下，Q3_K_XL -> corrected UDNL_MX 再反序复测得到 Q3 **29.37/29.17**、UDNL **33.11/33.64 tok/s**，均值 29.270 对 **33.375 tok/s（+14.02%）**。两格式各自的生成 hash 和接受数跨顺序稳定；UDNL 接受率反而较低（63.556% 对 68.056%）。这是 DSpark 指定配置证据，不是同质量结论：两者既有 PPL 4.6047 对 4.0189 的差异，也生成不同文本。
+Q2/Q3/Q4 v1 在 `blk.21` 异常 MXFP4 gate/up 使 Q3 fp16 scale 变为 `inf` 时被门禁拒绝。v2 将完整 gate/up 原子对保留为 MXFP4，并已物化为 **108.816 GiB**、`Q2_K/Q3_K/Q4_K/MXFP4 = 61/56/10/2`，129/129 tensor、文件大小与 SHA 均通过；但同命令 20-chunk PPL 为 **4.7379**，比 matched UD-Q3_K_XL 的 4.0189 差 **17.89%**。质量门已拒绝，按规则未运行 PP/TG，不把 proxy 优势写成可用模型。格式主线因此转向高质量 GGUF 的动态流式烘焙。
 
 UDNL_MX corrected 的 K24 strict-hot raw/no-DSpark pilot 将 TG 从 26.9 提升到 31.3 tok/s（+16.36%），同命令 5-chunk PPL 从 3.5614 改善到 3.5218；但 cold GGUF 与 12.8496 GiB 热权重合计约 **128.978 GiB**，比 Q3_K_XL 大 8.02%，且尚无同命令 Q3 20-chunk 对照。这只是速度/负面质量消融，不是同质量 headline 或推荐配置。
 

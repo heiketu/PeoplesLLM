@@ -106,31 +106,45 @@ TG512 顺序为 ABBA 后接 BAAB：
 | remote wait mean | 0.444 ms | **0.310 ms** | 仅结构诊断 |
 | mixed merge mean | 0.0070 ms | 0.0296 ms | B 恢复严格的六 slot GPU/CPU 左折叠 |
 
-当前限制是 `n_seq_max=1`、KLOCAL=0、non-pipe 同步调度和 weight-on-master REQ4；每层只有一份 staging/event，原子 in-flight gate 会拒绝并发使用。多 slot 需要 per-context hot buffer/event，MAX_EFFORT 需要额外副本与负载门，DSpark 需要独立验收。
+当前限制是 `n_seq_max=1`、KLOCAL=0、non-pipe 同步调度和 weight-on-master REQ4；每层只有一份 staging/event，原子 in-flight gate 会拒绝并发使用。多 slot 需要 per-context hot buffer/event。
+
+### DSpark multi-token GPU-hot + CPU-remote-EP
+
+桥接已扩展到1-4 target tokens，hot/cold active mask、RESP4和严格merge统一为`[token,slot]`。直接raw-pointer AVX512 merge避免了weighted-cold临时大buffer：64-token诊断中decode assignment 29,508 -> 17,386（-41.08%）、remote wait 847.15 -> 629.38 ms（-25.71%）、merge 120.65 -> 33.27 ms（3.63x），优化前后hash和accepted/drafted一致。
+
+K16/CUDA1的CLI 512-token ABBABAAB为31.8075 -> 37.125 tok/s（+16.72%），但PPL从2.7647升至2.8066，质量门拒绝。K24/CUDA0 PPL改善到2.7412，但生产决策口径的warm server NMAX=3仅35.251 -> 35.950（+1.98%）。NMAX=2的A三轮均值34.645；两个独立B server进程六轮均值36.353、CV2.466%，提升4.928%，比5%硬门低0.072个百分点。因此保留default-off，不作生产提速头条；原始逐请求证据保存在私有实验bundle中。
+
+UPE hot-scoped CPU-Q8消融把真实激活code mismatch从33/10,144降到0、scale mismatch保持0；相同code后的普通MXFP4残余relative error为2.29e-7–4.80e-7，来自CUDA warp accumulation。正式NMAX=2 warm-server A-B-B-A（每档4×512有效请求）为A 35.0614±0.2720、B 37.9573±0.4868 tok/s（+8.2595%）；A/B acceptance为266/490与273/474，各自hash稳定但轨迹不同，43/43 NT3与hook marker通过。B的5-chunk PPL=2.7855，对strict-hot 2.7412为+1.62%，对no-hot 2.7647为+0.75%，超过0.3%门，且仍低于40 tok/s。结论是生产REJECT/default-off：produced-code一致与acceptance提升不足以证明质量保持。
+
+### CPU_REPACK 通用动态流式烘焙
+
+`GGML_STREAM_BAKE=1` 对非mmap CPU_REPACK tensor使用双staging `pread`，按格式row-group边读边写最终panel，不重新量化。真实tensor与全模型结果：
+
+| 范围 | 整块 | stream 1 MiB | 结论 |
+|---|---:|---:|---|
+| MXFP4 1,140,850,688 bytes | 3.23 s / 2,420,908 KiB | 2.12 s / 1,307,104 KiB | hash均`84d0d08b79287973` |
+| IQ3_XXS 822,083,584 bytes | 4.37 s / 1,798,336 KiB | 3.11 s / 995,824 KiB | hash均`a6539c53f8bfce27` |
+| 145.26 GiB全模型load+pp1 | 163.48 s / 146,223,120 KiB | 98.66 s / 146,141,616 KiB | wall -39.65% |
+| NUMA-EP load+PP256/TG128各3轮 | 256.83 s | 177.55 s | wall -30.87% |
+
+最后一行PP为229.87±38.40→230.14±39.45，TG为27.14±0.13→26.75±0.41；TG差值不足2σ且最终bytes相同，因此判为推理性能无可检出变化，不写成TG回归/提升。1/4/16/64 MiB扫描中4 MiB仅快约1%，1 MiB更省staging且历史E4A也最优，故默认chunk保持1 MiB，功能仍opt-in。
+
+GPU MXFP4 planar候选在单projection token2局部快约4%--5%，但完整K24/6-slot hot FFN三轮在token1/2/4均约1.00x，已从生产源码删除。该结果进一步说明“体积/局部带宽更优”不能代替完整算子链验收。
+
+CUDA clamped FFN fusion把gate/up共享一次activation量化，并在同一MMVQ kernel内完成DSV4 clamp与GLU。K24/6-slot完整hot-FFN为+6.3%/+4.3%/+2.6%（1/2/4 token），on/off hash逐位一致。但四路e128 MAX_EFFORT、K24、NMAX2的512-token ABBA-BAAB为off 39.675（CV2.06%）对on 39.225（CV3.21%），-1.13%；8轮acceptance=0.52410、261/498和正文hash一致。内核收益被remote CPU关键路径隐藏，`GGML_CUDA_MOE_CLAMPED_FUSION`保持default-off。
 
 ### Q2/Q3/Q4 proxy 与物化门禁状态
 
-Q2/Q3/Q4 Phase A v1 的 129-tensor gate/up 原子计划为 `Q2_K/Q3_K/Q4_K = 61/58/10`，dry-run **108.4046 GiB**、large-scan proxy loss **0.898640× all-Q3**、expert traffic **0.903594× all-Q3**。完整物化在 `blk.21.ffn_gate_exps.weight` 的 Q3 fp16 super-scale 变为 `inf` 时被验证门拒绝，没有输出模型；这不是 PPL 失败。
+Phase A v1 的 129-tensor gate/up 原子计划为 `Q2_K/Q3_K/Q4_K = 61/58/10`，dry-run **108.4046 GiB**、large-scan proxy loss **0.898640× all-Q3**、expert traffic **0.903594× all-Q3**。完整物化在 `blk.21.ffn_gate_exps.weight` 的 Q3 fp16 super-scale 变为 `inf` 时被验证门拒绝，没有输出模型；这不是 PPL 失败。
 
 随后对 129 个 expert tensor 做全量只读 MXFP4 representability 扫描，只有 `blk.21` 的 gate/up 两个 tensor 含异常范围，可能让 Q2_K/Q3_K/Q4_K 的 fp16 super-scale 溢出。v2 不 clamp、不重解释源值，而是把完整 gate/up 原子对保留为 MXFP4；类型计数为 `Q2_K/Q3_K/Q4_K/MXFP4 = 61/56/10/2`：
 
 | 计划 | Q2_K / Q3_K / Q4_K / MXFP4 | dry-run | proxy loss / all-Q3 | expert traffic / all-Q3 | 状态 |
 |---|---:|---:|---:|---:|---|
 | v1 | 61 / 58 / 10 / 0 | 108.4046 GiB | 0.898640 | 0.903594 | 物化被 scale-inf 门拒绝，无模型 |
-| v2 | 61 / 56 / 10 / 2 | **108.8159 GiB** | 0.888917 | 0.907259 | 物化完成；129/129 类型、大小与 SHA 通过 |
+| v2 | 61 / 56 / 10 / 2 | **108.8159 GiB** | 0.888917 | 0.907259 | 已物化；PPL 4.7379，质量门拒绝 |
 
-这些仍只是 reconstruction/traffic 代理与 quantizer 容量结果，不是模型质量或速度。v2 的完整产物为 116,840,147,392 bytes（108.8159 GiB），129/129 个专家张量与 `61/56/10/2` 类型计数已核验。它仍必须先通过 PPL、确定性和完整输出门，才能将 raw TG/PP 列入正式表；DSpark 需另行测量。
-
-### DSpark NMAX=2 的 Q3_K_XL / corrected UDNL_MX 双顺序对照
-
-两格式使用同一 CLI/DSO、MXFP4 DSpark draft、prompt、seed、CPU 线程和 CUDA 布局，配置为 `NMAX=2,p_min=0`。顺序为 Q3 -> UDNL，然后反序 UDNL -> Q3：
-
-| 格式 | 正序 TG | 反序 TG | 均值 | 样本标准差 | draft acceptance |
-|---|---:|---:|---:|---:|---:|
-| Q3_K_XL | 29.37 | 29.17 | 29.270 | 0.141 | 68.056% (294/432) |
-| corrected UDNL_MX | 33.11 | 33.64 | **33.375** | 0.375 | 63.556% (286/450) |
-
-UDNL 在该配置下高 **14.02%**。Q3 两轮的生成正文 hash 相同，UDNL 两轮也相同，接受数同样跨顺序稳定；两格式之间的正文 hash 不同。UDNL 接受率较低，所以其 TG 差异不是“接受了更多 draft”造成的；但 target verify、CPU MoE 格式/内核开销和不同生成轨迹仍然混合在一起。已知 PPL 为 Q3 4.0189、UDNL 4.6047，因此本表不支持同质量、纯格式 causal 或任意 prompt 的外推结论。
+v2文件116,840,147,392 bytes，129/129类型、producer SHA和payload hash均通过；matched UD-Q3_K_XL PPL为4.0189，v2为4.7379（+17.89%）。质量门拒绝后没有运行PP/TG或DSpark。proxy只解释选择器目标，不能替代模型质量；该首模不作为可用格式。
 
 <details>
 <summary>历史矩阵：2026-08-21，<code>powersave</code>（仅供追溯）</summary>

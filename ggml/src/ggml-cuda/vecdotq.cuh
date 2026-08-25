@@ -324,7 +324,12 @@ static __device__ __forceinline__ float vec_dot_mxfp4_q8_1(
         sumi = ggml_cuda_dp4a(v.y, q8[l + 4], sumi);
     }
 
-    const float d = ggml_cuda_e8m0_to_fp32(bq4->e) * 0.5f * __low2float(bq8_1->ds);
+    // Compatibility profile for GGUFs containing the OCP-reserved 0xff byte:
+    // CPU_REPACK historically interprets the half-scale as 2^127. CUDA's native
+    // E8M0 conversion yields NaN, so spell out the CPU execution value here.
+    const float weight_scale_half = bq4->e == 0xff ? __int_as_float(0x7f000000) :
+        ggml_cuda_e8m0_to_fp32(bq4->e) * 0.5f;
+    const float d = weight_scale_half * __low2float(bq8_1->ds);
     return d * sumi;
 }
 

@@ -29,12 +29,6 @@
 #include <sys/sysctl.h>
 #endif
 
-#if defined(__gnu_linux__)
-#include <stdint.h>
-#include <sys/mman.h>
-#endif
-
-
 // backend buffer type
 
 const char * ggml_backend_buft_name(ggml_backend_buffer_type_t buft) {
@@ -3138,24 +3132,6 @@ static ggml_backend_buffer_t ggml_backend_cpu_buffer_type_alloc_buffer(ggml_back
         GGML_LOG_ERROR("%s: failed to allocate buffer of size %zu\n", __func__, size);
         return NULL;
     }
-
-#if defined(__gnu_linux__)
-    // env GGML_KV_THP=1: mark large CPU host buffers (KV cache, compute workspace) for
-    // transparent huge pages. These ranges are the CPU-side TLB hot spots; with
-    // defrag=madvise the kernel attempts fault-time 2 MiB pages for MADV_HUGEPAGE VMAs.
-    // madvise needs a page-aligned start; posix_memalign(64) does not guarantee one.
-    static const bool kv_thp = []() {
-        const char * e = getenv("GGML_KV_THP");
-        return e && e[0] != '\0' && strcmp(e, "0") != 0;
-    }();
-    if (kv_thp && size >= (size_t)(2u << 20)) {
-        const uintptr_t beg = ((uintptr_t) data + 4095) & ~(uintptr_t) 4095;
-        const size_t    adj = beg - (uintptr_t) data;
-        if (size > adj && madvise((void *) beg, size - adj, MADV_HUGEPAGE) != 0) {
-            GGML_LOG_WARN("%s: madvise(MADV_HUGEPAGE) failed for %.2f MiB buffer\n", __func__, size/1048576.0);
-        }
-    }
-#endif
 
     return ggml_backend_buffer_init(buft, ggml_backend_cpu_buffer_i, data, size);
 }

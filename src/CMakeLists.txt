@@ -50,6 +50,11 @@ add_library(llama
             ${LLAMA_MODELS_SOURCES}
             )
 
+if (NOT LLAMA_USE_SYSTEM_GGML AND TARGET ggml-cpu AND NOT GGML_BACKEND_DL)
+    target_sources(llama PRIVATE llama-repack-stream-bake.cpp)
+    target_compile_definitions(llama PRIVATE LLAMA_REPACK_STREAM_BAKE)
+endif()
+
 set_target_properties(llama PROPERTIES
     VERSION ${LLAMA_VERSION_BASE}
     SOVERSION ${LLAMA_VERSION_MAJOR}

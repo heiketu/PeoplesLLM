@@ -38,7 +38,7 @@
 | `GGML_NUMA_EP_GATE_UP_PARALLEL` | 关 | 小批 decode 时把每个节点内线程对半分给独立的 gate/up 专家投影并融合 clamp/GLU；要求 2 节点、线程数可被 4 整除、repack 权重、token 维 ≤8，不满足自动回退。`ggml-cpu.c:5452` | 配合 `GGML_NUMA_EP=1` + `GGML_NUMA_HIER_BARRIER=1` 的双路纯 CPU decode；混合模式 PP 自动走原路径 |
 | `GGML_NUMA_EP_DEBUG` | 关 | 行窗 EP claim 诊断：每 256 次调用打印 wall/spread/busy/两节点认领行数/窃取统计。`repack.cpp:6021` | 调试专用；共享计数器热行有明显海森堡效应（TG 约 -18%），只看相对结构 |
 | `GGML_NUMA_EP_MMAP` | 关 | 允许对 mmap 加载的模型做 **policy-only** 专家放置（`mbind(MPOL_BIND, flags=0)`，只设 VMA 策略、不迁移已缓存页）。不设时 mmap + EP 直接跳过放置并打日志。`src/llama-model.cpp:1501` | **避免**：冷 page cache 下首触页按 interleave 落两节点后被钉死在错位节点，PP 减半。EP 生产配置请用 `--no-mmap` |
-| `GGML_NUMA_EP_PLACE` | 行窗（默认） | `=block` 时专家权重改按 2 MiB 块交替 mbind 到各节点，计算侧按同一字节网格推导节点本地行区间。`src/llama-model.cpp`、`repack.cpp` | **否决留档**：端到端零收益（HANDOVER:1377-1383），保持默认 |
+| `GGML_NUMA_EP_PLACE` | 行窗（默认） | `=block` 时专家权重改按 2 MiB 块交替 mbind 到各节点，计算侧按同一字节网格推导节点本地行区间。`src/llama-model.cpp`、`repack.cpp` | **否决留档**：端到端零收益，保持默认 |
 
 ### 1.2 NUMA barrier 与 mirror
 
@@ -62,7 +62,7 @@
 | `GGML_CPU_DISABLE_FUSION` | 关（上游已有） | `=1` 禁用 CPU op fusion 框架。`ggml-cpu.c:5448` | 调试用 |
 | `GGML_REPACK_MMID_GEMM_TILE` | `32` | MoE `mul_mat_id` 每次 GEMM 调用 staging 的 src1 行数上限；仅接受 4/8/16/32，其他值回落 32。`repack.cpp:6254` | 扫参/A/B 专用 |
 | `GGML_CPU_FP16_INTERMEDIATE` | 关 | `=1` MoE 块内激活走 f16 中间态（优先于 q8 边界）。`src/llama-graph.cpp:2501`、`repack.cpp:41` | 实验岛，默认关 |
-| `GGML_CPU_INT8_INTERMEDIATE` | 关 | `=1` MoE 块内激活走 q8_0 中间态；与 FP16 同设时 INT8 赢。`src/llama-graph.cpp:2508`、`ops.cpp:664` | **否决留档**：比 FP16 差一个量级（HANDOVER:1227 ②），别用 |
+| `GGML_CPU_INT8_INTERMEDIATE` | 关 | `=1` MoE 块内激活走 q8_0 中间态；与 FP16 同设时 INT8 赢。`src/llama-graph.cpp:2508`、`ops.cpp:664` | **否决留档**：比 FP16 差一个量级，别用 |
 | `GGML_MOE_HOT_STATS` | 关 | `=1` 经 gate 投影的 mmid ids 统计每层每专家命中数（每个 (token, expert) 选中计一次），退出时 atexit 落盘 TSV；上限 128 层 × 1024 专家。`repack.cpp:81` | 采集热专家画像；产出即 Slice 12 `GGML_HOT_EXPERT_TABLE` 的输入格式（§4.4） |
 | `GGML_MOE_HOT_STATS_PATH` | `/tmp/expert-hot.tsv` | 上者 TSV 的落盘路径。`repack.cpp:60` | 配合上者 |
 | `GGML_MOE_HOT_TRACE` | 关 | `=1` 记录 gate router 的时序选择，每个 token row 输出 `step layer expert...`；`step` 是捕获序号。事件先写入有界内存，退出时批量落盘。`xllama-hot-trace.cpp` | 仅用于单槽、hot-expert-off 的 temporal LRU 回放；与 `GGML_HOT_EXPERT=1` 同开时会拒绝启用，避免把已掩码 sentinel 写成伪缺失 trace |
@@ -84,14 +84,17 @@
 | `GGML_REPACK_Q3_R_GEMM_MR` | `8` | Q3_R GEMM 行分块；`=4` 恢复旧分块。`arch/x86/repack.cpp:5994` |
 | `GGML_REPACK_Q3_R_GEMM_MADD` | 开 | Q3_R GEMM maddubs+madd 整数 tile（仅 nc≥8 启用）；`=0` 强制 fp32-finalize tile。`arch/x86/repack.cpp:6002` |
 
-### 1.4 E4A 有界流式加载
+### 1.4 CPU_REPACK 有界流式烘焙
 
-源码：`src/llama-e4a-stream-bake.cpp`、`src/llama-model-loader.cpp`、`ggml/src/ggml-cpu/repack.cpp`。
+源码：`src/llama-repack-stream-bake.cpp`、`src/llama-model-loader.cpp`、`ggml/src/ggml-cpu/repack.cpp`。
 
 | 变量 | 默认 | 作用 | 何时开 / 关 |
 |---|---|---|---|
-| `GGML_E4A_STREAM_BAKE` | 关 | `=1` 时，非 mmap、非 direct-I/O 且目标为 CPU_REPACK 的 E4A tensor 使用双 staging `pread` + NR16 panel byte-bake；不分配完整 raw tensor。非 E4A、非法 shape、非 CPU_REPACK 或能力不匹配在写入前自动走原 loader。读取/验证错误终止加载，进度取消返回失败，不执行半成品 tensor | E4A + AVX512/VNNI 的 `--load-mode none` 实验；当前保持 opt-in，生产启用前先跑 `test-e4a-stream-bake` 和真实模型 smoke |
-| `GGML_E4A_STREAM_BAKE_CHUNK_MIB` | `1` | requested staging chunk MiB，合法范围 1–1024；运行时向完整 `(16 rows, all K blocks)` panel 边界取整，双 staging 峰值约为 2x effective chunk。非法值会 warning 并关闭 stream bake | 当前 NVMe/E4A pure-byte 实测 1 MiB 最优；不同磁盘、direct I/O 或未来 requantization baker 需重新扫描 |
+| `GGML_STREAM_BAKE` | 关 | `=1` 时，非 mmap、非 direct-I/O 且目标为 CPU_REPACK 的受支持 tensor 使用双 staging `pread`，边读边烘焙为 CPU 原生 panel 布局，不分配完整 raw tensor。当前支持 Q3_K/Q4_K、IQ2_XXS/IQ2_XS/IQ3_XXS、MXFP4、E4A；Q2_K 仅在该平台启用其 repack trait 时支持。非法 shape、普通 CPU buffer 或能力不匹配会在写入前自动回退原 loader | `--load-mode none` 加载大模型时试开；当前仍为 opt-in，生产启用前先跑 synthetic 与真实模型 hash smoke |
+| `GGML_STREAM_BAKE_CHUNK_MIB` | `1` | requested staging chunk MiB，合法范围 1–1024；运行时向当前格式的完整 repack row-group 边界取整，双 staging 峰值约为 2x effective chunk。非法值会 warning 并关闭 stream bake | 默认 1 MiB；应按存储设备和目标格式重新扫描 |
+| `GGML_E4A_STREAM_BAKE` / `GGML_E4A_STREAM_BAKE_CHUNK_MIB` | 关 / `1` | 旧 E4A 专用变量的兼容别名；仅在对应 `GGML_STREAM_BAKE*` 未设置时读取 | 旧脚本兼容；新配置使用通用变量 |
+
+真实 MXFP4 1.14085 GB 专家 tensor 的 warm-cache 配对结果：整块重排 3.23 s / 2,420,908 KiB RSS，流式烘焙 2.12 s / 1,307,104 KiB RSS；输出 FNV-1a64 均为 `84d0d08b79287973`。145.26 GiB 全模型同命令 load + `pp1` smoke 为 163.48→98.66 s（-39.65%），两侧 rc0；整模 RSS 仅 -0.056%，因为常驻权重占主导。这是加载期收益，不改变磁盘 GGUF、PPL 或推理内核结果；`pp1` 单发速度不作推理性能样本。
 
 ---
 
@@ -127,6 +130,15 @@
 | `GGML_REMOTE_EP_SCHED_PP_REPEAT_COST` | `1000` | 同一 PP batch 再次命中同一专家时的边际虚拟成本（0–1000）。`:579` | 生产显式设 250（同组 A/B +0.94%） |
 | `GGML_REMOTE_EP_SCHED_REPEAT_ACCOUNTING` | 关 | 把 endpoint 在飞队列与服务率样本统一成「新专家 + repeat 边际成本」单位。`:589` | 多 slot 调度实验；单 slot 实测 -1.45%，生产保持关 |
 | `GGML_REMOTE_EP_WEIGHT_ON_MASTER` | 关 | 同步 SCHED 用 REQ4/RESP4：worker 返回未乘 router weight 的逐 slot 向量，master 加权合并。与异步 `_PIPE=1` 不兼容（自动关闭）。`:552` | 减少 worker 端操作，生产开启 |
+| `GGML_REMOTE_EP_UPE_STRICT` | 关 | `=1` 要求每个 scheduled worker 在 CAP 中返回 UPE precision-contract，拒绝合同、model schema、data epoch 或重连后能力变化。旧 worker 缺合同时直接失败 | 质量保持型混合/DSpark EP 建议开；要求同时设置 `GGML_EP_DATA_EPOCH` |
+| `GGML_EP_DATA_EPOCH` | 空（未知） | master 与所有 worker 共享的不变模型/部署版本字符串；协议上仅传 FNV-1a64 hash。strict UPE 拒绝空值或不匹配 | 使用可复现标识，例如模型 SHA256 + 量化/转换版本；不要用“latest” |
+| `GGML_REMOTE_EP_UPE_ACTIVATION_TRACE` | 关 | `=1` 对真实 remote-EP F32 hidden 按32值块统计CPU与nominal-CUDA code差异和half-step边界距离，并只保留边界block；`=2` 保留全部block供CUDA直接回放（上限2,097,152 blocks，约277MiB）。不改输出，但增加CPU扫描/内存开销 | 仅UPE/DSpark诊断，不计入性能样本 |
+| `GGML_REMOTE_EP_UPE_ACTIVATION_TRACE_FILE` | 空 | 进程退出时写per-layer CSV；未设时trace打stderr | 建议每次实验用独立路径 |
+| `GGML_HOT_EXPERT_UPE_BOUNDARY_FALLBACK` | 关 | GPU-hot + CPU-remote 实验性verify-strict策略：某token hidden任一Q8值靠近half-step边界时，只把该token的GPU-hot slots额外派到CPU worker，merge选CPU结果；非边界token仍走GPU | 当前仅A/B；需shadow/PPL/DSpark acceptance与性能门后才能默认 |
+| `GGML_HOT_EXPERT_UPE_BOUNDARY_THRESHOLD` | `1e-6` | raw/TG的归一化Q8 half-step距离阈值（0–0.01）；CPU与nominal-CUDA code直接不同时无视距离必然fallback。全量15.7M trace上该组合预测60个值，对34个实际差异漏5 | 性能导向研究档；仍default-off |
+| `GGML_HOT_EXPERT_UPE_VERIFY_THRESHOLD` | `0` | n_tokens>1的DSpark verify阈值；默认只在CPU与nominal-CUDA code已不同时fallback。`1.6e-5`可覆盖34/34 trace code差异，但首轮回退3,549 hot slots、TG仅37.9→32.4，已否决作为默认 | nominal-only首轮34.8 tok/s、67/120，仍需多提示/warm-server A/B |
+| `GGML_HOT_EXPERT_UPE_VERIFY_CPU` | 关 | phase selector：n_tokens>1时不提交GPU-hot图，直接走普通CPU remote EP；n_tokens=1 raw/TG仍用GPU-hot。用于消除“GPU先算、CPU再覆盖”的重复税 | 当前仅verify-strict研究；必须用DSpark warm-server验收净TG/acceptance |
+| `GGML_HOT_EXPERT_EXCLUDE` | 空 | 逗号分隔`layer:expert`；这些专家不进GPU驻留集，由同层后续热点自动补足K，并强制走CPU/cold域。非法或表中不存在的项直接拒绝启动 | UPE/TAE设备不适配专家放置；当前研究值`21:202,21:205` |
 | `GGML_REMOTE_EP_RECONNECT_TIMEOUT_MS` | `0`（一次立即重连） | SCHED endpoint 断连后等待 worker 重启并重发暂存请求的最长毫秒（0–300000）。重连后强制核对 expert map/kernel ID/CAP，不一致即拒绝。`:75` | 常驻服务建议 `90000`（覆盖 worker ~70 s 的权重加载/repack） |
 
 ### 2.3 传输与合并
@@ -207,6 +219,7 @@ worker CLI 参数见 §7.3。
 | `GGML_CUDA_MOE_PP_EP` | `0`（关） | 真双卡同层 expert-axis EP：同层 routed experts 沿 expert 轴拆到两张 GPU 分别计算，融合 `MOE_WREDUCE` 按升序 slot 归并，只跨卡传 `[n_embd, n_tokens]` partial。要求 `n_expert` 偶数、MXFP4 等条件。`src/llama-graph.cpp:2401` | 双卡/NVLink 长 prefill（2K PP +63%）；必须配 `MOE_PP_MIN_TOKENS`；单卡勿设 |
 | `GGML_CUDA_MOE_PP_EP_MIN_TOKENS` | `0` | true-EP 的最小 query batch；生效门限为 `max(ep_min, pp_min)`。`src/llama-graph.cpp:2397`、`src/llama-layer-major.cpp:241` | q1 decode 不进入 GPU EP；建议显式设 2048 |
 | `GGML_CUDA_MOE_PP_EP_OWNER_EXPERTS` | `n_expert/2` | rank0 持有的专家数（覆盖 50/50 拆分）。`src/llama-layer-major.cpp:32` | 双卡算力不均时调 |
+| `GGML_CUDA_MOE_CLAMPED_FUSION` | 关 | `=1` 允许CUDA MMVQ把量化MoE的gate/up、DSV4 clamp和GLU合并；支持1--4 target tokens。K24/6-slot完整hot-FFN为+2.6%--6.3%，但512-token remote-EP ABBA-BAAB为39.675→39.225 tok/s（-1.13%，B CV3.21%），未过端到端门 | 仅内核研究/本机A/B；生产保持关 |
 | `GGML_CUDA_MMQ_MOE_J` | `0`（自动） | 强制 MoE MMQ tile 宽度 J（8..128 步进 8）；自动模式按每专家典型行数选择。`ggml/src/ggml-cuda/mmq.cuh:1486` | 仅 A/B 测量 |
 | `GGML_CUDA_P2P` | 关 | 允许双卡 backend 用 peer/NVLink copy。`ggml-cuda.cu:400` | 有 NVLink/P2P 时开；无能力勿设 |
 | `GGML_CUDA_MOE_PP_RESERVE_MB` | `2048` | MoE 预取 staging 槽扩容时必须保留的显存余量（MB），不足则槽不增长。`ggml-cuda.cu:2527` | 显存紧张时调 |
@@ -254,11 +267,14 @@ server 侧资格门：全新单序列 prompt、token 数 ≥ 阈值、无 cache 
 | `GGML_HOT_EXPERT_K` | `16` | 每层钉驻的热专家数；DSV4 最终单槽质量门使用 K24（12.8496 GiB 热权重），不得在未做显存与 PPL 门禁时机械照搬 |
 | `GGML_HOT_EXPERT_DEV` | `CUDA1` | 热专家驻留设备 |
 | `GGML_HOT_EXPERT_LAYERS` | `all` | 生效层：逗号表/区间（如 `42`、`30-42`） |
-| `GGML_HOT_EXPERT_MAX_TOKENS` | `1` | GPU fork 处理的最大 n_tokens；当前 compact graph 固定单 token，设置 >1 会 warning 并钳制到 1；`0` 禁用 fork |
+| `GGML_HOT_EXPERT_MAX_TOKENS` | `1` | GPU fork 处理的最大 n_tokens，合法范围 1–4；用于 DSpark 2–4 token speculative decode 的 compact graph。`0` 禁用 fork |
 | `GGML_HOT_EXPERT_PACKED_IO` | 开 | 把 hidden、ids 和 router weights 按 256 B 对齐后合成一次 H2D；`=0` 回退三次独立 H2D。layer 42 callback ABBA 为 137.560 -> 134.432 us（+2.33%），43 层端到端收益仍待测 |
-| `GGML_HOT_EXPERT_SLOT_ORDER` | **开** | `=1` 让 GPU 回传逐 router-slot 专家输出，由 CPU 按 slot 0..5 严格左折叠，恢复 baseline 求和顺序；`=0` 回退 cold/hot 两 partial 最后相加的旧路径，用于 A/B。当前严格路径限定 `MAX_TOKENS=1` |
+| `GGML_HOT_EXPERT_SLOT_ORDER` | **开** | `=1` 让 GPU 回传逐 `[token,router-slot]` 专家输出，由 CPU 对每个 token 按 slot 0..5 严格左折叠，恢复 baseline 求和顺序；`=0` 回退 cold/hot 两 partial 最后相加的旧路径，用于 A/B。当前实现覆盖 `MAX_TOKENS=1–4`，但仍只验收单 active slot |
 | `GGML_HOT_EXPERT_SLOT_MERGE_AVX512` | **开** | x86 GCC/Clang 且 CPU 支持 AVX512F 时，跨 16 个 hidden rows 向量化 strict slot merge；slot 0..5 仍逐 slot 独立 `mul` 后 `add`，不使用 FMA。`=0` 强制 scalar 回退；其它平台自动 scalar |
 | `GGML_HOT_EXPERT_REMOTE_EP` | 关 | `=1` 将CUDA hot slots与scheduled remote-EP合并；当前只接受单slot、`n_seq_max=1`、`KLOCAL=0`、同步REQ4、`WEIGHT_ON_MASTER=1`、`PIPE=0`。dealer只向CPU派cold slots，master按原slot顺序合并 |
+| `GGML_CUDA_HOT_MXFP4_CPU_Q8` | 关 | 仅对名称为`hot_expert.*`的CUDA MXFP4 MMVQ激活使用CPU Q8_0同款RNE code生成；不改变scale、权重解释或warp归约树。用于缩小GPU-hot/CPU_REPACK produced-code合同差异 | UPE/DSpark实验；即使code mismatch归零也不代表expert bit-exact，必须继续过PPL、hash、acceptance与warm-server门 |
+| `GGML_HOT_EXPERT_REMOTE_EP_SHADOW` | 关 | `=1` 时热 slot 也发送给 CPU REQ4，最终结果仍使用 GPU；用来配对审计 GPU/CPU 专家数值差异。要求同时开启 `GGML_HOT_EXPERT_REMOTE_EP`，不可计入性能样本 |
+| `GGML_HOT_EXPERT_SHADOW_FILE` | `/tmp/hot-expert-shadow.csv` | shadow 模式输出 CSV；既含逐层逐专家误差，也含 `expert=-1` 的整层候选输出对 all-CPU strict 输出统计 | 质量/接受率诊断；生产关闭 |
 | `GGML_HOT_EXPERT_MARKERS` | 关 | `=1` 输出稳定的 `[hotmarker] init/fork` 记录；init 显式包含 `slot_order=1/0`，供正式 benchmark meta 校验实际路径 |
 
 当前已验收范围是单槽 decode。DSV4 K24 本地CPU cold路径的12轮结果为25.0167→30.2333 tok/s，PP2048=361.47 tok/s，5-chunk PPL 2.7758→2.7548。四路remote CPU cold桥接的raw/no-DSpark八轮为25.25→28.85 tok/s（+14.26%），paired PPL 2.7647→2.7412。后者仍是strict modulo cover，不是MAX_EFFORT。多槽并发尚未验收，因为 staging/event 状态仍需拆成per-context/per-slot所有权；当前in-flight原子门会拒绝并发覆盖。`SLOT_ORDER=0`只用于旧路径消融，不应作为生产提速开关。
@@ -412,14 +428,14 @@ llama-epd -m model.gguf --selftest [--selftest-layer N] [--selftest-tokens N]
 
 | 项 | 状态 | 证据与结论 |
 |---|---|---|
-| `GGML_NUMA_EP_PLACE=block` | 否决留档，default-off | 2 MiB block placement 端到端零收益（HANDOVER:1377-1383，commit 752c435fd；§1.1） |
-| 三级 barrier（`HIER_BARRIER=2`）+ `GGML_NUMA_PIN_CORE` + `GGML_NUMA_BARRIER_GROUP` | 否决留档，default-off | Slice 10 否决（commit 35aa515b9，HANDOVER:1491-1497；§1.2） |
-| `pocs/udnl-grid-mmid.cpp` | 否决留档 | Slice 6 的 32 核网格 GEMM 原型，胜率 0（HANDOVER:1395-1400） |
-| `GGML_CPU_INT8_INTERMEDIATE`（INT8 激活岛） | 否决留档，default-off | 比 FP16 差一个量级（HANDOVER:1227 ②；§1.3） |
-| `GGML_CUDA_FA_PV_Q8` | 否决留档，default-off | q8_0 V 的替代 P*V 路径，负结果（HANDOVER:1227 ④；`fattn-common.cuh:1692`） |
+| `GGML_NUMA_EP_PLACE=block` | 否决留档，default-off | 2 MiB block placement 端到端零收益（commit 752c435fd；§1.1） |
+| 三级 barrier（`HIER_BARRIER=2`）+ `GGML_NUMA_PIN_CORE` + `GGML_NUMA_BARRIER_GROUP` | 否决留档，default-off | Slice 10 否决（commit 35aa515b9；§1.2） |
+| 32 核网格 GEMM 原型 | 否决留档 | Slice 6 实测胜率 0，原型不进入公开生产路径 |
+| `GGML_CPU_INT8_INTERMEDIATE`（INT8 激活岛） | 否决留档，default-off | 比 FP16 差一个量级（§1.3） |
+| `GGML_CUDA_FA_PV_Q8` | 否决留档，default-off | q8_0 V 的替代 P*V 路径为负结果（`fattn-common.cuh:1692`） |
 | `GGML_REMOTE_EP_PIPELINE(+_CHUNK)` | 留档，default-off | 净收益仅 +0.7~1.4%（§2.3） |
 | `LLAMA_LAYER_MAJOR_SPECULATIVE` | 留档，default-off，**生产禁开** | 远程 EP 下负收益（§4.3） |
 | `GGML_REMOTE_EP_SCHED_REPEAT_ACCOUNTING` | 留档，default-off | 单 slot -1.45%（§2.2） |
-| `GGML_CUDA_ALLREDUCE=internal`（TP AllReduce） | 实验级保留 | 二轮 TP tg +49%（13.6→20.3）仍低于 layer 模式 25.9；联合 graph 捕获已否决（天花板 +3，HANDOVER:1503；§4.1） |
+| `GGML_CUDA_ALLREDUCE=internal`（TP AllReduce） | 实验级保留 | 二轮 TP tg +49%（13.6→20.3）仍低于 layer 模式 25.9；联合 graph 捕获天花板仅 +3（§4.1） |
 | 整层 `-ot` 跨设备钉卡 | 否决，无代码残留 | Slice 9：跨设备 -10%（HOT-EXPERT-GPU.md §4） |
 | dspark 流水线化 / 半确定预取 / e144 / MXFP4 NR5..8 / signed-bias dealer / GLU-down fusion | 各 Slice 否决，代码已回退 | 无残留，仅留档 |

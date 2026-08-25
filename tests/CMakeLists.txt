@@ -376,10 +376,6 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
 endif()
 llama_test(test-layer-major LABEL model)
 
-# standalone correctness harness for GGML_CUDA_RESIDENT_BF16 resident f16/bf16
-# weight materialization in the CUDA device buffer
-llama_build(test-resident-bf16.cpp)
-
 # bit-exactness harness for the DSV4 quantized-KV compact gather path
 # (get_rows + cast vs full dequant + get_rows on the CPU backend)
 llama_build(test-dsv4-gather-dequant.cpp)
@@ -395,9 +391,67 @@ add_test(NAME test-hot-expert-slot-merge-scalar
     COMMAND ${CMAKE_COMMAND} -E env GGML_HOT_EXPERT_SLOT_MERGE_AVX512=0
         $<TARGET_FILE:test-hot-expert-slot-order>)
 
+if (GGML_CUDA)
+    llama_build(test-cuda-mxfp4-fused-clamp.cpp)
+    add_test(NAME test-cuda-mxfp4-fused-clamp
+        COMMAND ${CMAKE_COMMAND} -E env GGML_CUDA_MOE_CLAMPED_FUSION=1
+            $<TARGET_FILE:test-cuda-mxfp4-fused-clamp>)
+    add_test(NAME test-cuda-mxfp4-fused-clamp-disabled
+        COMMAND ${CMAKE_COMMAND} -E env GGML_CUDA_DISABLE_FUSION=1
+            $<TARGET_FILE:test-cuda-mxfp4-fused-clamp>)
+
+    if (TARGET ggml-cpu)
+        if (UNIX AND NOT APPLE)
+            llama_build(test-cuda-q8-contract.cpp)
+            target_link_libraries(test-cuda-q8-contract PRIVATE ggml-cuda ggml-cpu ggml CUDA::cudart)
+            target_link_options(test-cuda-q8-contract PRIVATE "LINKER:--no-as-needed")
+            target_include_directories(test-cuda-q8-contract PRIVATE
+                ${PROJECT_SOURCE_DIR}/ggml/src
+                ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cpu
+                ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda)
+            llama_test(test-cuda-q8-contract)
+            add_test(NAME test-cuda-q8-contract-cpu-q8
+                COMMAND ${CMAKE_COMMAND} -E env GGML_CUDA_MXFP4_CPU_Q8=1
+                    $<TARGET_FILE:test-cuda-q8-contract>)
+        endif()
+
+        llama_build(test-cpu-cuda-mxfp4-parity.cpp)
+        target_link_libraries(test-cpu-cuda-mxfp4-parity PRIVATE ggml-cpu)
+        target_include_directories(test-cpu-cuda-mxfp4-parity PRIVATE
+            ${PROJECT_SOURCE_DIR}/ggml/src
+            ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cpu)
+        llama_test(test-cpu-cuda-mxfp4-parity)
+        add_test(NAME test-cpu-cuda-mxfp4-parity-hot-cpu-q8
+            COMMAND ${CMAKE_COMMAND} -E env GGML_CUDA_HOT_MXFP4_CPU_Q8=1
+                $<TARGET_FILE:test-cpu-cuda-mxfp4-parity>)
+    endif()
+endif()
+
 # standalone numerical tests + microbenchmarks for the 8x8 repack matmul kernels
 # (Q2_K / Q5_K x Q8_K); needs the internal ggml-cpu repack headers and symbols
 if (NOT LLAMA_USE_SYSTEM_GGML AND TARGET ggml-cpu)
+    find_package(Threads REQUIRED)
+    add_executable(test-xllama-hot-trace
+        test-xllama-hot-trace.cpp
+        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cpu/xllama-hot-trace.cpp)
+    target_compile_features(test-xllama-hot-trace PRIVATE cxx_std_17)
+    target_link_libraries(test-xllama-hot-trace PRIVATE Threads::Threads)
+    target_include_directories(test-xllama-hot-trace PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cpu)
+    add_test(NAME test-xllama-hot-trace COMMAND $<TARGET_FILE:test-xllama-hot-trace>)
+    add_test(NAME test-xllama-hot-trace-disabled COMMAND $<TARGET_FILE:test-xllama-hot-trace> disabled)
+    add_test(NAME test-xllama-hot-trace-hot-conflict COMMAND $<TARGET_FILE:test-xllama-hot-trace> hot-conflict)
+    add_test(NAME test-xllama-hot-trace-capacity COMMAND $<TARGET_FILE:test-xllama-hot-trace> capacity)
+
+    if (UNIX AND NOT GGML_BACKEND_DL)
+        llama_build(test-repack-stream-bake.cpp)
+        target_link_libraries(test-repack-stream-bake PRIVATE ggml-cpu)
+        target_include_directories(test-repack-stream-bake PRIVATE
+            ${PROJECT_SOURCE_DIR}/src
+            ${PROJECT_SOURCE_DIR}/ggml/src
+            ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cpu)
+        llama_test(test-repack-stream-bake)
+    endif()
+
     add_executable(test-repack-kernels test-repack-kernels.cpp)
     target_link_libraries(test-repack-kernels PRIVATE ggml-cpu ggml)
     target_include_directories(test-repack-kernels PRIVATE
@@ -413,10 +467,21 @@ if (NOT LLAMA_USE_SYSTEM_GGML AND TARGET ggml-cpu)
     # Slice-0 UD-NL microbench: per-format single-core decode ceiling plus the
     # W4-NL NR16xK4 prototype kernel (x86-64 only; self-skips without AVX512).
     if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
-        add_executable(test-udnl-w4nl test-udnl-w4nl.cpp)
-        target_link_libraries(test-udnl-w4nl PRIVATE ggml-cpu ggml)
-        target_include_directories(test-udnl-w4nl PRIVATE
+        add_executable(test-repack-iq test-repack-iq.cpp)
+        target_link_libraries(test-repack-iq PRIVATE ggml-cpu ggml)
+        target_include_directories(test-repack-iq PRIVATE
             ${PROJECT_SOURCE_DIR}/ggml/src
             ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cpu)
+        add_test(NAME test-repack-iq COMMAND $<TARGET_FILE:test-repack-iq>)
+
+        if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND NOT MSVC)
+            add_executable(test-udnl-w4nl test-udnl-w4nl.cpp)
+            target_link_libraries(test-udnl-w4nl PRIVATE ggml-cpu ggml)
+            target_include_directories(test-udnl-w4nl PRIVATE
+                ${PROJECT_SOURCE_DIR}/ggml/src
+                ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cpu)
+            add_test(NAME test-udnl-w4nl
+                COMMAND $<TARGET_FILE:test-udnl-w4nl> --w4nl 256 256)
+        endif()
     endif()
 endif()

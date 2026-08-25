@@ -273,6 +273,7 @@ def main() -> int:
     parser.add_argument("--max-holders", type=int, default=2,
                         help="maximum total holders per expert (primary included)")
     parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    parser.add_argument("--output", type=Path, help="write output to a file instead of stdout")
     args = parser.parse_args()
     if args.workers < 1 or args.workers > 63 or args.extra_per_worker < 0 or \
             args.max_holders < 1 or args.max_holders > args.workers:
@@ -314,15 +315,20 @@ def main() -> int:
         ],
     }
     if args.json:
-        print(json.dumps(result, indent=2, sort_keys=True))
+        output = json.dumps(result, indent=2, sort_keys=True) + "\n"
     else:
-        print(f"layers={layers} experts={len(freq)} workers={args.workers}")
+        lines = [f"layers={layers} experts={len(freq)} workers={args.workers}"]
         for name, values in result["metrics"].items():
-            print(f"{name}: peak_layer_ratio={values['peak_layer_ratio']:.6f} "
-                  f"normalized_rms={values['normalized_rms']:.6f}")
+            lines.append(f"{name}: peak_layer_ratio={values['peak_layer_ratio']:.6f} "
+                         f"normalized_rms={values['normalized_rms']:.6f}")
         for worker in result["workers"]:
-            print(f"worker{worker['worker']} primary={worker['primary_count']} "
-                  f"replicas={worker['replica_count']} --expert-list {worker['expert_list']}")
+            lines.append(f"worker{worker['worker']} primary={worker['primary_count']} "
+                         f"replicas={worker['replica_count']} --expert-list {worker['expert_list']}")
+        output = "\n".join(lines) + "\n"
+    if args.output:
+        args.output.write_text(output)
+    else:
+        print(output, end="")
     return 0
 
 

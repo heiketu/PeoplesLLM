@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <limits>
 #include <memory>
@@ -144,6 +145,13 @@ struct remote_ep_state {
     bool        sched_max_effort = false; // KLOCAL=0: allow replicated worker experts
     bool        sched_pp        = false; // allow n_tokens > 1 (P4; default decode-only)
     bool        sched_weight_on_master = false; // REQ4: worker skips output weighting op
+    bool        upe_strict      = false; // require negotiated UPE contract + nonzero data epoch
+    uint64_t    upe_expected_epoch = 0; // hash of GGML_EP_DATA_EPOCH, zero = unspecified
+    bool        upe_boundary_fallback = false; // route sensitive GPU-hot tokens to CPU workers
+    float       upe_boundary_threshold = 1.0e-6f; // raw/TG distance in normalized Q8 units
+    float       upe_verify_boundary_threshold = 0.0f; // multi-token verify: nominal mismatch only by default
+    std::atomic<uint64_t> upe_boundary_tokens{0};
+    std::atomic<uint64_t> upe_boundary_slots{0};
     int64_t     sched_tg_activation_cost = 0; // 1000 = one median assignment
     int         sched_tg_repeat_cost = 250; // per mille of a new expert weight stream
     // Prefill normally balances every routed row independently. Values below
@@ -204,6 +212,30 @@ struct remote_ep_state {
     std::vector<std::vector<uint64_t>> ep_freq;        // [layer][expert]
     std::vector<uint64_t>              ep_freq_tokens; // [layer] tokens seen
 
+    struct upe_activation_stats {
+        uint64_t blocks = 0;
+        uint64_t values = 0;
+        uint64_t nonfinite = 0;
+        uint64_t nominal_code_mismatch = 0;
+        uint64_t near_1e6 = 0;
+        uint64_t near_1e5 = 0;
+        uint64_t near_1e4 = 0;
+        uint64_t near_1e3 = 0;
+    };
+    struct upe_activation_sample {
+        int32_t layer = -1;
+        float values[32] = {};
+    };
+    static constexpr size_t UPE_ACTIVATION_SAMPLE_MAX = 4096;
+    static constexpr size_t UPE_ACTIVATION_SAMPLE_ALL_MAX = 2097152;
+    int                               upe_activation_trace = 0; // 1=boundary samples, 2=all blocks
+    std::string                       upe_activation_trace_file;
+    std::mutex                        upe_activation_trace_mtx;
+    std::vector<upe_activation_stats> upe_activation_layers;
+    std::vector<upe_activation_sample> upe_activation_samples;
+    FILE *                            upe_activation_sample_stream = nullptr;
+    uint32_t                          upe_activation_sample_stream_count = 0;
+
     struct sched_ep {
         std::string        host;
         int                port     = 29200;
@@ -214,6 +246,8 @@ struct remote_ep_state {
         std::vector<uint8_t> expert_bitmap; // optional CAP sparse ownership bits
         uint32_t           kernel_id  = 0;
         uint32_t           caps       = 0;
+        bool               has_precision = false;
+        llama_ep_precision_contract precision = {};
         std::unique_ptr<std::mutex> send_mtx = std::unique_ptr<std::mutex>(new std::mutex); // serializes frame writes on the conn
         std::thread        recv_thread; // pipe mode background receiver
         std::unique_ptr<std::atomic<bool>> recv_live =
@@ -271,7 +305,8 @@ struct remote_ep_state {
         std::vector<uint8_t> accounting_seen;
         std::vector<uint8_t> cold_active;
         std::vector<uint8_t> hot_mask;
-        std::vector<float> hot_cold_slots;
+        std::vector<uint8_t> hot_cpu_override;
+        std::vector<const float *> hot_cold_slots;
         std::vector<int> active_eps;
         std::vector<uint8_t> recv_ok;
         std::vector<std::string> recv_err;
@@ -374,6 +409,188 @@ struct remote_ep_state {
         }
     }
 
+    void trace_upe_activation(int il, const float * hidden, int64_t n_tokens, int64_t n_embd) {
+        if (!upe_activation_trace || hidden == nullptr || il < 0 || n_tokens < 1 || n_embd < 1) {
+            return;
+        }
+        upe_activation_stats local;
+        std::vector<upe_activation_sample> local_samples;
+        for (int64_t token = 0; token < n_tokens; ++token) {
+            const float * row = hidden + token * n_embd;
+            for (int64_t start = 0; start < n_embd; start += 32) {
+                const int64_t count = std::min<int64_t>(32, n_embd - start);
+                float amax = 0.0f;
+                bool finite = true;
+                for (int64_t lane = 0; lane < count; ++lane) {
+                    const float value = row[start + lane];
+                    finite = finite && std::isfinite(value);
+                    amax = std::max(amax, std::abs(value));
+                }
+                ++local.blocks;
+                if (!finite || !std::isfinite(amax)) {
+                    local.nonfinite += (uint64_t) count;
+                    continue;
+                }
+                const float d = amax / 127.0f;
+                const float id = amax == 0.0f ? 0.0f : 127.0f / amax;
+                bool sample_block = false;
+                for (int64_t lane = 0; lane < count; ++lane) {
+                    const float value = row[start + lane];
+                    const float cpu_normalized = value * id;
+                    const int cpu_code = (int) std::nearbyint(cpu_normalized);
+                    const int cuda_nominal_code = amax == 0.0f ? 0 : (int) std::round(value / d);
+                    const bool code_mismatch = cpu_code != cuda_nominal_code;
+                    local.nominal_code_mismatch += code_mismatch;
+
+                    const float fraction = cpu_normalized - std::floor(cpu_normalized);
+                    const float distance = std::abs(fraction - 0.5f);
+                    local.near_1e6 += distance <= 1.0e-6f;
+                    local.near_1e5 += distance <= 1.0e-5f;
+                    local.near_1e4 += distance <= 1.0e-4f;
+                    local.near_1e3 += distance <= 1.0e-3f;
+                    sample_block = sample_block || code_mismatch || distance <= 1.0e-5f;
+                    ++local.values;
+                }
+                const size_t local_sample_max = upe_activation_trace >= 2 ?
+                    UPE_ACTIVATION_SAMPLE_ALL_MAX : UPE_ACTIVATION_SAMPLE_MAX;
+                if ((upe_activation_trace >= 2 || sample_block) && count == 32 &&
+                        local_samples.size() < local_sample_max) {
+                    upe_activation_sample sample;
+                    sample.layer = il;
+                    memcpy(sample.values, row + start, sizeof(sample.values));
+                    local_samples.push_back(sample);
+                }
+            }
+        }
+        std::lock_guard<std::mutex> lock(upe_activation_trace_mtx);
+        if (upe_activation_layers.size() <= (size_t) il) {
+            upe_activation_layers.resize((size_t) il + 1);
+        }
+        auto & total = upe_activation_layers[(size_t) il];
+        total.blocks += local.blocks;
+        total.values += local.values;
+        total.nonfinite += local.nonfinite;
+        total.nominal_code_mismatch += local.nominal_code_mismatch;
+        total.near_1e6 += local.near_1e6;
+        total.near_1e5 += local.near_1e5;
+        total.near_1e4 += local.near_1e4;
+        total.near_1e3 += local.near_1e3;
+        if (upe_activation_trace >= 2 && !upe_activation_trace_file.empty()) {
+            if (upe_activation_sample_stream == nullptr) {
+                const std::string sample_path = upe_activation_trace_file + ".blocks.bin";
+                upe_activation_sample_stream = fopen(sample_path.c_str(), "wb+");
+                if (upe_activation_sample_stream != nullptr) {
+                    const uint32_t header[4] = {
+                        UINT32_C(0x31504555), 1, 32, 0,
+                    };
+                    if (fwrite(header, sizeof(header), 1, upe_activation_sample_stream) != 1) {
+                        fclose(upe_activation_sample_stream);
+                        upe_activation_sample_stream = nullptr;
+                    }
+                }
+            }
+            if (upe_activation_sample_stream != nullptr &&
+                    upe_activation_sample_stream_count < UPE_ACTIVATION_SAMPLE_ALL_MAX) {
+                const size_t available = UPE_ACTIVATION_SAMPLE_ALL_MAX - upe_activation_sample_stream_count;
+                const size_t append = std::min(available, local_samples.size());
+                const size_t written = fwrite(local_samples.data(), sizeof(upe_activation_sample),
+                    append, upe_activation_sample_stream);
+                upe_activation_sample_stream_count += (uint32_t) written;
+                if (fseek(upe_activation_sample_stream, 3 * sizeof(uint32_t), SEEK_SET) == 0) {
+                    fwrite(&upe_activation_sample_stream_count,
+                        sizeof(upe_activation_sample_stream_count), 1, upe_activation_sample_stream);
+                    fseek(upe_activation_sample_stream, 0, SEEK_END);
+                }
+                fflush(upe_activation_sample_stream);
+            }
+        } else {
+            const size_t available = UPE_ACTIVATION_SAMPLE_MAX - upe_activation_samples.size();
+            const size_t append = std::min(available, local_samples.size());
+            upe_activation_samples.insert(upe_activation_samples.end(),
+                local_samples.begin(), local_samples.begin() + append);
+        }
+    }
+
+    void dump_upe_activation_trace() {
+        FILE * file = stderr;
+        if (!upe_activation_trace_file.empty()) {
+            file = fopen(upe_activation_trace_file.c_str(), "w");
+            if (file == nullptr) {
+                file = stderr;
+                fprintf(stderr, "[upe-activation] cannot open %s, dumping to stderr\n",
+                    upe_activation_trace_file.c_str());
+            }
+        }
+        fprintf(file, "layer,blocks,values,nonfinite,nominal_code_mismatch,near_1e-6,near_1e-5,near_1e-4,near_1e-3\n");
+        for (size_t il = 0; il < upe_activation_layers.size(); ++il) {
+            const auto & stats = upe_activation_layers[il];
+            if (stats.blocks == 0) {
+                continue;
+            }
+            fprintf(file, "%zu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n", il,
+                (unsigned long long) stats.blocks,
+                (unsigned long long) stats.values,
+                (unsigned long long) stats.nonfinite,
+                (unsigned long long) stats.nominal_code_mismatch,
+                (unsigned long long) stats.near_1e6,
+                (unsigned long long) stats.near_1e5,
+                (unsigned long long) stats.near_1e4,
+                (unsigned long long) stats.near_1e3);
+        }
+        if (file != stderr) {
+            fclose(file);
+        }
+        if (!upe_activation_trace_file.empty() && !upe_activation_samples.empty()) {
+            const std::string sample_path = upe_activation_trace_file + ".blocks.bin";
+            FILE * sample_file = fopen(sample_path.c_str(), "wb");
+            if (sample_file == nullptr) {
+                fprintf(stderr, "[upe-activation] cannot open sample file %s\n", sample_path.c_str());
+                return;
+            }
+            const uint32_t header[4] = {
+                UINT32_C(0x31504555), // "UPE1" little-endian
+                1,
+                32,
+                (uint32_t) upe_activation_samples.size(),
+            };
+            const bool ok = fwrite(header, sizeof(header), 1, sample_file) == 1 &&
+                fwrite(upe_activation_samples.data(), sizeof(upe_activation_sample),
+                    upe_activation_samples.size(), sample_file) == upe_activation_samples.size();
+            fclose(sample_file);
+            if (!ok) {
+                fprintf(stderr, "[upe-activation] short write to sample file %s\n", sample_path.c_str());
+            }
+        }
+    }
+
+    bool upe_token_boundary_sensitive(const float * row, int64_t n_embd, float threshold) const {
+        if (!upe_boundary_fallback || row == nullptr) {
+            return false;
+        }
+        for (int64_t start = 0; start < n_embd; start += 32) {
+            const int64_t count = std::min<int64_t>(32, n_embd - start);
+            float amax = 0.0f;
+            for (int64_t lane = 0; lane < count; ++lane) {
+                amax = std::max(amax, std::abs(row[start + lane]));
+            }
+            if (!(amax > 0.0f) || !std::isfinite(amax)) {
+                continue;
+            }
+            const float id = 127.0f / amax;
+            const float d = amax / 127.0f;
+            for (int64_t lane = 0; lane < count; ++lane) {
+                const float normalized = row[start + lane] * id;
+                const int cpu_code = (int) std::nearbyint(normalized);
+                const int cuda_nominal_code = (int) std::round(row[start + lane] / d);
+                const float fraction = normalized - std::floor(normalized);
+                if (cpu_code != cuda_nominal_code || std::abs(fraction - 0.5f) <= threshold) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     // "A-B" or "A" or a comma-separated list of those ("3-7,22-42")
     static bool parse_ranges(const char * s, std::vector<std::pair<int, int>> & out) {
         out.clear();
@@ -415,6 +632,46 @@ struct remote_ep_state {
             return;
         }
         enabled = true;
+
+        if (const char * value = getenv("GGML_REMOTE_EP_UPE_STRICT")) {
+            upe_strict = value[0] != '\0' && strcmp(value, "0") != 0;
+        }
+        if (const char * value = getenv("GGML_HOT_EXPERT_UPE_BOUNDARY_FALLBACK")) {
+            upe_boundary_fallback = value[0] != '\0' && strcmp(value, "0") != 0;
+        }
+        if (const char * value = getenv("GGML_HOT_EXPERT_UPE_BOUNDARY_THRESHOLD")) {
+            char * end = nullptr;
+            const float parsed = strtof(value, &end);
+            if (end != value && *end == '\0' && parsed >= 0.0f && parsed <= 0.01f) {
+                upe_boundary_threshold = parsed;
+            } else {
+                LLAMA_LOG_WARN("%s: ignoring malformed GGML_HOT_EXPERT_UPE_BOUNDARY_THRESHOLD='%s'\n",
+                    __func__, value);
+            }
+        }
+        if (const char * value = getenv("GGML_HOT_EXPERT_UPE_VERIFY_THRESHOLD")) {
+            char * end = nullptr;
+            const float parsed = strtof(value, &end);
+            if (end != value && *end == '\0' && parsed >= 0.0f && parsed <= 0.01f) {
+                upe_verify_boundary_threshold = parsed;
+            } else {
+                LLAMA_LOG_WARN("%s: ignoring malformed GGML_HOT_EXPERT_UPE_VERIFY_THRESHOLD='%s'\n",
+                    __func__, value);
+            }
+        }
+        if (const char * epoch = getenv("GGML_EP_DATA_EPOCH")) {
+            if (epoch[0] != '\0') {
+                upe_expected_epoch = llama_ep_fnv1a64_update(
+                    UINT64_C(1469598103934665603), epoch, strlen(epoch));
+                if (upe_expected_epoch == 0) {
+                    upe_expected_epoch = 1;
+                }
+            }
+        }
+        if (upe_strict && upe_expected_epoch == 0) {
+            LLAMA_LOG_WARN("%s: GGML_REMOTE_EP_UPE_STRICT=1 requires a shared non-empty GGML_EP_DATA_EPOCH\n",
+                    __func__);
+        }
 
         if (const char * h = getenv("GGML_REMOTE_EP_HOST")) {
             host = h;
@@ -477,6 +734,14 @@ struct remote_ep_state {
         }
         if (const char * f = getenv("GGML_REMOTE_EP_FREQ_FILE")) {
             ep_freq_file = f;
+        }
+        if (const char * value = getenv("GGML_REMOTE_EP_UPE_ACTIVATION_TRACE")) {
+            if (value[0] != '\0' && strcmp(value, "0") != 0) {
+                upe_activation_trace = std::max(1, std::min(2, atoi(value)));
+            }
+        }
+        if (const char * value = getenv("GGML_REMOTE_EP_UPE_ACTIVATION_TRACE_FILE")) {
+            upe_activation_trace_file = value;
         }
         // async pipelined dispatch (GGML_REMOTE_EP_PIPE=1): implies SCHED with
         // the REQ3/RESP3 async transport; any multi-token batch is allowed
@@ -606,6 +871,14 @@ struct remote_ep_state {
                     sched_max_effort ? ", max-effort replicas" : "",
                     (long long) sched_tg_activation_cost, sched_tg_repeat_cost, sched_pp_repeat_cost,
                     (int) sched_repeat_accounting);
+            if (upe_strict) {
+                LLAMA_LOG_INFO("%s: strict UPE enabled, expected data epoch=%016llx\n", __func__,
+                        (unsigned long long) upe_expected_epoch);
+            }
+            if (upe_boundary_fallback) {
+                LLAMA_LOG_INFO("%s: GPU-hot UPE boundary fallback enabled, raw-threshold=%.9g verify-threshold=%.9g\n",
+                        __func__, upe_boundary_threshold, upe_verify_boundary_threshold);
+            }
             if (pipe) {
                 LLAMA_LOG_INFO("%s: pipe credits: %.1f MiB, %zu endpoint requests\n", __func__,
                         pipe_credits.limit().bytes / 1048576.0, pipe_credits.limit().requests);
@@ -1237,6 +1510,19 @@ remote_ep_state::~remote_ep_state() {
     if (ep_freq_on) {
         dump_ep_freq();
     }
+    if (upe_activation_trace) {
+        dump_upe_activation_trace();
+    }
+    if (upe_activation_sample_stream != nullptr) {
+        fclose(upe_activation_sample_stream);
+        upe_activation_sample_stream = nullptr;
+    }
+    if (upe_boundary_fallback) {
+        fprintf(stderr, "[upe-boundary] raw_threshold=%.9g verify_threshold=%.9g tokens=%llu hot_slots=%llu\n",
+            upe_boundary_threshold, upe_verify_boundary_threshold,
+            (unsigned long long) upe_boundary_tokens.load(std::memory_order_relaxed),
+            (unsigned long long) upe_boundary_slots.load(std::memory_order_relaxed));
+    }
     if (conn) {
         conn->ops.close(conn->ctx);
         delete conn;
@@ -1254,7 +1540,7 @@ static bool remote_ep_sched_ep_cap(
         remote_ep_state::sched_ep & ep,
         std::string               & err,
         bool                        require_stable = false) {
-    llama_ep_cap_master mcap = {LLAMA_EP_PROTO_VER, 0};
+    llama_ep_cap_master mcap = {LLAMA_EP_PROTO_VER, LLAMA_EP_CAP_MASTER_WANT_PRECISION};
     if (!llama_ep_send_frame(ep.conn, LLAMA_EP_MSG_CAP, &mcap, sizeof(mcap))) {
         err = "send CAP failed";
         return false;
@@ -1286,9 +1572,29 @@ static bool remote_ep_sched_ep_cap(
         err = "kernel_id mismatch (heterogeneous ggml build — SCHEDULER-DESIGN §7.3)";
         return false;
     }
+    const bool has_precision = capability.has_precision();
+    if (remote_ep_get().upe_strict && remote_ep_get().upe_expected_epoch == 0) {
+        err = "strict UPE requires non-empty GGML_EP_DATA_EPOCH on the master";
+        return false;
+    }
+    if (remote_ep_get().upe_strict && !has_precision) {
+        err = "worker CAP lacks the required UPE precision contract";
+        return false;
+    }
+    if (has_precision && remote_ep_get().upe_expected_epoch != 0 &&
+            capability.precision.data_epoch_id != remote_ep_get().upe_expected_epoch) {
+        err = "worker UPE data epoch does not match GGML_EP_DATA_EPOCH";
+        return false;
+    }
+    if (remote_ep_get().upe_strict && capability.precision.data_epoch_id == 0) {
+        err = "worker UPE data epoch is unknown in strict mode";
+        return false;
+    }
     if (require_stable && (ep.expert_first != wcap.expert_first ||
             ep.expert_last != wcap.expert_last || ep.expert_bitmap != capability.expert_bitmap ||
-            ep.kernel_id != wcap.kernel_id || ep.caps != wcap.caps)) {
+            ep.kernel_id != wcap.kernel_id || ep.caps != wcap.caps ||
+            ep.has_precision != has_precision ||
+            (has_precision && !llama_ep_precision_contract_equal(ep.precision, capability.precision)))) {
         err = "worker capabilities changed after reconnect";
         return false;
     }
@@ -1297,6 +1603,8 @@ static bool remote_ep_sched_ep_cap(
     ep.expert_bitmap = std::move(capability.expert_bitmap);
     ep.kernel_id     = wcap.kernel_id;
     ep.caps          = wcap.caps;
+    ep.has_precision = has_precision;
+    ep.precision     = capability.precision;
     return true;
 }
 
@@ -1318,6 +1626,7 @@ static bool remote_ep_sched_negotiate(remote_ep_state & st) {
     }
     bool ok = true;
     std::string err;
+    const llama_ep_precision_contract * precision_ref = nullptr;
     for (auto & ep : st.sched_eps) {
         // startup races with worker (re)starts — the port may answer a probe
         // before the worker is ready, or a worker may briefly be down. Use the
@@ -1333,6 +1642,20 @@ static bool remote_ep_sched_negotiate(remote_ep_state & st) {
             ok = false;
             break;
         }
+        if (ep.has_precision) {
+            if (precision_ref != nullptr &&
+                    !llama_ep_precision_contract_equal(*precision_ref, ep.precision)) {
+                LLAMA_LOG_ERROR("%s: endpoint %s:%d has a different UPE precision contract; refusing mixed CPU EP\n",
+                        __func__, ep.host.c_str(), ep.port);
+                ok = false;
+                break;
+            }
+            precision_ref = &ep.precision;
+        } else {
+            LLAMA_LOG_WARN("%s: endpoint %s:%d did not provide a UPE precision contract; "
+                    "cross-endpoint numerical equivalence is unproven\n",
+                    __func__, ep.host.c_str(), ep.port);
+        }
         size_t n_owned = 0;
         if (!ep.expert_bitmap.empty()) {
             for (int e = ep.expert_first; e < ep.expert_last; ++e) {
@@ -1346,6 +1669,14 @@ static bool remote_ep_sched_negotiate(remote_ep_state & st) {
                 __func__, ep.host.c_str(), ep.port, ep.expert_first, ep.expert_last,
                 owned_desc.c_str(),
                 ep.kernel_id, ep.is_rdma ? " [rdma]" : "");
+        if (ep.has_precision) {
+            LLAMA_LOG_INFO("%s: sched endpoint %s:%d: UPE contract=%016llx schema=%016llx epoch=%016llx%s\n",
+                    __func__, ep.host.c_str(), ep.port,
+                    (unsigned long long) ep.precision.contract_id,
+                    (unsigned long long) ep.precision.model_schema_id,
+                    (unsigned long long) ep.precision.data_epoch_id,
+                    ep.precision.data_epoch_id == 0 ? " [epoch-unknown]" : "");
+        }
     }
     if (!ok) {
         for (auto & ep : st.sched_eps) {
@@ -1797,6 +2128,8 @@ void llama_remote_ep_sched_send_cb(ggml_tensor * dst, int ith, int nth, void * u
         GGML_ABORT("%s: unexpected tensor shapes/types for layer %d", __func__, il);
     }
 
+    st.trace_upe_activation(il, (const float *) a->data, n_tokens, n_embd);
+
     const bool dbg = remote_ep_debug_enabled();
     const int64_t t0 = dbg ? ggml_time_us() : 0;
 
@@ -1824,30 +2157,80 @@ void llama_remote_ep_sched_send_cb(ggml_tensor * dst, int ith, int nth, void * u
     p.hot_userdata = nullptr;
     p.cold_active.clear();
     p.hot_mask.clear();
+    p.hot_cpu_override.clear();
     if (dst->src[3] != nullptr && llama_remote_ep_sched_hot_compatible(il) &&
             llama_hot_expert_remote_ep_enabled()) {
-        if (n_tokens != 1 || m_local != 0) {
-            GGML_ABORT("%s: layer %d: hot/remote EP requires one token and KLOCAL=0", __func__, il);
+        if (n_tokens > llama_hot_expert_max_tokens() || m_local != 0) {
+            GGML_ABORT("%s: layer %d: hot/remote EP requires n_tokens<=%lld and KLOCAL=0", __func__, il,
+                    (long long) llama_hot_expert_max_tokens());
         }
         p.hot_userdata = llama_hot_expert_userdata(il);
-        p.cold_active.resize((size_t) k);
-        p.hot_mask.resize((size_t) k);
+        p.cold_active.resize((size_t) n_tokens * k);
+        p.hot_mask.resize((size_t) n_tokens * k);
         if (p.hot_userdata == nullptr || !llama_hot_expert_remote_ep_split(
-                    p.hot_userdata, p.cold_active.data(), p.hot_mask.data(), k)) {
+                    p.hot_userdata, p.cold_active.data(), p.hot_mask.data(), n_tokens, k)) {
             GGML_ABORT("%s: layer %d: hot/remote EP slot split unavailable", __func__, il);
         }
-        if (llama_hot_expert_markers_enabled()) {
-            static std::mutex marker_mtx;
-            static std::vector<uint8_t> marker_layers;
-            std::lock_guard<std::mutex> marker_lock(marker_mtx);
-            if ((int) marker_layers.size() <= il) {
-                marker_layers.resize((size_t) il + 1, 0);
+        if (llama_hot_expert_upe_verify_cpu_enabled() && n_tokens > 1) {
+            if (std::any_of(p.hot_mask.begin(), p.hot_mask.end(), [](uint8_t value) { return value != 0; })) {
+                GGML_ABORT("%s: layer %d: verify-CPU send unexpectedly exposed GPU hot slots", __func__, il);
             }
-            if (!marker_layers[(size_t) il]) {
-                marker_layers[(size_t) il] = 1;
+            llama_hot_expert_remote_ep_cancel(p.hot_userdata);
+            p.hot_userdata = nullptr;
+            p.hot_mask.clear();
+        }
+        if (p.hot_userdata != nullptr && st.upe_boundary_fallback) {
+            p.hot_cpu_override.assign((size_t) n_tokens * k, 0);
+            uint64_t overridden_tokens = 0;
+            uint64_t overridden_slots = 0;
+            const float * hidden = (const float *) a->data;
+            const float boundary_threshold = n_tokens > 1 ?
+                st.upe_verify_boundary_threshold : st.upe_boundary_threshold;
+            for (int64_t token = 0; token < n_tokens; ++token) {
+                if (!st.upe_token_boundary_sensitive(hidden + token * n_embd, n_embd, boundary_threshold)) {
+                    continue;
+                }
+                ++overridden_tokens;
+                for (int64_t slot = 0; slot < k; ++slot) {
+                    const size_t pos = (size_t) token * k + slot;
+                    if (p.hot_mask[pos]) {
+                        p.cold_active[pos] = 1;
+                        p.hot_cpu_override[pos] = 1;
+                        ++overridden_slots;
+                    }
+                }
+            }
+            st.upe_boundary_tokens.fetch_add(overridden_tokens, std::memory_order_relaxed);
+            st.upe_boundary_slots.fetch_add(overridden_slots, std::memory_order_relaxed);
+            if (overridden_tokens != 0) {
+                fprintf(stderr, "[upe-boundary] layer=%d n_tokens=%lld tokens=%llu hot_slots=%llu threshold=%.9g\n",
+                    il, (long long) n_tokens,
+                    (unsigned long long) overridden_tokens,
+                    (unsigned long long) overridden_slots,
+                    boundary_threshold);
+            }
+        }
+        if (p.hot_userdata != nullptr && llama_hot_expert_remote_ep_shadow_enabled()) {
+            std::fill(p.cold_active.begin(), p.cold_active.end(), 1);
+        }
+        if (p.hot_userdata != nullptr && llama_hot_expert_markers_enabled()) {
+            static std::mutex marker_mtx;
+            static std::vector<uint8_t> marker_shapes;
+            std::lock_guard<std::mutex> marker_lock(marker_mtx);
+            if ((int) marker_shapes.size() <= il) {
+                marker_shapes.resize((size_t) il + 1, 0);
+            }
+            const uint8_t shape_bit = 1u << (n_tokens - 1);
+            if (!(marker_shapes[(size_t) il] & shape_bit)) {
+                marker_shapes[(size_t) il] |= shape_bit;
                 const int hot_slots = std::count(p.hot_mask.begin(), p.hot_mask.end(), (uint8_t) 1);
-                fprintf(stderr, "[hotmarker] remote-ep layer=%d hot_slots=%d cold_slots=%lld req4=1\n",
-                        il, hot_slots, (long long) k - hot_slots);
+                if (n_tokens == 1) {
+                    fprintf(stderr, "[hotmarker] remote-ep layer=%d hot_slots=%d cold_slots=%lld req4=1\n",
+                            il, hot_slots, (long long) k - hot_slots);
+                } else {
+                    fprintf(stderr, "[hotmarker] remote-ep layer=%d n_tokens=%lld hot_slots=%d cold_slots=%lld req4=1\n",
+                            il, (long long) n_tokens, hot_slots, (long long) n_tokens*k - hot_slots);
+                }
             }
         }
     }
@@ -2314,33 +2697,40 @@ void llama_remote_ep_sched_merge_cb(ggml_tensor * dst, int ith, int nth, void * 
     const int64_t n_embd  = p.n_embd;
 
     if (p.hot_userdata != nullptr) {
-        GGML_ASSERT(p.n_tokens == 1 && pure && st.sched_weight_on_master && !st.pipe);
-        GGML_ASSERT(p.hot_mask.size() == (size_t) k);
-        p.hot_cold_slots.assign((size_t) k * n_embd, 0.0f);
+        GGML_ASSERT(p.n_tokens >= 1 && p.n_tokens <= llama_hot_expert_max_tokens());
+        GGML_ASSERT(pure && st.sched_weight_on_master && !st.pipe);
+        GGML_ASSERT(p.hot_mask.size() == (size_t) p.n_tokens * k);
+        p.hot_cold_slots.assign((size_t) p.n_tokens * k, nullptr);
         std::vector<size_t> cursor(p.eps.size(), 0);
-        for (int64_t j = 0; j < k; ++j) {
-            if (p.hot_mask[(size_t) j]) {
-                if (p.plan.owner[(size_t) j] != 0xff) {
-                    GGML_ABORT("%s: layer %d: hot slot %lld was assigned remotely", __func__, il, (long long) j);
+        for (int64_t token = 0; token < p.n_tokens; ++token) {
+            for (int64_t j = 0; j < k; ++j) {
+                const size_t pos = (size_t) token * k + j;
+                if (p.hot_mask[pos]) {
+                    const bool cpu_override = !p.hot_cpu_override.empty() && p.hot_cpu_override[pos];
+                    const bool needs_cpu = llama_hot_expert_remote_ep_shadow_enabled() || cpu_override;
+                    if (!needs_cpu && p.plan.owner[pos] != 0xff) {
+                        GGML_ABORT("%s: layer %d: token %lld hot slot %lld was assigned remotely", __func__, il,
+                                (long long) token, (long long) j);
+                    }
+                    if (!needs_cpu) {
+                        continue;
+                    }
                 }
-                continue;
-            }
-            const uint8_t owner = p.plan.owner[(size_t) j];
-            if (owner == 0 || owner == 0xff) {
-                GGML_ABORT("%s: layer %d: cold slot %lld has no remote owner", __func__, il, (long long) j);
-            }
-            auto & pe = p.eps[(size_t) owner - 1];
-            const size_t idx = cursor[(size_t) owner - 1]++;
-            if (idx >= p.plan.eps[(size_t) owner - 1].token.size() ||
-                    pe.resp.size() != p.plan.eps[(size_t) owner - 1].token.size() * (size_t) n_embd) {
-                GGML_ABORT("%s: layer %d: endpoint %u RESP4 cursor/size mismatch", __func__, il, (unsigned) owner - 1);
-            }
-            const float * v = pe.resp.data() + idx * (size_t) n_embd;
-            float * cold_slot = p.hot_cold_slots.data() + (size_t) j * n_embd;
-            const float wj = w[j];
-            for (int64_t e = 0; e < n_embd; ++e) {
-                const volatile float product = v[e] * wj;
-                cold_slot[e] = product;
+                const uint8_t owner = p.plan.owner[pos];
+                if (owner == 0 || owner == 0xff) {
+                    GGML_ABORT("%s: layer %d: token %lld cold slot %lld has no remote owner", __func__, il,
+                            (long long) token, (long long) j);
+                }
+                auto & pe = p.eps[(size_t) owner - 1];
+                const size_t idx = cursor[(size_t) owner - 1]++;
+                const auto & assignment = p.plan.eps[(size_t) owner - 1];
+                if (idx >= assignment.token.size() || assignment.token[idx] != token || assignment.slot[idx] != j ||
+                        pe.resp.size() != assignment.token.size() * (size_t) n_embd) {
+                    GGML_ABORT("%s: layer %d: endpoint %u RESP4 cursor/order/size mismatch", __func__, il,
+                            (unsigned) owner - 1);
+                }
+                const float * v = pe.resp.data() + idx * (size_t) n_embd;
+                p.hot_cold_slots[pos] = v;
             }
         }
         for (size_t i = 0; i < p.eps.size(); ++i) {
@@ -2349,8 +2739,9 @@ void llama_remote_ep_sched_merge_cb(ggml_tensor * dst, int ith, int nth, void * 
             }
         }
         llama_hot_expert_remote_ep_merge(
-            p.hot_userdata, out, p.hot_cold_slots.data(), (size_t) n_embd,
-            n_embd, k);
+            p.hot_userdata, out, p.hot_cold_slots.data(), w,
+            p.hot_cpu_override.empty() ? nullptr : p.hot_cpu_override.data(),
+            n_embd, p.n_tokens, k);
     } else {
         // Response vectors are endpoint-grouped in (token, slot) order. Build a
         // token prefix for each endpoint so token ranges can merge independently

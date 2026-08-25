@@ -33,7 +33,13 @@ cmake -S . -B build-peoples-cpu \
     -DLLAMA_BUILD_SERVER=ON
 cmake --build build-peoples-cpu -j --target \
     llama-cli llama-bench llama-server llama-epd \
-    test-chat test-backend-ops test-repack-kernels llama-ep-dealer-test
+    test-chat test-backend-ops test-repack-kernels test-xllama-hot-trace llama-ep-dealer-test
+
+# x86-64 only
+cmake --build build-peoples-cpu -j --target test-repack-iq
+
+# x86-64 with GCC or Clang only
+cmake --build build-peoples-cpu -j --target test-udnl-w4nl
 ```
 
 `test-chat` 使用 server 的请求转换代码，因此只在 `LLAMA_BUILD_SERVER=ON` 时生成。
@@ -62,7 +68,11 @@ cmake --build build-peoples-cuda -j
 build-peoples-cpu/bin/llama-ep-dealer-test
 build-peoples-cpu/bin/test-chat
 build-peoples-cpu/bin/test-repack-kernels
+ctest --test-dir build-peoples-cpu --output-on-failure \
+    -R '^(test-repack|test-udnl|test-xllama-hot-trace|llama-ep-)'
 ```
+
+`test-repack-iq` 仅在 x86-64 构建中注册；`test-udnl-w4nl` 还要求 GCC 或 Clang。后者在 CTest 中使用缩小形状做冒烟；完整尺寸模式属于性能微基准，继续手工运行，避免把易受频率和系统负载影响的性能数字当作稳定的 CTest 通过条件。
 
 CPU-only 构建直接运行 `test-backend-ops` 会跳过作为参考实现的 CPU backend，不能把它的
 零退出状态当成算子正确性通过。完整 backend 对拍需要 CUDA 等第二个 backend；`-b CPU`
@@ -77,6 +87,16 @@ CPU-only 构建直接运行 `test-backend-ops` 会跳过作为参考实现的 CP
 
 大模型进程继续使用项目约定的独占 benchmark 锁，避免并发加载造成 OOM 或污染结果。
 
+## Fork 环境变量审计
+
+```sh
+scripts/verify/fork-env-audit.py
+scripts/verify/fork-env-audit.py --json
+scripts/verify/fork-env-audit.py --selftest
+```
+
+审计器只扫描脚本内显式列出的 fork 模块和变量前缀，不把上游通用 backend 的环境变量混入结果。默认在源码变量缺文档或文档变量无读取点时返回 1；重复读取点始终报告，但只有加 `--fail-duplicates` 才令检查失败。路径/输入错误返回 2。
+
 ## 文档职责
 
 - `README.md`：项目定位和经过复核的代表性结果。
@@ -84,4 +104,4 @@ CPU-only 构建直接运行 `test-backend-ops` 会跳过作为参考实现的 CP
 - `docs/PARAMETERS.md`：当前代码实际支持的参数和生产配方（PEOPLESLLM-PARAMS.md 已于 H0 退役为重定向页）。
 - `docs/LONG-CONTEXT-1M.md`：1M context 的 RAM/VRAM 硬预算与 release gate。
 - `tools/epd/*DESIGN.md`：设计与实验路线，必须标注 implemented / experimental / rejected。
-- 工作区 `HANDOVER.md`：本地研发日志和证据索引，不属于稳定用户接口。
+- 私有研发日志与原始证据bundle不进入公开仓库，也不属于稳定用户接口。

@@ -83,6 +83,44 @@
 //                               wait up to N ms for its worker to restart before
 //                               the final fatal error (default 0, max 300000).
 //                               The staged request is resent after reconnect.
+//   GGML_REMOTE_EP_UPE_STRICT=1
+//                               require every scheduled worker to return the
+//                               negotiated Unified Precision Engine contract;
+//                               reject unknown/mismatched data epochs and any
+//                               contract change on reconnect. Default off for
+//                               compatibility with old workers.
+//   GGML_EP_DATA_EPOCH=STRING   immutable deployment/model version shared by
+//                               master and every worker. It is hashed on the
+//                               wire; strict UPE requires a non-empty value.
+//   GGML_REMOTE_EP_UPE_ACTIVATION_TRACE=1|2
+//                               default-off diagnostic: inspect each real F32
+//                               expert input in 32-value blocks and count CPU
+//                               versus nominal-CUDA code differences plus the
+//                               distance to half-step quantization boundaries;
+//                               1 samples only boundary blocks, 2 records all
+//                               blocks for direct CUDA replay.
+//   GGML_REMOTE_EP_UPE_ACTIVATION_TRACE_FILE=PATH
+//                               write the per-layer CSV at process exit.
+//   GGML_HOT_EXPERT_UPE_BOUNDARY_FALLBACK=1
+//                               experimental verify-strict policy for the
+//                               GPU-hot + CPU-remote bridge: if a token has an
+//                               activation within the configured half-step
+//                               distance, recompute its hot slots remotely and
+//                               merge the CPU result instead of the GPU result.
+//   GGML_HOT_EXPERT_UPE_BOUNDARY_THRESHOLD=FLOAT
+//                               raw/TG normalized Q8 half-step distance (default
+//                               1e-6). Nominal CPU/CUDA code disagreement always
+//                               triggers independently of this distance.
+//   GGML_HOT_EXPERT_UPE_VERIFY_THRESHOLD=FLOAT
+//                               multi-token verify distance (default 0: only
+//                               nominal CPU/CUDA code disagreement triggers).
+//                               1.6e-5 covers all current trace mismatches but
+//                               its remote fanout cost failed the first A/B.
+//   GGML_HOT_EXPERT_UPE_VERIFY_CPU=1
+//                               phase selector: for n_tokens>1, skip GPU-hot
+//                               submission entirely and use ordinary CPU remote
+//                               EP; single-token raw/TG remains GPU-hot. This
+//                               avoids the duplicate GPU work of boundary fallback.
 //
 // Only the routed-expert FFN is remote; attention, router and the weighted
 // sum semantics are unchanged. Layers outside the range (and warmup graphs)

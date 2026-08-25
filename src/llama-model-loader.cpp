@@ -3,6 +3,7 @@
 #include "ggml-alloc.h"
 #include "ggml.h"
 #include "gguf.h"
+#include "llama-repack-stream-bake.h"
 #include "llama-hparams.h"
 #include "llama.h"
 
@@ -1570,6 +1571,29 @@ bool llama_model_loader::load_all_data(
         return backend;
     }(__func__);
 
+    // Keep the temporary async-upload resources exception- and cancellation-safe.
+    // In particular, the E4A stream-bake progress callback can return early from
+    // the tensor loop, after these resources have already been allocated.
+    struct async_upload_cleanup {
+        std::vector<ggml_backend_event_t> & events;
+        std::vector<ggml_backend_buffer_t> & host_buffers;
+        ggml_backend_t & backend;
+
+        ~async_upload_cleanup() {
+            for (auto * event : events) {
+                ggml_backend_event_synchronize(event);
+                ggml_backend_event_free(event);
+            }
+            for (auto * buffer : host_buffers) {
+                ggml_backend_buffer_free(buffer);
+            }
+            if (backend != nullptr) {
+                ggml_backend_free(backend);
+                backend = nullptr;
+            }
+        }
+    } upload_cleanup{events, host_buffers, upload_backend};
+
     if (upload_backend) {
         LLAMA_LOG_DEBUG("%s: using async uploads for device %s, buffer type %s, backend %s\n", __func__,
             ggml_backend_dev_name(ggml_backend_get_device(upload_backend)),
@@ -1635,8 +1659,36 @@ bool llama_model_loader::load_all_data(
                     }));
                 }
             } else {
+                bool stream_baked = false;
+#if defined(LLAMA_REPACK_STREAM_BAKE)
+                if (llama_repack_stream_bake_env_enabled()) {
+                    llama_repack_stream_bake_config config;
+                    config.chunk_bytes = llama_repack_stream_bake_env_chunk_bytes();
+                    config.validate = check_tensors;
+                    const auto result = llama_repack_stream_bake_load(
+                        *file, weight->offs, cur, config,
+                        [&](size_t completed, size_t) {
+                            return progress_callback == nullptr || progress_callback(
+                                (float) (size_done + completed) / size_data, progress_callback_user_data);
+                        });
+                    if (result == llama_repack_stream_bake_result::cancelled) {
+                        return false;
+                    }
+                    stream_baked = result == llama_repack_stream_bake_result::complete;
+                    if (stream_baked) {
+                        static std::once_flag once;
+                        std::call_once(once, [&]() {
+                            LLAMA_LOG_INFO("%s: using bounded CPU-repack stream bake with %zu MiB requested chunks\n",
+                                    __func__, config.chunk_bytes / MiB);
+                        });
+                    }
+                }
+#endif
+
                 // If upload_backend is valid load the tensor in chunks to pinned memory and upload the buffers asynchronously to the GPU.
-                if (upload_backend) {
+                if (stream_baked) {
+                    // The stream-bake helper wrote the final CPU_REPACK buffer directly.
+                } else if (upload_backend) {
                     size_t offset = weight->offs;
                     alignment = file->read_alignment();
                     size_t aligned_offset = offset & ~(alignment - 1);
@@ -1702,16 +1754,6 @@ bool llama_model_loader::load_all_data(
 
         size_done += n_size;
     }
-
-    // free temporary resources used for async uploads
-    for (auto * event : events) {
-        ggml_backend_event_synchronize(event);
-        ggml_backend_event_free(event);
-    }
-    for (auto * buf : host_buffers) {
-        ggml_backend_buffer_free(buf);
-    }
-    ggml_backend_free(upload_backend);
 
     // check validation results
     bool validation_failed = false;

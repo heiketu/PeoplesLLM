@@ -176,6 +176,14 @@ extern "C" {
     GGML_BACKEND_API void ggml_backend_cpu_set_threadpool    (ggml_backend_t backend_cpu, ggml_threadpool_t threadpool);
     GGML_BACKEND_API void ggml_backend_cpu_set_abort_callback(ggml_backend_t backend_cpu, ggml_abort_callback abort_callback, void * abort_callback_data);
 
+    // Raw-layout chunk loading for size-preserving CPU_REPACK formats.
+    // Returns 0 when the tensor cannot be safely written in independent chunks.
+    GGML_BACKEND_API size_t ggml_backend_cpu_repack_chunk_alignment(const struct ggml_tensor * tensor);
+    // offset and size use the original raw tensor byte layout. Returns false
+    // without writing when the range is unsupported or not chunk-aligned.
+    GGML_BACKEND_API bool   ggml_backend_cpu_repack_write_chunk(
+            struct ggml_tensor * tensor, const void * data, size_t offset, size_t size);
+
     GGML_BACKEND_API void ggml_backend_cpu_set_use_ref(ggml_backend_t backend_cpu, bool use_ref);
 
     GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cpu_reg(void);

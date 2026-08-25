@@ -1835,7 +1835,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     return use_mul_mat_vec_f;
 }
 
-static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
+static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, bool allow_multi_token_mmid = false) {
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
@@ -1857,11 +1857,19 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
         return false;
     }
 
-    if (tensor->op == GGML_OP_MUL_MAT_ID && dst->ne[2] != 1) {
+    if (tensor->op == GGML_OP_MUL_MAT_ID && dst->ne[2] != 1 && !allow_multi_token_mmid) {
         return false;
     }
 
     return use_mul_mat_vec_q;
+}
+
+static bool ggml_cuda_clamped_mmid_fusion_enabled() {
+    static const bool enabled = []() {
+        const char * value = getenv("GGML_CUDA_MOE_CLAMPED_FUSION");
+        return value != nullptr && atoi(value) != 0;
+    }();
+    return enabled;
 }
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -4125,6 +4133,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_cuda_topk_moe_args args;
         const bool              can_fuse = ggml_cuda_topk_moe_fusion(cgraph, i, args);
         std::vector<ggml_op>    ops;
+        ops.reserve(16); // longest router pattern; avoids repeated initializer-list growth
 
         if (can_fuse) {
             const ggml_tensor * logits  = node->src[0];
@@ -4540,6 +4549,61 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             if (fused_mul_mat_vec) {
                 break;
             }
+        }
+
+        // DSV4-style clamped SwiGLU.  The CLAMP nodes are views over the two
+        // MMID outputs, so fusing both projections, clamps, and GLU also
+        // removes one activation quantization and four kernel boundaries.
+        if (op == GGML_OP_MUL_MAT_ID && ggml_cuda_clamped_mmid_fusion_enabled()) {
+            const ggml_op clamp_ops[] = { op, GGML_OP_CLAMP, op, GGML_OP_CLAMP, GGML_OP_GLU };
+            const int out_nodes[] = { i + 4 };
+            if (ggml_can_fuse_subgraph(cgraph, i, 5, clamp_ops, out_nodes, 1) &&
+                    ggml_cuda_check_fusion_memory_ranges(cgraph, i, 5, out_nodes, 1)) {
+                ggml_tensor * mm0 = cgraph->nodes[i + 0];
+                ggml_tensor * clamp0 = cgraph->nodes[i + 1];
+                ggml_tensor * mm1 = cgraph->nodes[i + 2];
+                ggml_tensor * clamp1 = cgraph->nodes[i + 3];
+                ggml_tensor * glu = cgraph->nodes[i + 4];
+
+                if (clamp0->src[0] == mm0 && clamp1->src[0] == mm1) {
+                    ggml_tensor * gate = nullptr;
+                    ggml_tensor * up = nullptr;
+                    ggml_tensor * gate_clamp = nullptr;
+                    ggml_tensor * up_clamp = nullptr;
+                    if (glu->src[0] == clamp0 && glu->src[1] == clamp1) {
+                        gate = mm0; gate_clamp = clamp0;
+                        up = mm1; up_clamp = clamp1;
+                    } else if (glu->src[0] == clamp1 && glu->src[1] == clamp0) {
+                        gate = mm1; gate_clamp = clamp1;
+                        up = mm0; up_clamp = clamp0;
+                    }
+
+                    if (gate != nullptr && up != nullptr) {
+                        ggml_tensor glu_unclamped = *glu;
+                        glu_unclamped.src[0] = gate;
+                        glu_unclamped.src[1] = up;
+                        if (ggml_cuda_should_fuse_mul_mat(up, gate, &glu_unclamped) &&
+                                ggml_cuda_should_fuse_mul_mat_vec_q(up, true)) {
+                            ggml_cuda_mm_fusion_args_host fusion_data{};
+                            fusion_data.gate = gate->src[0];
+                            fusion_data.x_clamp_min = ggml_get_op_params_f32(up_clamp, 0);
+                            fusion_data.x_clamp_max = ggml_get_op_params_f32(up_clamp, 1);
+                            fusion_data.gate_clamp_min = ggml_get_op_params_f32(gate_clamp, 0);
+                            fusion_data.gate_clamp_max = ggml_get_op_params_f32(gate_clamp, 1);
+                            fusion_data.glu_op = ggml_get_glu_op(glu);
+
+                            ggml_cuda_mul_mat_vec_q(*cuda_ctx, up->src[0], up->src[1], up->src[2], glu, &fusion_data);
+                            fused_mul_mat_vec = true;
+                            fused_node_count = 5;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (fused_mul_mat_vec) {
+            break;
         }
 
         if (ggml_cuda_can_fuse(cgraph, i, { op, bias_op, op, bias_op, GGML_OP_GLU }, {})) {

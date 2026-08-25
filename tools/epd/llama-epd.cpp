@@ -30,6 +30,7 @@
 // matching repack traits keep the raw layout. GGML_EPD_REPACK=0 disables.
 
 #include "llama-ep-transport.h"
+#include "llama-ep-capability.h"
 #include "llama-ep-protocol.h"
 #include "llama-ep-session-manager.h"
 #include "llama-ep-expert-map.h"
@@ -2189,13 +2190,78 @@ static bool ep_handle_req(
     return llama_ep_send_framev(t, LLAMA_EP_MSG_RESP, parts, lens, 2);
 }
 
+static uint64_t ep_model_precision_schema_id(const ep_model & m) {
+    uint64_t hash = UINT64_C(1469598103934665603);
+    hash = llama_ep_fnv1a64_update(hash, m.arch.data(), m.arch.size());
+    hash = llama_ep_fnv1a64_update(hash, &m.n_layer, sizeof(m.n_layer));
+    const char * fp16_env = getenv("GGML_CPU_FP16_INTERMEDIATE");
+    const uint64_t execution_modes[5] = {
+        ep_repack_enabled(),
+        ep_fuse_gate_up_enabled(),
+        ep_fuse_clamp_swiglu_enabled(),
+        (uint64_t) ep_shared_q8_min_tokens(),
+        fp16_env != nullptr && atoi(fp16_env) != 0,
+    };
+    hash = llama_ep_fnv1a64_update(hash, execution_modes, sizeof(execution_modes));
+    for (const auto & item : m.layers) {
+        const ep_layer & layer = item.second;
+        const int32_t types[3] = {
+            (int32_t) (layer.gate_up ? layer.gate_up->type : layer.gate->type),
+            (int32_t) (layer.gate_up ? layer.gate_up->type : layer.up->type),
+            (int32_t) layer.down->type,
+        };
+        const int64_t shape[4] = {layer.il, layer.n_embd, layer.n_ff, layer.n_expert_full};
+        const uint32_t fused_gate_up = layer.gate_up != nullptr;
+        hash = llama_ep_fnv1a64_update(hash, shape, sizeof(shape));
+        hash = llama_ep_fnv1a64_update(hash, types, sizeof(types));
+        hash = llama_ep_fnv1a64_update(hash, &fused_gate_up, sizeof(fused_gate_up));
+        hash = llama_ep_fnv1a64_update(hash, &layer.clamp, sizeof(layer.clamp));
+    }
+    return hash == 0 ? UINT64_C(1) : hash;
+}
+
+static bool ep_model_has_cpu_repack_precision_contract(const ep_model & m) {
+    if (!ep_repack_enabled() || m.layers.empty()) {
+        return false;
+    }
+    for (const auto & item : m.layers) {
+        const ep_layer & layer = item.second;
+        if (ep_repack_activation_type(layer.gate_up ? layer.gate_up : layer.gate) == GGML_TYPE_COUNT ||
+                (!layer.gate_up && ep_repack_activation_type(layer.up) == GGML_TYPE_COUNT) ||
+                ep_repack_activation_type(layer.down) == GGML_TYPE_COUNT) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static uint64_t ep_data_epoch_id() {
+    const char * epoch = getenv("GGML_EP_DATA_EPOCH");
+    if (epoch == nullptr || epoch[0] == '\0') {
+        return 0;
+    }
+    uint64_t hash = llama_ep_fnv1a64_update(
+        UINT64_C(1469598103934665603), epoch, strlen(epoch));
+    return hash == 0 ? UINT64_C(1) : hash;
+}
+
 // CAP handshake (protocol v2): answer with this worker's capabilities and owned
-// ranges; the payload (llama_ep_cap_master) is informational only — the reply
-// is the same whatever the master offers
+// ranges. Precision fields are appended only when requested by the master, so
+// old flags=0 masters retain their byte-identical CAP reply.
 static bool ep_handle_cap(
         llama_ep_transport * t,
         const ep_model     & m,
-        const ep_config    & cfg) {
+        const ep_config    & cfg,
+        const uint8_t      * payload,
+        size_t               payload_len) {
+    if (payload == nullptr || payload_len != sizeof(llama_ep_cap_master)) {
+        return ep_send_err(t, LLAMA_EP_ERR_BAD_SHAPE, "CAP: invalid master payload");
+    }
+    llama_ep_cap_master master = {};
+    memcpy(&master, payload, sizeof(master));
+    const bool want_precision = (master.flags & LLAMA_EP_CAP_MASTER_WANT_PRECISION) != 0 &&
+        ep_model_has_cpu_repack_precision_contract(m);
+
     llama_ep_cap_worker cap;
     cap.proto_ver = LLAMA_EP_PROTO_VER;
     cap.caps      = LLAMA_EP_CAP_REQ2 | LLAMA_EP_CAP_REQ3 | LLAMA_EP_CAP_REQ4;
@@ -2204,14 +2270,30 @@ static bool ep_handle_cap(
     cap.expert_first = m.expert_map.contiguous ? m.expert_map.first : 0;
     cap.expert_last  = m.expert_map.contiguous ? m.expert_map.last  : m.expert_map.n_expert;
     cap.kernel_id = llama_ep_kernel_id();
-    if (m.expert_map.contiguous) {
+    llama_ep_precision_contract precision = {};
+    if (want_precision) {
+        cap.caps |= LLAMA_EP_CAP_PRECISION_CONTRACT;
+        precision = llama_ep_make_cpu_repack_precision_contract(
+            cap.kernel_id, ep_model_precision_schema_id(m), ep_data_epoch_id());
+    }
+
+    if (m.expert_map.contiguous && !want_precision) {
         return llama_ep_send_frame(t, LLAMA_EP_MSG_CAP, &cap, sizeof(cap));
     }
-    cap.caps |= LLAMA_EP_CAP_EXPERT_BITMAP;
-    const std::vector<uint8_t> bitmap = m.expert_map.bitmap();
-    const void * parts[2] = {&cap, bitmap.data()};
-    const size_t lens[2]  = {sizeof(cap), bitmap.size()};
-    return llama_ep_send_framev(t, LLAMA_EP_MSG_CAP, parts, lens, 2);
+    std::vector<uint8_t> bitmap;
+    if (!m.expert_map.contiguous) {
+        cap.caps |= LLAMA_EP_CAP_EXPERT_BITMAP;
+        bitmap = m.expert_map.bitmap();
+    }
+    if (!want_precision) {
+        const void * parts[2] = {&cap, bitmap.data()};
+        const size_t lens[2]  = {sizeof(cap), bitmap.size()};
+        return llama_ep_send_framev(t, LLAMA_EP_MSG_CAP, parts, lens, 2);
+    }
+    const void * parts[3] = {&cap, &precision, bitmap.data()};
+    const size_t lens[3]  = {sizeof(cap), want_precision ? sizeof(precision) : 0, bitmap.size()};
+    const size_t n_parts = !bitmap.empty() ? 3 : 2;
+    return llama_ep_send_framev(t, LLAMA_EP_MSG_CAP, parts, lens, n_parts);
 }
 
 // REQ2 (SCHEDULER-DESIGN §4.4): ragged per-slot dispatch. each assignment is a
@@ -2416,7 +2498,7 @@ static void ep_serve_connection(
             break;
         }
         if (type == LLAMA_EP_MSG_CAP) {
-            if (!ep_handle_cap(t, m, cfg)) {
+            if (!ep_handle_cap(t, m, cfg, payload.data(), payload.size())) {
                 LOG("llama-epd: failed to answer CAP\n");
                 break;
             }
@@ -2743,37 +2825,72 @@ static int ep_selftest(ep_model & m, const ep_config & cfg, int layer, int n_tok
         llama_ep_transport * cli2 = llama_ep_tcp_connect("127.0.0.1", port2, &req2_err);
         if (cli2) {
             // CAP handshake first, as the master would
-            llama_ep_cap_master mcap = {LLAMA_EP_PROTO_VER, 0};
-            uint32_t ctype = 0;
+            auto request_cap = [&](uint32_t flags, llama_ep_worker_capability & capability,
+                                   std::vector<uint8_t> & raw) {
+                llama_ep_cap_master mcap = {LLAMA_EP_PROTO_VER, flags};
+                uint32_t ctype = 0;
+                return llama_ep_send_frame(cli2, LLAMA_EP_MSG_CAP, &mcap, sizeof(mcap)) &&
+                    llama_ep_recv_frame(cli2, ctype, raw) && ctype == LLAMA_EP_MSG_CAP &&
+                    llama_ep_parse_worker_capability(raw.data(), raw.size(), capability, req2_err);
+            };
+
+            // First prove backward compatibility: a flags=0 master must receive
+            // exactly the old prefix plus optional ownership bitmap.
+            llama_ep_worker_capability legacy_capability;
+            std::vector<uint8_t> legacy_payload;
+            if (!request_cap(0, legacy_capability, legacy_payload) || legacy_capability.has_precision()) {
+                req2_ok = false;
+                req2_err = "legacy CAP layout negotiation failed";
+            } else {
+                const size_t legacy_size = sizeof(llama_ep_cap_worker) +
+                    (m.expert_map.contiguous ? 0 : m.expert_map.bitmap().size());
+                if (legacy_payload.size() != legacy_size) {
+                    req2_ok = false;
+                    req2_err = "legacy CAP byte layout changed";
+                }
+            }
+
+            llama_ep_worker_capability worker_capability;
             std::vector<uint8_t> cpayload;
-            llama_ep_cap_worker wcap;
-            memset(&wcap, 0, sizeof(wcap));
-            if (llama_ep_send_frame(cli2, LLAMA_EP_MSG_CAP, &mcap, sizeof(mcap)) &&
-                llama_ep_recv_frame(cli2, ctype, cpayload) &&
-                ctype == LLAMA_EP_MSG_CAP && cpayload.size() >= sizeof(wcap)) {
-                memcpy(&wcap, cpayload.data(), sizeof(wcap));
+            if (req2_ok && request_cap(
+                    LLAMA_EP_CAP_MASTER_WANT_PRECISION, worker_capability, cpayload)) {
+                const llama_ep_cap_worker & wcap = worker_capability.wire;
                 if (wcap.proto_ver < LLAMA_EP_PROTO_VER || !(wcap.caps & LLAMA_EP_CAP_REQ2)) {
                     req2_ok = false;
                     req2_err = "worker CAP lacks REQ2";
-                } else if (m.expert_map.contiguous) {
+                }
+                if (req2_ok && ep_model_has_cpu_repack_precision_contract(m)) {
+                    const llama_ep_precision_contract expected = llama_ep_make_cpu_repack_precision_contract(
+                        wcap.kernel_id, ep_model_precision_schema_id(m), ep_data_epoch_id());
+                    if (!worker_capability.has_precision() ||
+                            !llama_ep_precision_contract_equal(worker_capability.precision, expected)) {
+                        req2_ok = false;
+                        req2_err = "worker CAP UPE precision contract mismatch";
+                    }
+                }
+                if (req2_ok && m.expert_map.contiguous) {
                     if ((wcap.caps & LLAMA_EP_CAP_EXPERT_BITMAP) ||
-                            cpayload.size() != sizeof(wcap) ||
                             wcap.expert_first != m.expert_map.first ||
                             wcap.expert_last != m.expert_map.last) {
                         req2_ok = false;
                         req2_err = "worker CAP contiguous ownership mismatch";
                     }
-                } else {
+                } else if (req2_ok) {
                     const std::vector<uint8_t> expected = m.expert_map.bitmap();
                     if (!(wcap.caps & LLAMA_EP_CAP_EXPERT_BITMAP) ||
                             wcap.expert_first != 0 || wcap.expert_last != m.expert_map.n_expert ||
-                            cpayload.size() != sizeof(wcap) + expected.size() ||
-                            memcmp(cpayload.data() + sizeof(wcap), expected.data(), expected.size()) != 0) {
+                            worker_capability.expert_bitmap != expected) {
                         req2_ok = false;
                         req2_err = "worker CAP sparse ownership bitmap mismatch";
                     }
                 }
-            } else {
+                if (req2_ok && worker_capability.has_precision()) {
+                    LOG("selftest-req2: UPE contract=%016llx schema=%016llx epoch=%016llx\n",
+                        (unsigned long long) worker_capability.precision.contract_id,
+                        (unsigned long long) worker_capability.precision.model_schema_id,
+                        (unsigned long long) worker_capability.precision.data_epoch_id);
+                }
+            } else if (req2_ok) {
                 req2_ok = false;
                 req2_err = "CAP handshake failed";
             }

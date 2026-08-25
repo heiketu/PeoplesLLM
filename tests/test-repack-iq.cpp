@@ -6,9 +6,8 @@
 //                           CPU_REPACK buffer vs the plain vec_dot path
 //   bench mode:          kernel-level timing: vec_dot vs repack gemv (1 row) and gemm (8 rows)
 //
-// Not wired into CMake/ctest on purpose; build manually, e.g.:
-//   g++ -O2 -std=c++17 tests/test-repack-iq.cpp -I ggml/include -I ggml/src -I ggml/src/ggml-cpu \
-//       -L build-iq/bin -lggml-cpu -lggml-base -lggml -Wl,-rpath,$PWD/build-iq/bin -o build-iq/test-repack-iq
+// The default correctness mode is registered in CTest. The benchmark modes
+// remain manual so timing does not become a CI pass condition.
 
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -135,7 +134,7 @@ struct repacked_weights {
 template <typename BLOCK>
 static repacked_weights repack_via_buffer(ggml_type type, const BLOCK * plain, int64_t ne00, int64_t ne01, int64_t ne02 = 1) {
     repacked_weights rw;
-    rw.ctx = ggml_init({ ggml_tensor_overhead() * 4, nullptr, true });
+    rw.ctx = ggml_init({ 1024 * 1024, nullptr, true });
     rw.t   = ne02 == 1 ? ggml_new_tensor_2d(rw.ctx, type, ne00, ne01)
                        : ggml_new_tensor_3d(rw.ctx, type, ne00, ne01, ne02);
     rw.buf = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_repack_buffer_type(), ggml_nbytes(rw.t));
@@ -144,6 +143,10 @@ static repacked_weights repack_via_buffer(ggml_type type, const BLOCK * plain, i
         exit(1);
     }
     ggml_backend_tensor_alloc(rw.buf, rw.t, ggml_backend_buffer_get_base(rw.buf));
+    if (rw.t->extra == nullptr) {
+        fprintf(stderr, "repack is unavailable for %s\n", ggml_type_name(type));
+        exit(1);
+    }
     ggml_backend_tensor_set(rw.t, plain, 0, ggml_nbytes(rw.t));
     return rw;
 }
@@ -310,9 +313,14 @@ static int test_graph(const char * name, ggml_type type, void (*fill)(BLOCK *, i
     repacked_weights rw_mm   = repack_via_buffer<BLOCK>(type, plain.data(), ne00, ne01);
 
     const auto run = [&](bool use_repack, bool is_mmid, bool prequantized, std::vector<float> & dst) {
-        ggml_context * ctx = ggml_init({ ggml_tensor_overhead() * 16 + ggml_graph_overhead(), nullptr, true });
-        ggml_tensor * src0 = is_mmid ? ggml_new_tensor_3d(ctx, type, ne00, ne01, nexp)
-                                     : ggml_new_tensor_2d(ctx, type, ne00, ne01);
+        repacked_weights & rw = is_mmid ? rw_mmid : rw_mm;
+        ggml_context * ctx = use_repack
+            ? rw.ctx
+            : ggml_init({ ggml_tensor_overhead() * 16 + ggml_graph_overhead(), nullptr, true });
+        ggml_tensor * src0 = use_repack
+            ? rw.t
+            : (is_mmid ? ggml_new_tensor_3d(ctx, type, ne00, ne01, nexp)
+                       : ggml_new_tensor_2d(ctx, type, ne00, ne01));
         const ggml_type src1_type = prequantized ? GGML_TYPE_Q8_0 : GGML_TYPE_F32;
         ggml_tensor * src1 = is_mmid ? ggml_new_tensor_3d(ctx, src1_type, ne00, 1, ntok)
                                      : ggml_new_tensor_2d(ctx, src1_type, ne00, ntok);
@@ -324,34 +332,34 @@ static int test_graph(const char * name, ggml_type type, void (*fill)(BLOCK *, i
         } else {
             out = ggml_mul_mat(ctx, src0, src1);
         }
-        ggml_backend_buffer_t ctx_buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
-        if (idst != nullptr) {
-            memcpy(idst->data, ids.data(), ids.size() * sizeof(int32_t));
-        }
-        if (prequantized) {
-            memcpy(src1->data, xq.data(), ggml_nbytes(src1));
-        } else {
-            memcpy(src1->data, xf.data(), xf.size() * sizeof(float));
-        }
-        if (use_repack) {
-            // point src0 at the repacked weight buffer (same layout the model loader produces)
-            ggml_tensor * rt = is_mmid ? rw_mmid.t : rw_mm.t;
-            src0->buffer = rt->buffer;
-            src0->data   = rt->data;
-            src0->extra  = rt->extra;
-        } else {
-            memcpy(src0->data, plain.data(), ggml_nbytes(src0));
-        }
         ggml_cgraph * gf = ggml_new_graph(ctx);
         ggml_build_forward_expand(gf, out);
+        ggml_gallocr_t gallocr = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
+        if (gallocr == nullptr || !ggml_gallocr_alloc_graph(gallocr, gf)) {
+            fprintf(stderr, "graph allocation failed\n");
+            exit(1);
+        }
+        if (idst != nullptr) {
+            ggml_backend_tensor_set(idst, ids.data(), 0, ids.size() * sizeof(int32_t));
+        }
+        if (prequantized) {
+            ggml_backend_tensor_set(src1, xq.data(), 0, ggml_nbytes(src1));
+        } else {
+            ggml_backend_tensor_set(src1, xf.data(), 0, xf.size() * sizeof(float));
+        }
+        if (!use_repack) {
+            ggml_backend_tensor_set(src0, plain.data(), 0, ggml_nbytes(src0));
+        }
         if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
             fprintf(stderr, "graph compute failed\n");
             exit(1);
         }
         dst.resize(ggml_nelements(out));
-        memcpy(dst.data(), out->data, ggml_nbytes(out));
-        ggml_backend_buffer_free(ctx_buffer);
-        ggml_free(ctx);
+        ggml_backend_tensor_get(out, dst.data(), 0, ggml_nbytes(out));
+        ggml_gallocr_free(gallocr);
+        if (!use_repack) {
+            ggml_free(ctx);
+        }
     };
 
     int bad = quant_bad;
@@ -506,21 +514,17 @@ static void bench_mmid_graph(const char * name, ggml_type type, int qk,
         }
     }
 
-    ggml_context * ctx = ggml_init({ ggml_tensor_overhead()*16 + ggml_graph_overhead(), nullptr, true });
-    ggml_tensor * src0 = ggml_new_tensor_3d(ctx, type, ne00, ne01, nexp);
+    ggml_context * ctx = rw.ctx;
+    ggml_tensor * src0 = rw.t;
     ggml_tensor * src1 = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne00, 1, ntok);
     ggml_tensor * idst = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, nids, ntok);
     ggml_tensor * out = ggml_mul_mat_id(ctx, src0, src1, idst);
-    ggml_backend_buffer_t ctx_buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
-
-    memcpy(src1->data, xf.data(), xf.size()*sizeof(float));
-    memcpy(idst->data, ids.data(), ids.size()*sizeof(int32_t));
-    src0->buffer = rw.t->buffer;
-    src0->data   = rw.t->data;
-    src0->extra  = rw.t->extra;
-
     ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, out);
+    ggml_gallocr_t gallocr = ggml_gallocr_new(ggml_backend_cpu_buffer_type());
+    GGML_ASSERT(gallocr != nullptr && ggml_gallocr_alloc_graph(gallocr, gf));
+    ggml_backend_tensor_set(src1, xf.data(), 0, xf.size()*sizeof(float));
+    ggml_backend_tensor_set(idst, ids.data(), 0, ids.size()*sizeof(int32_t));
     for (int i = 0; i < n_warmup; ++i) {
         GGML_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
     }
@@ -537,18 +541,29 @@ static void bench_mmid_graph(const char * name, ggml_type type, int qk,
            name, (long long) ne00, (long long) ne01, (long long) nexp, (long long) nids,
            (long long) ntok, samples[samples.size()/2], samples.front());
 
-    ggml_backend_buffer_free(ctx_buffer);
-    ggml_free(ctx);
+    ggml_gallocr_free(gallocr);
     free_repacked(rw);
 }
 
 // ---------------------------------------------------------------------------
 
 int main(int argc, char ** argv) {
-    const bool do_bench = argc > 1 && std::string(argv[1]) == "bench";
-    const bool do_numa  = argc > 1 && std::string(argv[1]) == "numa";
-    const bool do_bench_mmid = argc > 1 && std::string(argv[1]) == "bench-mmid";
+    const bool do_bench       = argc > 1 && std::string(argv[1]) == "bench";
+    const bool do_numa        = argc > 1 && std::string(argv[1]) == "numa";
+    const bool do_bench_mmid  = argc > 1 && std::string(argv[1]) == "bench-mmid";
     const bool do_model_shape = argc > 1 && std::string(argv[1]) == "model-shape";
+
+    if (!do_bench_mmid &&
+            (!ggml_cpu_has_avx512() || !ggml_cpu_has_avx512_vnni() || !ggml_cpu_has_avx512_vbmi())) {
+        printf("test-repack-iq: SKIPPED (needs AVX512/VNNI/VBMI)\n");
+        return 0;
+    }
+
+#if defined(_WIN32)
+    _putenv_s("GGML_REPACK_Q2_K", "1");
+#else
+    setenv("GGML_REPACK_Q2_K", "1", 1);
+#endif
 
     if (do_numa || do_model_shape) {
 #if defined(_WIN32)

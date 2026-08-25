@@ -72,6 +72,35 @@ int main() {
     CHECK(!llama_ep_parse_worker_capability(payload.data(), payload.size(), parsed, error));
     CHECK(llama_ep_parse_worker_capability(payload.data(), sizeof(cap), parsed, error));
 
+    cap.kernel_id = 0x1234abcd;
+    cap.caps = LLAMA_EP_CAP_REQ2 | LLAMA_EP_CAP_PRECISION_CONTRACT;
+    const llama_ep_precision_contract precision =
+        llama_ep_make_cpu_repack_precision_contract(cap.kernel_id, UINT64_C(0x11223344), UINT64_C(0x55667788));
+    std::vector<uint8_t> precision_payload(sizeof(cap) + sizeof(precision));
+    std::memcpy(precision_payload.data(), &cap, sizeof(cap));
+    std::memcpy(precision_payload.data() + sizeof(cap), &precision, sizeof(precision));
+    CHECK(llama_ep_parse_worker_capability(
+        precision_payload.data(), precision_payload.size(), parsed, error));
+    CHECK(parsed.has_precision());
+    CHECK(llama_ep_precision_contract_equal(parsed.precision, precision));
+    CHECK(!llama_ep_parse_worker_capability(
+        precision_payload.data(), precision_payload.size() - 1, parsed, error));
+
+    llama_ep_precision_contract bad_precision = precision;
+    bad_precision.contract_id ^= 1;
+    std::memcpy(precision_payload.data() + sizeof(cap), &bad_precision, sizeof(bad_precision));
+    CHECK(!llama_ep_parse_worker_capability(
+        precision_payload.data(), precision_payload.size(), parsed, error));
+
+    cap.caps |= LLAMA_EP_CAP_EXPERT_BITMAP;
+    std::vector<uint8_t> full_payload(sizeof(cap) + sizeof(precision) + sizeof(sparse_bits));
+    std::memcpy(full_payload.data(), &cap, sizeof(cap));
+    std::memcpy(full_payload.data() + sizeof(cap), &precision, sizeof(precision));
+    std::memcpy(full_payload.data() + sizeof(cap) + sizeof(precision), sparse_bits, sizeof(sparse_bits));
+    CHECK(llama_ep_parse_worker_capability(full_payload.data(), full_payload.size(), parsed, error));
+    CHECK(parsed.has_precision());
+    CHECK(parsed.ownership().count() == 4);
+
     std::puts("EP topology tests passed");
     return 0;
 }

@@ -9,6 +9,7 @@
 #include "ggml-shard-plan.h"
 #include "simd-mappings.h"
 #include "traits.h"
+#include "xllama-hot-trace.h"
 #include <atomic>
 
 #include "arch-fallback.h"
@@ -88,14 +89,17 @@ static bool ggml_moe_hot_stats_enabled() {
     return enabled;
 }
 
-// src0_name: e.g. "blk.12.ffn_gate_exps.weight"; only the gate projection is counted
-// so each (token, expert) selection contributes exactly one hit per layer.
-static void ggml_moe_hot_stats_count(const char * src0_name, const ggml_tensor * ids, int n_ids, int n_as) {
+static int ggml_moe_hot_layer(const char * src0_name) {
     int layer = -1;
     if (sscanf(src0_name, "blk.%d.ffn_gate_exps.weight", &layer) != 1 ||
         layer < 0 || layer >= GGML_MOE_HOT_MAX_LAYERS) {
-        return;
+        return -1;
     }
+    return layer;
+}
+
+// Only the gate projection is counted, so each selected expert contributes once.
+static void ggml_moe_hot_stats_count(int layer, const ggml_tensor * ids, int n_ids, int n_as) {
     auto * hits = ggml_moe_hot_hits[layer];
     for (int32_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
         for (int32_t id = 0; id < n_ids; ++id) {
@@ -5773,19 +5777,9 @@ template <> int repack<block_udnl_w4, 1, 16>(struct ggml_tensor * t, const void 
     GGML_UNUSED(data_size);
 }
 
-// E4A: row blocks -> NR16xK4 panel layout (see the layout comment above
-// ggml_gemv_e4a_1x16_q8_0_generic). Pure byte rearrangement: the panel stream
-// is exactly 16 x sizeof(block_e4a) per (panel, 256-K block).
-template <> int repack<block_e4a, 1, 16>(struct ggml_tensor * t, const void * data, size_t data_size) {
-    GGML_ASSERT(t->type == GGML_TYPE_E4A);
-
+static int repack_e4a_rows(void * dst_data, const void * data, int64_t nblocks, int64_t nrow) {
     const block_e4a * src = (const block_e4a *) data;
-    uint8_t *       dst = (uint8_t *) t->data;
-
-    const int64_t nrow    = ggml_nrows(t);
-    const int64_t nblocks = t->ne[0] / QK_E4A;
-
-    GGML_ASSERT(data_size == (size_t) nrow * nblocks * sizeof(block_e4a));
+    uint8_t *       dst = (uint8_t *) dst_data;
 
     if (nrow % 16 != 0) {
         return -1;
@@ -5814,6 +5808,19 @@ template <> int repack<block_e4a, 1, 16>(struct ggml_tensor * t, const void * da
         }
     }
     return 0;
+}
+
+// E4A: row blocks -> NR16xK4 panel layout (see the layout comment above
+// ggml_gemv_e4a_1x16_q8_0_generic). Pure byte rearrangement: the panel stream
+// is exactly 16 x sizeof(block_e4a) per (panel, 256-K block).
+template <> int repack<block_e4a, 1, 16>(struct ggml_tensor * t, const void * data, size_t data_size) {
+    GGML_ASSERT(t->type == GGML_TYPE_E4A);
+
+    const int64_t nrow    = ggml_nrows(t);
+    const int64_t nblocks = t->ne[0] / QK_E4A;
+
+    GGML_ASSERT(data_size == (size_t) nrow * nblocks * sizeof(block_e4a));
+    return repack_e4a_rows(t->data, data, nblocks, nrow);
 
     GGML_UNUSED(data_size);
 }
@@ -6269,7 +6276,7 @@ static constexpr int64_t MMID_EP_CHUNK_MAX = 128;
 // of the tensor (head bytes before it count as block -1). Must match
 // llama_model::numa_ep_place_experts. Unlike the default 128-row window placement
 // (~1.7 MiB fragments with alternating mempolicies), every fragment is a full
-// PMD-aligned VMA, so GGML_NUMA_THP=collapse can actually promote the pages.
+// PMD-aligned VMA for experiments that need block-granular placement.
 static bool mmid_ep_place_block() {
     static const bool v = []() {
         const char * e = getenv("GGML_NUMA_EP_PLACE");
@@ -6322,13 +6329,29 @@ static int mmid_ep_block_ranges(const char * tbase, int64_t nb01, int64_t nb02, 
 class tensor_traits_base : public ggml::cpu::tensor_traits {
   public:
     virtual int repack(struct ggml_tensor * t, const void * data, size_t data_size) = 0;
+    virtual int repack_stream_chunk(struct ggml_tensor * t, const void * data, size_t data_size) = 0;
     virtual ggml_type activation_type() const = 0;
+    virtual int64_t stream_bake_rows() const = 0;
 };
 
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PARAM_TYPE> class tensor_traits : public tensor_traits_base {
 
     ggml_type activation_type() const override {
         return PARAM_TYPE;
+    }
+
+    int64_t stream_bake_rows() const override {
+        if constexpr (std::is_same<BLOC_TYPE, block_q2_K>::value ||
+                      std::is_same<BLOC_TYPE, block_q3_K>::value ||
+                      std::is_same<BLOC_TYPE, block_q4_K>::value ||
+                      std::is_same<BLOC_TYPE, block_iq2_xxs>::value ||
+                      std::is_same<BLOC_TYPE, block_iq2_xs>::value ||
+                      std::is_same<BLOC_TYPE, block_iq3_xxs>::value ||
+                      std::is_same<BLOC_TYPE, block_mxfp4>::value ||
+                      std::is_same<BLOC_TYPE, block_e4a>::value) {
+            return NB_COLS;
+        }
+        return 0;
     }
 
     bool work_size(int n_threads, const struct ggml_tensor * op, size_t & size) override {
@@ -6914,8 +6937,18 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
             }
             GGML_ASSERT(matrix_row_offsets[n_as] <= n_selected);
 
-            if (ggml_moe_hot_stats_enabled()) {
-                ggml_moe_hot_stats_count(src0->name, ids, n_ids, n_as);
+            const bool hot_stats = ggml_moe_hot_stats_enabled();
+            static const bool hot_trace = xllama::moe_hot_trace_enabled();
+            if (hot_stats || hot_trace) {
+                const int layer = ggml_moe_hot_layer(src0->name);
+                if (layer >= 0) {
+                    if (hot_stats) {
+                        ggml_moe_hot_stats_count(layer, ids, n_ids, n_as);
+                    }
+                    if (hot_trace) {
+                        xllama::moe_hot_trace_record(layer, ids->data, ids->ne[1], n_ids, ids->nb[1], ids->nb[0], n_as);
+                    }
+                }
             }
 
             for (int32_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
@@ -7516,6 +7549,13 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                        (int) NB_COLS, (int) INTER_SIZE);
         return ggml::cpu::repack::repack<BLOC_TYPE, INTER_SIZE, NB_COLS>(t, data, data_size);
     }
+
+    int repack_stream_chunk(struct ggml_tensor * t, const void * data, size_t data_size) override {
+        // Stream baking invokes this once per small staging chunk.  Keep the
+        // normal one-line tensor repack diagnostic, but do not emit thousands
+        // of identical lines while a tensor is loaded panel by panel.
+        return ggml::cpu::repack::repack<BLOC_TYPE, INTER_SIZE, NB_COLS>(t, data, data_size);
+    }
 };
 
 }  // namespace ggml::cpu::repack
@@ -8013,6 +8053,48 @@ ggml_backend_buffer_type_t ggml_backend_cpu_repack_buffer_type(void) {
     };
 
     return &ggml_backend_cpu_buffer_type_repack;
+}
+
+size_t ggml_backend_cpu_repack_chunk_alignment(const struct ggml_tensor * tensor) {
+    if (tensor == nullptr || tensor->data == nullptr || tensor->extra == nullptr || tensor->buffer == nullptr ||
+            tensor->buffer->buft != ggml_backend_cpu_repack_buffer_type()) {
+        return 0;
+    }
+    const auto * traits = static_cast<const ggml::cpu::repack::tensor_traits_base *>(tensor->extra);
+    const int64_t rows = traits->stream_bake_rows();
+    if (rows <= 0 || tensor->ne[1] % rows != 0 || ggml_nrows(tensor) % rows != 0 ||
+            tensor->ne[0] % ggml_blck_size(tensor->type) != 0) {
+        return 0;
+    }
+    const size_t alignment = ggml_row_size(tensor->type, tensor->ne[0]) * (size_t) rows;
+    return alignment > 0 && ggml_nbytes(tensor) % alignment == 0 ? alignment : 0;
+}
+
+bool ggml_backend_cpu_repack_write_chunk(
+        struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    const size_t alignment = ggml_backend_cpu_repack_chunk_alignment(tensor);
+    if (alignment == 0 || data == nullptr || size == 0 || offset % alignment != 0 || size % alignment != 0 ||
+            offset > ggml_nbytes(tensor) || size > ggml_nbytes(tensor) - offset) {
+        return false;
+    }
+
+    auto * traits = static_cast<ggml::cpu::repack::tensor_traits_base *>(tensor->extra);
+    const int64_t rows_per_chunk = traits->stream_bake_rows();
+    const int64_t nrows = (size / alignment) * rows_per_chunk;
+    if (tensor->type == GGML_TYPE_E4A) {
+        const int64_t nblocks = tensor->ne[0] / QK_E4A;
+        return ggml::cpu::repack::repack_e4a_rows((char *) tensor->data + offset, data, nblocks, nrows) == 0;
+    }
+
+    ggml_tensor chunk = *tensor;
+    chunk.data = (char *) tensor->data + offset;
+    chunk.ne[1] = nrows;
+    chunk.ne[2] = 1;
+    chunk.ne[3] = 1;
+    chunk.nb[1] = ggml_row_size(chunk.type, chunk.ne[0]);
+    chunk.nb[2] = chunk.nb[1] * chunk.ne[1];
+    chunk.nb[3] = chunk.nb[2];
+    return traits->repack_stream_chunk(&chunk, data, size) == 0;
 }
 
 

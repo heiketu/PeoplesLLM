@@ -149,6 +149,65 @@ int main() {
         return 1;
     }
 
+    constexpr int64_t max_tokens = 4;
+    std::vector<float> token_cold(max_tokens*n_slots*n_embd);
+    std::vector<float> token_hot(max_tokens*n_slots*n_embd);
+    std::vector<float> token_raw(max_tokens*n_slots*n_embd);
+    std::vector<float> token_weights(max_tokens*n_slots);
+    std::vector<uint8_t> token_mask(max_tokens*n_slots);
+    std::vector<uint8_t> token_override_mask(max_tokens*n_slots);
+    std::vector<const float *> token_cold_ptrs(max_tokens*n_slots);
+    std::vector<const float *> token_all_ptrs(max_tokens*n_slots);
+    std::vector<float> token_expected(max_tokens*n_embd);
+    std::vector<float> token_actual(max_tokens*n_embd);
+    std::vector<float> token_raw_actual(max_tokens*n_embd);
+    std::vector<float> token_override_actual(max_tokens*n_embd);
+    for (int64_t token = 0; token < max_tokens; ++token) {
+        const uint32_t mask_bits = (0x09u << token) & 0x3fu;
+        for (int64_t slot = 0; slot < n_slots; ++slot) {
+            const size_t pos = (size_t) token*n_slots + slot;
+            token_weights[pos] = weights[slot] + 0.001f*(float) token;
+            token_mask[pos] = (mask_bits >> slot) & 1u;
+            for (int64_t row = 0; row < n_embd; ++row) {
+                const size_t offset = pos*n_embd + row;
+                const float value = raw[slot*n_embd + row] + 0.0001f*(float) token;
+                const float product = rounded_product(value, token_weights[pos]);
+                token_raw[offset] = value;
+                token_hot[offset] = token_mask[pos] ? value : std::numeric_limits<float>::quiet_NaN();
+                token_cold[offset] = token_mask[pos] ? std::numeric_limits<float>::quiet_NaN() : product;
+                float & expected_value = token_expected[(size_t) token*n_embd + row];
+                expected_value = slot == 0 ? product : rounded_add(expected_value, product);
+            }
+            token_cold_ptrs[pos] = token_mask[pos] ? nullptr : token_raw.data() + pos*n_embd;
+            token_all_ptrs[pos] = token_raw.data() + pos*n_embd;
+            token_override_mask[pos] = token_mask[pos] && ((token + slot) & 1) == 0;
+        }
+    }
+    for (int64_t n_tokens = 1; n_tokens <= max_tokens; ++n_tokens) {
+        const size_t output_bytes = (size_t) n_tokens*n_embd*sizeof(float);
+        llama_hot_expert_merge_tokens_f32(
+            token_actual.data(), token_cold.data(), token_hot.data(), token_weights.data(), token_mask.data(),
+            n_embd, n_tokens, n_slots);
+        if (std::memcmp(token_actual.data(), token_expected.data(), output_bytes) != 0) {
+            std::fprintf(stderr, "multi-token slot-order mismatch for NT=%lld\n", (long long) n_tokens);
+            return 1;
+        }
+        llama_hot_expert_merge_raw_tokens_f32(
+            token_raw_actual.data(), token_cold_ptrs.data(), token_hot.data(), token_weights.data(), token_mask.data(),
+            n_embd, n_tokens, n_slots);
+        if (std::memcmp(token_raw_actual.data(), token_expected.data(), output_bytes) != 0) {
+            std::fprintf(stderr, "multi-token raw slot-order mismatch for NT=%lld\n", (long long) n_tokens);
+            return 1;
+        }
+        llama_hot_expert_merge_raw_tokens_f32(
+            token_override_actual.data(), token_all_ptrs.data(), token_hot.data(), token_weights.data(), token_override_mask.data(),
+            n_embd, n_tokens, n_slots);
+        if (std::memcmp(token_override_actual.data(), token_expected.data(), output_bytes) != 0) {
+            std::fprintf(stderr, "multi-token CPU override mismatch for NT=%lld\n", (long long) n_tokens);
+            return 1;
+        }
+    }
+
     const uint32_t bench_mask_bits = 0x2a;
     uint8_t bench_mask[n_slots];
     for (int64_t slot = 0; slot < n_slots; ++slot) {

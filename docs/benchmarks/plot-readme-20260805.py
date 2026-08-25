@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """PeoplesLLM README 图表（2026-08-05）：vs 主线基线 + 头条加速比 + CPU 内核加速比。
-数据全部出自仓库实测记录（README/进度.md/记录.md/HANDOVER.md）。"""
+数据全部出自仓库公开、复核后的 README 与 benchmarks 记录。"""
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt

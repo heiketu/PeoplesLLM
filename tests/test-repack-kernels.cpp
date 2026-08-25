@@ -272,6 +272,33 @@ std::vector<float> make_random_f32(int64_t n, uint32_t seed) {
     return v;
 }
 
+bool test_udnl_mx_imatrix_contract() {
+    constexpr int64_t nrows = 16;
+    constexpr int64_t k = 512;
+    const std::vector<float> source = make_random_f32(nrows * k, 8642);
+    std::vector<float> imatrix(k);
+    for (int64_t i = 0; i < k; ++i) {
+        imatrix[i] = 0.25f + (float) ((i * 17) % 101) / 37.0f;
+    }
+    std::vector<float> extended(nrows * k);
+    std::copy(imatrix.begin(), imatrix.end(), extended.begin());
+    for (int64_t i = k; i < nrows * k; ++i) {
+        extended[i] = 1000.0f + (float) ((i * 29) % 251);
+    }
+
+    const size_t output_size = ggml_row_size(GGML_TYPE_UDNL_MX, k) * nrows;
+    std::vector<char> short_weights(output_size);
+    std::vector<char> extended_weights(output_size);
+    const size_t short_size = ggml_quantize_chunk(
+        GGML_TYPE_UDNL_MX, source.data(), short_weights.data(), 0, nrows, k, imatrix.data());
+    const size_t extended_size = ggml_quantize_chunk(
+        GGML_TYPE_UDNL_MX, source.data(), extended_weights.data(), 0, nrows, k, extended.data());
+    const bool exact = short_size == output_size && extended_size == output_size &&
+        memcmp(short_weights.data(), extended_weights.data(), output_size) == 0;
+    printf("[UDNL_MX] single-row imatrix contract and tail independence: %s\n", exact ? "bit-exact" : "FAILED");
+    return exact;
+}
+
 // Quantize nr activation rows of k floats each into the block_q8_{K,0}x4
 // interleaved layout used by the gemm kernels (nr must be a multiple of 4).
 std::vector<char> quantize_acts_4x8(const std::vector<float> & x, int nr, int k, ggml_type act = GGML_TYPE_Q8_K) {
@@ -490,13 +517,15 @@ void perf_type(const kernel_fns & fn, int nc, int k, int nr, int nthreads, int n
 
     std::vector<float> x = make_random_f32((int64_t) nr * k, 43);
 
-    // column slices aligned to 8 (kernels require nc % 8 == 0)
+    // Column slices follow the physical panel width. The UDNL/E4A kernels
+    // require every per-thread slice to contain complete 16-column panels.
     std::vector<std::pair<int, int>> slices;
     {
+        const int col_align = fn.type == GGML_TYPE_UDNL_W4 || fn.type == GGML_TYPE_UDNL_MX || fn.type == GGML_TYPE_E4A ? 16 : 8;
         int c = 0;
         for (int t = 0; t < nthreads && c < nc; t++) {
-            int n = ((nc - c) / (nthreads - t)) & ~7;
-            if (n == 0) n = std::min(8, nc - c);
+            int n = ((nc - c) / (nthreads - t)) / col_align * col_align;
+            if (n == 0) n = std::min(col_align, nc - c);
             slices.push_back({c, n});
             c += n;
         }
@@ -1568,6 +1597,10 @@ int main(int argc, char ** argv) {
         return expected == actual ? 0 : 1;
     }
 
+    if (argc > 1 && std::string(argv[1]) == "--udnl-mx-imatrix-contract") {
+        return test_udnl_mx_imatrix_contract() ? 0 : 1;
+    }
+
 #if defined(_WIN32)
     _putenv_s("GGML_REPACK_Q2_K", "1");
 #else
@@ -1892,6 +1925,7 @@ int main(int argc, char ** argv) {
     ok &= test_mmid_prequantized_q8_k();
     ok &= test_e4a_exponent_edges();
     ok &= test_mmid_e4a();
+    ok &= test_udnl_mx_imatrix_contract();
 
     printf("[MXFP4] unrepack (inverse transform) bit-exact roundtrips\n");
     ok &= test_unrepack_layout(8, 128, 512, false);   // k=4096 gate/up row
