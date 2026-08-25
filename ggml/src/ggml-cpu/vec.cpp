@@ -15,6 +15,17 @@ void ggml_vec_dot_f32(int n, float * GGML_RESTRICT s, size_t bs, const float * G
    GGML_UNUSED(by);
    GGML_UNUSED(bs);
 
+#if defined(GGML_CPU_F32_DOT_STRICT)
+    float strict_sum = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        const volatile float term = x[i] * y[i];
+        const volatile float next = strict_sum + term;
+        strict_sum = next;
+    }
+    *s = strict_sum;
+    return;
+#endif
+
 #if defined(GGML_SIMD)
     float sumf = 0.0f;
 

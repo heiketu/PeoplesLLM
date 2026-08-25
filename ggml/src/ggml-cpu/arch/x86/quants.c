@@ -321,6 +321,7 @@ static inline float hsum_float_4x4(const __m128 a, const __m128 b, const __m128 
 void quantize_row_q8_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
     assert(QK8_0 == 32);
     assert(k % QK8_0 == 0);
+
     const int nb = k / QK8_0;
 
     block_q8_0 * GGML_RESTRICT y = vy;
@@ -1269,6 +1270,26 @@ void ggml_vec_dot_q5_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
     const block_q8_0 * GGML_RESTRICT y = vy;
 
 #if defined(__AVX2__)
+#if defined(GGML_CPU_Q5_0_STRICT)
+    // UPE strict experiment: keep the AVX2 integer dot inside each block, but
+    // restore the generic block-by-block FP32 accumulation order. This avoids
+    // the eight independent floating-point lanes + final horizontal reduction
+    // used by the throughput path below.
+    float sumf = 0.0f;
+    for (; ib < nb; ++ib) {
+        const volatile float d = GGML_CPU_FP16_TO_FP32(x[ib].d) * GGML_CPU_FP16_TO_FP32(y[ib].d);
+        __m256i qx = bytes_from_nibbles_32(x[ib].qs);
+        __m256i bxhi = bytes_from_bits_32(x[ib].qh);
+        bxhi = _mm256_andnot_si256(bxhi, _mm256_set1_epi8((char) 0xF0));
+        qx = _mm256_or_si256(qx, bxhi);
+        const __m256i qy = _mm256_loadu_si256((const __m256i *) y[ib].qs);
+        const float sumi = hsum_float_8(mul_sum_i8_pairs_float(qx, qy));
+        const volatile float term = d * sumi;
+        const volatile float next = sumf + term;
+        sumf = next;
+    }
+    *s = sumf;
+#else
     // Initialize accumulator with zeros
     __m256 acc = _mm256_setzero_ps();
 
@@ -1291,6 +1312,7 @@ void ggml_vec_dot_q5_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
     }
 
     *s = hsum_float_8(acc);
+#endif
 #elif defined(__AVX__)
     // Initialize accumulator with zeros
     __m256 acc = _mm256_setzero_ps();
@@ -1435,6 +1457,19 @@ void ggml_vec_dot_q8_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
     float sumf = 0;
 
 #if defined(__AVX2__)
+#if defined(GGML_CPU_Q8_0_DOT_STRICT)
+    float strict_sumf = 0.0f;
+    for (; ib < nb; ++ib) {
+        const volatile float d = GGML_CPU_FP16_TO_FP32(x[ib].d) * GGML_CPU_FP16_TO_FP32(y[ib].d);
+        const __m256i qx = _mm256_loadu_si256((const __m256i *) x[ib].qs);
+        const __m256i qy = _mm256_loadu_si256((const __m256i *) y[ib].qs);
+        const float sumi = hsum_float_8(mul_sum_i8_pairs_float(qx, qy));
+        const volatile float term = d * sumi;
+        const volatile float next = strict_sumf + term;
+        strict_sumf = next;
+    }
+    sumf = strict_sumf;
+#else
     // Initialize accumulator with zeros
     __m256 acc = _mm256_setzero_ps();
 
@@ -1452,6 +1487,7 @@ void ggml_vec_dot_q8_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
     }
 
     sumf = hsum_float_8(acc);
+#endif
 #elif defined(__AVX__)
     __m256 accum = _mm256_setzero_ps();
 

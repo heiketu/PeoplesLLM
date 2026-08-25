@@ -59,6 +59,17 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
     target_compile_features(${GGML_CPU_NAME} PRIVATE c_std_11 cxx_std_17)
     target_include_directories(${GGML_CPU_NAME} PRIVATE . ggml-cpu)
 
+    if (GGML_CPU_UPE_STRICT)
+        target_compile_definitions(${GGML_CPU_NAME} PRIVATE
+            GGML_CPU_Q5_0_STRICT
+            GGML_CPU_Q8_0_DOT_STRICT
+            GGML_CPU_F32_DOT_STRICT)
+        if (NOT MSVC)
+            target_compile_options(${GGML_CPU_NAME} PRIVATE
+                $<$<COMPILE_LANGUAGE:CXX>:-ffp-contract=off>)
+        endif()
+    endif()
+
     if (APPLE AND GGML_ACCELERATE)
         find_library(ACCELERATE_FRAMEWORK Accelerate)
         if (ACCELERATE_FRAMEWORK)
