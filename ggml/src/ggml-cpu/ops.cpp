@@ -1905,15 +1905,12 @@ void ggml_compute_forward_repeat_back(
 }
 
 // ggml_compute_forward_concat
-
 static void ggml_compute_forward_concat_any(
     const ggml_compute_params * params,
     ggml_tensor * dst) {
 
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
-
-    const size_t len = ggml_type_size(src0->type);
 
     const int ith = params->ith;
     const int nth = params->nth;
@@ -1923,53 +1920,40 @@ static void ggml_compute_forward_concat_any(
     const int32_t dim = ggml_get_op_params_i32(dst, 0);
 
     GGML_ASSERT(dim >= 0 && dim < 4);
+    GGML_ASSERT(ggml_is_contiguous_rows(src0));
+    GGML_ASSERT(ggml_is_contiguous_rows(src1));
 
     int64_t o[4] = {0, 0, 0, 0};
+
     if (dim == 0) {
+        GGML_ASSERT(src0->ne[0] % ggml_blck_size(src0->type) == 0);
+        GGML_ASSERT(src1->ne[0] % ggml_blck_size(src1->type) == 0);
+
         o[dim] = src0->ne[dim]/ggml_blck_size(src0->type);
     } else {
         o[dim] = src0->ne[dim];
     }
 
-    // split the work by rows (i1, i2, i3); when dim0 is contiguous everywhere each row
-    // is copied with 1-2 block memcpy instead of per-element copies
-    const int64_t nrows = ne1 * ne2 * ne3;
-    const int64_t row_start = (ith * nrows) / nth;
-    const int64_t row_end   = ((ith + 1) * nrows) / nth;
 
-    const int64_t ne0b = ne0/ggml_blck_size(dst->type);
-    const bool cont0 = nb00 == len && nb10 == len && nb0 == len;
-
-    for (int64_t row = row_start; row < row_end; row++) {
-        const int64_t i1 = row % ne1;
-        const int64_t i2 = (row / ne1) % ne2;
-        const int64_t i3 = row / (ne1 * ne2);
-
-        const bool from_src0 = i1 < ne01 && i2 < ne02 && i3 < ne03;
-
-        char * y = (char *)dst->data + i1*nb1 + i2*nb2 + i3*nb3;
-
-        if (cont0) {
-            if (from_src0) {
-                const char * x0 = (const char *)src0->data + i1*nb01 + i2*nb02 + i3*nb03;
-                if (dim == 0) {
-                    const char * x1 = (const char *)src1->data + (i1 - o[1])*nb11 + (i2 - o[2])*nb12 + (i3 - o[3])*nb13;
-                    memcpy(y, x0, o[0]*len);
-                    memcpy(y + o[0]*len, x1, (ne0b - o[0])*len);
-                } else {
-                    memcpy(y, x0, ne0b*len);
-                }
-            } else {
-                const char * x1 = (const char *)src1->data + (i1 - o[1])*nb11 + (i2 - o[2])*nb12 + (i3 - o[3])*nb13;
-                memcpy(y, x1, ne0b*len);
+    // Region 1: copy rows from src0
+    for (int i3 = 0; i3 < ne03; i3++) {
+        for (int i2 = ith; i2 < ne02; i2 += nth) {
+            for (int i1 = 0; i1 < ne01; i1++) {
+                const char * x = (const char *) src0->data + i1*nb01 + i2*nb02 + i3*nb03;
+                      char * y = (      char *) dst->data  + i1*nb1  + i2*nb2  + i3*nb3;
+                memcpy(y, x, ggml_row_size(src0->type, ne00));
             }
-        } else {
-            for (int64_t i0 = 0; i0 < ne0b; i0++) {
-                const char * x = from_src0
-                    ? (const char *)src0->data + i0*nb00 + i1*nb01 + i2*nb02 + i3*nb03
-                    : (const char *)src1->data + (i0 - o[0])*nb10 + (i1 - o[1])*nb11 + (i2 - o[2])*nb12 + (i3 - o[3])*nb13;
+        }
+    }
 
-                memcpy(y + i0*nb0, x, len);
+    // Region 2: copy rows from src1, offset into dst by o[]
+    for (int i3 = 0; i3 < ne13; i3++) {
+        for (int i2 = ith; i2 < ne12; i2 += nth) {
+            for (int i1 = 0; i1 < ne11; i1++) {
+                const char * x = (const char *) src1->data + i1*nb11         + i2*nb12         + i3*nb13;
+                      char * y = (      char *)  dst->data + (i1 + o[1])*nb1 + (i2 + o[2])*nb2 + (i3 + o[3])*nb3 + o[0]*nb0;
+                memcpy(y, x, ggml_row_size(src1->type, ne10));
+
             }
         }
     }
@@ -2172,14 +2156,6 @@ void ggml_compute_forward_concat(
     ggml_tensor * dst) {
 
     const ggml_tensor * src0 = dst->src[0];
-    const ggml_tensor * src1 = dst->src[1];
-
-    if (ggml_is_quantized(src0->type)) {
-        GGML_ASSERT(ggml_is_contiguous_rows(src0));
-        GGML_ASSERT(ggml_is_contiguous_rows(src1));
-        GGML_ASSERT(src0->ne[0] % ggml_blck_size(src0->type) == 0);
-        GGML_ASSERT(src1->ne[0] % ggml_blck_size(src1->type) == 0);
-    }
 
     switch (src0->type) {
         case GGML_TYPE_F16:
